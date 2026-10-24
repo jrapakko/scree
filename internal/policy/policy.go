@@ -185,6 +185,24 @@ func (p *Policy) Rel(abs string) (string, error) {
 			return rel, nil
 		}
 	}
+	// The path may reach the root through another symlink, such as macOS's
+	// /var -> /private/var. Resolve the deepest existing directory above the
+	// file, never the file itself, so a symlinked note keeps its own name;
+	// Read still applies every rule to the result.
+	dir, rest := filepath.Dir(abs), filepath.Base(abs)
+	for {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			if rel, ok := relUnder(p.root, filepath.Join(real, rest)); ok {
+				return rel, nil
+			}
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir, rest = parent, filepath.Join(filepath.Base(dir), rest)
+	}
 	return "", fmt.Errorf("%q is outside %s", abs, p.given)
 }
 

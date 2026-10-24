@@ -342,8 +342,9 @@ func TestRel(t *testing.T) {
 	given := filepath.Join(dir, "via")
 	link(t, real, given)
 	p := open(t, given, 0)
-	if p.Root() != real {
-		t.Fatalf("Root() = %s, want %s", p.Root(), real)
+	// The temp dir itself may sit behind a symlink (macOS: /var -> /private/var).
+	if want, _ := filepath.EvalSymlinks(real); p.Root() != want {
+		t.Fatalf("Root() = %s, want %s", p.Root(), want)
 	}
 	for _, abs := range []string{filepath.Join(real, "a", "b.md"), filepath.Join(given, "a", "b.md")} {
 		if rel, err := p.Rel(abs); err != nil || rel != "a/b.md" {
@@ -352,6 +353,16 @@ func TestRel(t *testing.T) {
 	}
 	if _, err := p.Rel(filepath.Join(dir, "outside", "secret.md")); err == nil {
 		t.Error("Rel accepted a path outside the root")
+	}
+	// A path that reaches the root through some other symlink, such as
+	// macOS's /var -> /private/var, still maps to the same key.
+	alt := filepath.Join(t.TempDir(), "alt")
+	link(t, dir, alt)
+	if rel, err := p.Rel(filepath.Join(alt, "notes", "new", "c.md")); err != nil || rel != "new/c.md" {
+		t.Errorf("Rel through another symlink = %q, %v", rel, err)
+	}
+	if _, err := p.Rel(filepath.Join(alt, "outside", "secret.md")); err == nil {
+		t.Error("Rel accepted an outside path through another symlink")
 	}
 }
 
