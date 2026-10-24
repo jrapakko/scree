@@ -133,7 +133,9 @@ install -m 755 bin/scree contrib/scree-mcp ~/.local/bin/
 claude mcp add scree --scope user -- ~/.local/bin/scree-mcp
 ```
 
-The wrapper refuses to start if the settings file is missing or readable by group or others. If `~/.local/bin` is not on the `PATH` Claude Code starts with, add `SCREE_BIN=/home/you/.local/bin/scree` to the settings file.
+The wrapper refuses to start if the settings file is missing, not owned by you, or readable by group or others. Install `scree` in the same folder as the wrapper: it runs that binary and nothing found through `PATH`.
+
+The settings file is the wrapper's only source of configuration. A repo's committed `.mcp.json` can start `scree-mcp` with its own environment and arguments, so the wrapper resets `PATH`, ignores every inherited `SCREE_*`, `OPENROUTER_API_KEY` and proxy variable, and refuses arguments. A repo can't redirect your key to another endpoint, swap in another binary, or point scree at another folder.
 
 Tools: `search_notes(query, k)`, `read_note(path)`, `reindex(path?)`.
 
@@ -197,7 +199,7 @@ install -m 755 contrib/scree-mcp-docker ~/.local/bin/
 claude mcp add scree --scope user -- ~/.local/bin/scree-mcp-docker
 ```
 
-`SCREE_DOCKER=podman`, `SCREE_IMAGE` and `SCREE_DATA_VOLUME` in the settings file change the engine, image and volume.
+`SCREE_DOCKER` (`docker` or `podman` only), `SCREE_IMAGE` and `SCREE_DATA_VOLUME` (a volume name, not a path) in the settings file change the engine, image and volume. Like `scree-mcp`, the Docker wrapper ignores inherited settings and takes no arguments.
 
 Inside a container, `serve -http` has to bind a non-loopback address to be reachable through a published port, so it needs `-allow-remote` and `SCREE_HTTP_TOKEN`. Publish the port on the host's loopback only, for example `-p 127.0.0.1:7077:7077`.
 
