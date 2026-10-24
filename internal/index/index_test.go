@@ -451,3 +451,101 @@ func TestSyncRaceKeepsOldRows(t *testing.T) {
 		t.Errorf("rows changed: hash %q -> %q", before, after)
 	}
 }
+
+// searchPaths runs Search and returns the distinct hit paths.
+func searchPaths(t *testing.T, ix *Indexer, q string, k int) []string {
+	t.Helper()
+	hits, err := ix.Search(context.Background(), q, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, h := range hits {
+		if !slices.Contains(got, h.Path) {
+			got = append(got, h.Path)
+		}
+	}
+	slices.Sort(got)
+	return got
+}
+
+func indexed(t *testing.T, files map[string]string) *Indexer {
+	t.Helper()
+	ix, _ := setup(t)
+	for rel, src := range files {
+		write(t, ix.Root(), rel, src)
+	}
+	if _, err := ix.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return ix
+}
+
+func TestSearchDropsNewlyIgnored(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple\n", "private/b.md": "# B\napple apple\n"})
+	if got := searchPaths(t, ix, "apple", 8); !slices.Equal(got, []string{"a.md", "private/b.md"}) {
+		t.Fatalf("before: %v", got)
+	}
+	var stale []string
+	ix.OnStale = func(p []string) { stale = append(stale, p...) }
+	write(t, ix.Root(), ".screeignore", "private/\n") // no sync
+	if got := searchPaths(t, ix, "apple", 8); !slices.Equal(got, []string{"a.md"}) {
+		t.Errorf("after: %v", got)
+	}
+	if !slices.Equal(stale, []string{"private/b.md"}) {
+		t.Errorf("OnStale got %v", stale)
+	}
+}
+
+func TestSearchDropsFrontMatterOptOut(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple\n", "b.md": "# B\napple\n"})
+	write(t, ix.Root(), "b.md", "---\nscree: ignore\n---\n# B\napple\n") // no sync
+	if got := searchPaths(t, ix, "apple", 8); !slices.Equal(got, []string{"a.md"}) {
+		t.Errorf("paths = %v", got)
+	}
+}
+
+func TestSearchDropsDeleted(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple\n", "b.md": "# B\napple\n"})
+	if err := os.Remove(filepath.Join(ix.Root(), "b.md")); err != nil {
+		t.Fatal(err)
+	}
+	if got := searchPaths(t, ix, "apple", 8); !slices.Equal(got, []string{"a.md"}) {
+		t.Errorf("paths = %v", got)
+	}
+}
+
+func TestSearchKeepsK(t *testing.T) {
+	files := map[string]string{}
+	for i := range 8 {
+		dir := "ok"
+		if i < 3 {
+			dir = "private"
+		}
+		files[fmt.Sprintf("%s/n%d.md", dir, i)] = "# N\n" + strings.Repeat("apple ", i+1) + "\n"
+	}
+	ix := indexed(t, files)
+	write(t, ix.Root(), ".screeignore", "private/\n")
+	got := searchPaths(t, ix, "apple", 5)
+	if len(got) != 5 {
+		t.Fatalf("got %d hits: %v", len(got), got)
+	}
+	for _, p := range got {
+		if strings.HasPrefix(p, "private/") {
+			t.Errorf("refused hit %q returned", p)
+		}
+	}
+}
+
+func TestSearchSkipsReadWhenUnchanged(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple\n"})
+	opened := 0
+	policy.TestHooks.BeforeOpen = func(string) { opened++ }
+	defer func() { policy.TestHooks.BeforeOpen = nil }()
+	if got := searchPaths(t, ix, "apple", 8); !slices.Equal(got, []string{"a.md"}) {
+		t.Fatalf("paths = %v", got)
+	}
+	if opened != 0 {
+		t.Errorf("search opened the file %d times; the stat matched", opened)
+	}
+}

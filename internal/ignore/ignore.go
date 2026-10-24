@@ -23,6 +23,7 @@ type rule struct {
 	segs    []string // pattern split on "/"; "**" matches any number of segments
 	neg     bool     // a "!" rule re-includes what it matches
 	dirOnly bool     // a trailing "/" matches folders only
+	line    int      // 1-based line in the ignore file
 }
 
 // Matcher holds the parsed rules of one ignore file.
@@ -58,6 +59,7 @@ func ParseWith(data []byte, o Options) *Matcher {
 		if !ok {
 			continue
 		}
+		r.line = i + 1
 		m.rules = append(m.rules, r)
 		m.hasNeg = m.hasNeg || r.neg
 	}
@@ -145,34 +147,65 @@ func translateClass(s string) string {
 }
 
 // Match reports whether the slash-separated path rel is ignored. isDir says
-// whether rel is a folder, for patterns that end in "/". A rule applies to
-// rel if it matches rel itself or any folder above it; the last rule that
-// applies wins.
+// whether rel is a folder, for patterns that end in "/". Rules are applied in
+// order. A rule that matches rel itself sets the verdict. A rule that matches
+// only a folder above rel excludes it, or, with "!", undoes folder
+// exclusions but never a rule that matched rel itself: with "*.private.md",
+// "archive/" and "!archive/2024/", archive/2024/x.private.md stays ignored.
 func (m *Matcher) Match(rel string, isDir bool) bool {
-	if m == nil || len(m.rules) == 0 {
-		return false
-	}
-	segs := strings.Split(m.key(rel), "/")
-	for i := len(m.rules) - 1; i >= 0; i-- {
-		r := m.rules[i]
-		if r.applies(segs, isDir) {
-			return !r.neg
-		}
-	}
-	return false
+	ignored, _ := m.Explain(rel, isDir)
+	return ignored
 }
 
-func (r rule) applies(segs []string, isDir bool) bool {
+// Explain is Match that also reports why. reincludedBy is the 1-based line
+// of the "!" rule that re-included rel after an earlier rule excluded it,
+// or 0.
+func (m *Matcher) Explain(rel string, isDir bool) (ignored bool, reincludedBy int) {
+	if m == nil || len(m.rules) == 0 {
+		return false, 0
+	}
+	segs := strings.Split(m.key(rel), "/")
+	cur, file, by := false, false, 0
+	for _, r := range m.rules {
+		self, ancestor := r.appliesTo(segs, isDir)
+		was := cur
+		switch {
+		case self:
+			cur, file = !r.neg, !r.neg
+		case !ancestor:
+			continue
+		case !r.neg:
+			cur = true
+		default:
+			cur = file
+		}
+		switch {
+		case cur:
+			by = 0
+		case was && r.neg:
+			by = r.line
+		}
+	}
+	return cur, by
+}
+
+// appliesTo reports whether r matches the path segs itself, and whether it
+// matches a folder above it.
+func (r rule) appliesTo(segs []string, isDir bool) (self, ancestor bool) {
 	for n := 1; n <= len(segs); n++ {
 		dir := n < len(segs) || isDir
 		if r.dirOnly && !dir {
 			continue
 		}
 		if matchSegs(r.segs, segs[:n], false) {
-			return true
+			if n == len(segs) {
+				self = true
+			} else {
+				ancestor = true
+			}
 		}
 	}
-	return false
+	return self, ancestor
 }
 
 // matchSegs matches pattern segments against path segments. With git set, a

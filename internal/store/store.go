@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
 	path TEXT PRIMARY KEY,
 	hash TEXT NOT NULL,
-	indexed_at INTEGER NOT NULL
+	indexed_at INTEGER NOT NULL,
+	mtime INTEGER,
+	size INTEGER
 );
 CREATE TABLE IF NOT EXISTS chunks(
 	id INTEGER PRIMARY KEY,
@@ -58,9 +60,18 @@ type Chunk struct {
 	Text    string
 }
 
+// FileStat is the modification time (Unix nanoseconds) and size of a file's
+// content as it was indexed.
+type FileStat struct {
+	Mtime, Size int64
+}
+
 // Hit is a search result.
 type Hit struct {
 	Chunk
+	// Stat is the file as it was indexed; nil for rows from before it was
+	// recorded.
+	Stat *FileStat
 	// Distance is the cosine distance to the query: 0 is identical, 2 is opposite.
 	Distance float64
 }
@@ -115,6 +126,9 @@ func (s *Store) init() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("store: schema: %w", err)
 	}
+	if err := s.migrate(); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
 	var n int
 	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'vecs'`).Scan(&n); err != nil {
 		return err
@@ -129,6 +143,36 @@ func (s *Store) init() error {
 		INSERT INTO vecs(cmd, vector) VALUES('rebuild', '{index:"flat", distance:"cos"}');`)
 	if err != nil {
 		return fmt.Errorf("store: creating vector table: %w", err)
+	}
+	return nil
+}
+
+// migrate adds the files columns that indexes from older versions lack.
+// Their rows get NULL, which search treats as unknown.
+func (s *Store) migrate() error {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info('files')`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []string{"mtime", "size"} {
+		if !have[col] {
+			if _, err := s.db.Exec(`ALTER TABLE files ADD COLUMN ` + col + ` INTEGER`); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -211,6 +255,35 @@ func (s *Store) FileHash(ctx context.Context, path string) (string, error) {
 	return h, err
 }
 
+// FileInfo returns the stored hash and stat for path: "" and nil if it is not
+// indexed, and a nil stat if none was recorded.
+func (s *Store) FileInfo(ctx context.Context, path string) (string, *FileStat, error) {
+	var h string
+	var mtime, size sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT hash, mtime, size FROM files WHERE path = ?`, path).Scan(&h, &mtime, &size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return h, statOf(mtime, size), nil
+}
+
+// SetFileStat records the stat of an indexed file whose content is
+// unchanged, for example after a touch.
+func (s *Store) SetFileStat(ctx context.Context, path string, st FileStat) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE files SET mtime = ?, size = ? WHERE path = ?`, st.Mtime, st.Size, path)
+	return err
+}
+
+func statOf(mtime, size sql.NullInt64) *FileStat {
+	if !mtime.Valid || !size.Valid {
+		return nil
+	}
+	return &FileStat{Mtime: mtime.Int64, Size: size.Int64}
+}
+
 // Paths returns every indexed file path.
 func (s *Store) Paths(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT path FROM files ORDER BY path`)
@@ -230,7 +303,7 @@ func (s *Store) Paths(ctx context.Context) ([]string, error) {
 }
 
 // ReplaceFile atomically swaps a file's chunks and vectors for new ones.
-func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, chunks []Chunk, vecs [][]float32) error {
+func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, st *FileStat, chunks []Chunk, vecs [][]float32) error {
 	if len(chunks) != len(vecs) {
 		return fmt.Errorf("store: %d chunks but %d vectors", len(chunks), len(vecs))
 	}
@@ -257,8 +330,13 @@ func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, 
 			return fmt.Errorf("store: inserting vector: %w", err)
 		}
 	}
+	var mtime, size sql.NullInt64
+	if st != nil {
+		mtime = sql.NullInt64{Int64: st.Mtime, Valid: true}
+		size = sql.NullInt64{Int64: st.Size, Valid: true}
+	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO files(path, hash, indexed_at) VALUES(?, ?, ?)`, path, hash, unix); err != nil {
+		`INSERT INTO files(path, hash, indexed_at, mtime, size) VALUES(?, ?, ?, ?, ?)`, path, hash, unix, mtime, size); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -301,9 +379,10 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.path, c.heading, c.line, c.text, v.distance
+		SELECT c.path, c.heading, c.line, c.text, v.distance, f.mtime, f.size
 		FROM (SELECT rowid, distance FROM vecs WHERE cmd = ? LIMIT ?) AS v
 		JOIN chunks c ON c.id = v.rowid
+		LEFT JOIN files f ON f.path = c.path
 		ORDER BY v.distance`, encode(query), k)
 	if err != nil {
 		return nil, fmt.Errorf("store: search: %w", err)
@@ -312,9 +391,11 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 	var hits []Hit
 	for rows.Next() {
 		var h Hit
-		if err := rows.Scan(&h.Path, &h.Heading, &h.Line, &h.Text, &h.Distance); err != nil {
+		var mtime, size sql.NullInt64
+		if err := rows.Scan(&h.Path, &h.Heading, &h.Line, &h.Text, &h.Distance, &mtime, &size); err != nil {
 			return nil, err
 		}
+		h.Stat = statOf(mtime, size)
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()

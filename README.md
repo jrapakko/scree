@@ -96,7 +96,7 @@ journal/
 !journal/public.md
 ```
 
-`include-hidden .name/` in `.screeignore` indexes another root hidden folder, and a pattern like `/.cursor/` drops one of the defaults.
+`include-hidden .name/` in `.screeignore` indexes another root hidden folder, and a pattern like `/.cursor/` drops one of the defaults. A `!` rule re-includes files inside an excluded folder, but never a file that a rule matched by name, so `*.private.md` stays ignored even under `!archive/2024/`; `doctor -v` lists what `!` re-included.
 
 ```
 ---

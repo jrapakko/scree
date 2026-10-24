@@ -463,7 +463,7 @@ func doctorScan(ctx context.Context, ix *index.Indexer, gitignore, verbose bool,
 	default:
 		report(true, "%s: not a git work tree", policy.GitIgnore.Layer())
 	}
-	report(true, "%s: %d", policy.IgnoreFile.Layer(), n(policy.IgnoreFile))
+	report(true, "%s: %d ignored, %d re-included by \"!\"", policy.IgnoreFile.Layer(), n(policy.IgnoreFile), len(sum.Reincluded))
 	report(true, "%s: %d", policy.FrontMatter.Layer(), n(policy.FrontMatter))
 	for _, e := range sum.IgnoreErrors {
 		// A bad .screeignore line is scree's own config; a bad pattern in a
@@ -492,5 +492,8 @@ func doctorScan(ctx context.Context, ix *index.Indexer, gitignore, verbose bool,
 	}
 	for _, e := range sum.ReadErrors {
 		fmt.Printf("  unreadable: %s\n", e)
+	}
+	for _, e := range sum.Reincluded {
+		fmt.Printf("  re-included: %s\n", e)
 	}
 }

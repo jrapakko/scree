@@ -37,10 +37,23 @@ func frontMatterIgnore(src []byte) bool {
 	return false // unclosed front matter is just text
 }
 
-// isIgnoreLine matches `scree: ignore` with an optionally quoted value and an
-// optional trailing comment, at the top level only.
+// isIgnoreLine matches `scree: ignore` at the top level only. The key may be
+// quoted ("scree" or 'scree') and followed by spaces or tabs before the
+// colon; the colon must be followed by whitespace. The value is ignore in any
+// case, optionally quoted, with an optional trailing comment.
 func isIgnoreLine(s string) bool {
-	rest, ok := strings.CutPrefix(s, "scree:")
+	var rest string
+	found := false
+	for _, key := range []string{"scree", `"scree"`, "'scree'"} {
+		if r, ok := strings.CutPrefix(s, key); ok {
+			rest, found = r, true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	rest, ok := strings.CutPrefix(strings.TrimLeft(rest, " \t"), ":")
 	if !ok || rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
 		return false
 	}
@@ -52,9 +65,9 @@ func isIgnoreLine(s string) bool {
 		}
 		rest = rest[:i]
 	}
-	switch strings.TrimRight(rest, " \t") {
-	case "ignore", "'ignore'", `"ignore"`:
-		return true
+	v := strings.TrimRight(rest, " \t")
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		v = v[1 : len(v)-1]
 	}
-	return false
+	return strings.EqualFold(v, "ignore")
 }

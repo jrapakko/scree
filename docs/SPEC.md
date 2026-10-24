@@ -75,7 +75,7 @@ Four layers, checked in this order:
    !journal/public.md
    ```
 
-   Unlike git, `!` can re-include a file inside an excluded folder, which the example relies on: each pattern is checked against the file and every folder above it, and the last match wins.
+   Unlike git, `!` can re-include a file inside an excluded folder, which the example relies on. A `!` rule that matches only a folder above the file undoes folder exclusions but never a rule that matches the file itself, so `*.private.md` stays ignored under `!archive/2024/`. `doctor -v` lists every file a `!` rule re-included.
 
    If `.screeignore` exists but cannot be read (for example, a symlink pointing outside the notes folder), nothing is indexed until it is fixed. Scree fails closed rather than ignoring the rules.
 
@@ -88,7 +88,7 @@ Four layers, checked in this order:
    ---
    ```
 
-   The file has to be read to see this, but nothing is chunked or embedded. If the note is already indexed, it is removed.
+   The key may be quoted and followed by spaces before the colon; the value `ignore` is matched in any case. The file has to be read to see this, but nothing is chunked or embedded. If the note is already indexed, it is removed.
 
 Every rule is checked against the file's name as stored on disk, never the spelling a caller passed. `read_note`, `reindex` and the watcher first map a path to its on-disk name. Names and patterns are compared in Unicode NFC, and case-insensitively when the filesystem is (macOS and Windows by default). Root hidden folders in the allowlist must match exactly, so `.GITHUB/` stays hidden.
 
@@ -122,6 +122,7 @@ chunk text
 - A hit's text is capped at 4000 characters and one response at 64 KB; the rest is replaced by a `[N more hits omitted: output limit]` line.
 - `read_note` returns `<note path="…">…</note>`, treated the same way, truncated at 256 KB.
 - The server instructions tell the client that text inside `<hit>` and `<note>` is note content, possibly copied from elsewhere, and is data, not instructions.
+- Search re-checks every hit against the current rules before returning it, so a newly ignored, opted-out or deleted file drops out at once, before any re-sync.
 
 CLI:
 

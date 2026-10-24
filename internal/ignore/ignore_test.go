@@ -243,3 +243,59 @@ func TestNFCMatching(t *testing.T) {
 		t.Errorf("Errors() = %q", errs)
 	}
 }
+
+func TestScreeignoreFileRuleBeatsFolderNegation(t *testing.T) {
+	cases := []struct {
+		file   string
+		checks []check
+	}{
+		{"*.private.md\narchive/\n!archive/2024/\n", []check{
+			{"archive/2024/salary.private.md", false, true},
+			{"archive/2024/a.md", false, false},
+			{"archive/2023/a.md", false, true},
+			{"x.private.md", false, true},
+		}},
+		{"journal/\n!journal/public.md\n", []check{
+			{"journal/public.md", false, false},
+			{"journal/x.md", false, true},
+		}},
+		// A later file rule still wins over an earlier negation.
+		{"archive/\n!archive/2024/\n*.private.md\n", []check{
+			{"archive/2024/s.private.md", false, true},
+			{"archive/2024/a.md", false, false},
+		}},
+		// A file-level "!" can re-include after a file rule.
+		{"*.private.md\n!keep.private.md\n", []check{
+			{"a/keep.private.md", false, false},
+			{"a/b.private.md", false, true},
+		}},
+	}
+	for _, c := range cases {
+		m := Parse([]byte(c.file))
+		for _, ch := range c.checks {
+			if got := m.Match(ch.path, ch.isDir); got != ch.want {
+				t.Errorf("%q: Match(%q) = %v, want %v", c.file, ch.path, got, ch.want)
+			}
+		}
+	}
+}
+
+func TestExplainReincluded(t *testing.T) {
+	m := Parse([]byte("# c\narchive/\n!archive/2024/\njournal/\n!journal/public.md\n!never-excluded.md\n"))
+	for _, c := range []struct {
+		path    string
+		ignored bool
+		by      int
+	}{
+		{"archive/2024/a.md", false, 3},
+		{"archive/2023/a.md", true, 0},
+		{"journal/public.md", false, 5},
+		{"never-excluded.md", false, 0},
+		{"other.md", false, 0},
+	} {
+		ignored, by := m.Explain(c.path, false)
+		if ignored != c.ignored || by != c.by {
+			t.Errorf("Explain(%q) = %v, %d, want %v, %d", c.path, ignored, by, c.ignored, c.by)
+		}
+	}
+}

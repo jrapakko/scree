@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -163,12 +164,13 @@ type Policy struct {
 	git   *gitRepo       // nil when the git layer is off or the root is not in a work tree
 	opts  ignore.Options // how patterns match: NFC always, case folded on case-insensitive filesystems
 
-	mu      sync.Mutex
-	m       *ignore.Matcher
-	allow   []string // root hidden folders that are searched
-	dirErrs []string // bad include-hidden directives
-	stamp   fileStamp
-	loadErr error
+	mu       sync.Mutex
+	m        *ignore.Matcher
+	allow    []string // root hidden folders that are searched
+	dirErrs  []string // bad include-hidden directives
+	ignLines []string // .screeignore's lines, for naming the rule that re-included a file
+	stamp    fileStamp
+	loadErr  error
 }
 
 // Options configures OpenOptions.
@@ -325,7 +327,32 @@ func (p *Policy) CheckName(rel string) Reason {
 // are *IgnoredError; a missing file gives an error wrapping fs.ErrNotExist.
 // Ignored files are never opened.
 func (p *Policy) Read(rel string) ([]byte, error) {
+	src, _, err := p.ReadStat(rel)
+	return src, err
+}
+
+// ReadStat is Read that also returns the opened file's FileInfo, which
+// matches the content returned.
+func (p *Policy) ReadStat(rel string) ([]byte, fs.FileInfo, error) {
 	clean, err := p.Canonical(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	rs, err := p.load()
+	if err != nil {
+		return nil, nil, err
+	}
+	if r := p.nameReason(clean); r != Allowed {
+		return nil, nil, ignored(clean, r)
+	}
+	return p.read(clean, true, rs)
+}
+
+// Check applies every rule Read applies except those that need the content
+// (front matter), without opening the file. It returns the FileInfo of the
+// file that would be read. rel is a store key, already in on-disk form.
+func (p *Policy) Check(rel string) (fs.FileInfo, error) {
+	clean, err := p.Clean(rel)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +363,8 @@ func (p *Policy) Read(rel string) ([]byte, error) {
 	if r := p.nameReason(clean); r != Allowed {
 		return nil, ignored(clean, r)
 	}
-	return p.read(clean, true, rs)
+	_, fi, err := p.check(clean, true, rs)
+	return fi, err
 }
 
 // rules are the loaded ignore rules for one operation.
@@ -361,20 +389,66 @@ func (p *Policy) load() (rules, error) {
 
 // read runs the checks after the name rules on rel. With resolve false, rel
 // is known to contain no symlinks and to sit in no nested repository.
-func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
+func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, fs.FileInfo, error) {
+	realRel, lfi, err := p.check(rel, resolve, rs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if TestHooks.BeforeOpen != nil {
+		TestHooks.BeforeOpen(realRel)
+	}
+	f, err := p.r.Open(realRel)
+	if err != nil {
+		return nil, nil, readErr(rel, err)
+	}
+	defer f.Close()
+	ffi, err := f.Stat()
+	if err != nil {
+		return nil, nil, readErr(rel, err)
+	}
+	// What was opened must be the file the rules were checked on, reached
+	// through the same folders: os.Root follows in-root symlinks in folder
+	// names, so a folder swapped for a link to a hidden one would otherwise
+	// pass. A swap and swap back between these checks remains possible; it
+	// needs a local process that can already read the files.
+	if !os.SameFile(lfi, ffi) {
+		return nil, nil, readErr(rel, ErrChanged)
+	}
+	if again, err := p.resolve(realRel); err != nil || again != realRel {
+		return nil, nil, readErr(rel, ErrChanged)
+	}
+	if now, err := p.r.Lstat(realRel); err != nil || !os.SameFile(now, ffi) {
+		return nil, nil, readErr(rel, ErrChanged)
+	}
+	src, err := io.ReadAll(io.LimitReader(f, p.max+1))
+	if err != nil {
+		return nil, nil, readErr(rel, err)
+	}
+	if int64(len(src)) > p.max {
+		return nil, nil, ignored(rel, TooLarge)
+	}
+	if frontMatterIgnore(src) {
+		return nil, nil, ignored(rel, FrontMatter)
+	}
+	return src, ffi, nil
+}
+
+// check runs every rule of read that needs no content, and returns the path
+// relative to the root that would be opened and its Lstat.
+func (p *Policy) check(rel string, resolve bool, rs rules) (string, fs.FileInfo, error) {
 	m := rs.m
 	realRel := rel
 	if resolve {
 		r, err := p.resolve(rel)
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
 		if realRel = r; realRel != rel {
 			if unsafeName(realRel) {
-				return nil, ignored(rel, UnsafeName)
+				return "", nil, ignored(rel, UnsafeName)
 			}
 			if r := p.nameReason(realRel); r != Allowed {
-				return nil, ignored(rel, r)
+				return "", nil, ignored(rel, r)
 			}
 		}
 	}
@@ -383,69 +457,32 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
 	}
 	lfi, err := p.r.Lstat(realRel)
 	if err != nil {
-		return nil, readErr(rel, err)
+		return "", nil, readErr(rel, err)
 	}
 	if lfi.Mode()&fs.ModeSymlink != 0 {
 		if !resolve {
 			// It became a symlink after Walk listed it.
-			return p.read(rel, true, rs)
+			return p.check(rel, true, rs)
 		}
-		return nil, readErr(rel, ErrChanged)
+		return "", nil, readErr(rel, ErrChanged)
 	}
 	if !lfi.Mode().IsRegular() {
-		return nil, readErr(rel, ErrNotRegular)
+		return "", nil, readErr(rel, ErrNotRegular)
 	}
 	if lfi.Size() > p.max {
-		return nil, ignored(rel, TooLarge)
+		return "", nil, ignored(rel, TooLarge)
 	}
 	if rs.g != nil {
 		for _, x := range []string{rel, realRel} {
 			if r := rs.g.fileReason(x, resolve); r != Allowed {
-				return nil, ignored(rel, r)
+				return "", nil, ignored(rel, r)
 			}
 		}
 	}
 	if m.Match(rel, false) || m.Match(realRel, false) {
-		return nil, ignored(rel, IgnoreFile)
+		return "", nil, ignored(rel, IgnoreFile)
 	}
-
-	if TestHooks.BeforeOpen != nil {
-		TestHooks.BeforeOpen(realRel)
-	}
-	f, err := p.r.Open(realRel)
-	if err != nil {
-		return nil, readErr(rel, err)
-	}
-	defer f.Close()
-	ffi, err := f.Stat()
-	if err != nil {
-		return nil, readErr(rel, err)
-	}
-	// What was opened must be the file the rules were checked on, reached
-	// through the same folders: os.Root follows in-root symlinks in folder
-	// names, so a folder swapped for a link to a hidden one would otherwise
-	// pass. A swap and swap back between these checks remains possible; it
-	// needs a local process that can already read the files.
-	if !os.SameFile(lfi, ffi) {
-		return nil, readErr(rel, ErrChanged)
-	}
-	if again, err := p.resolve(realRel); err != nil || again != realRel {
-		return nil, readErr(rel, ErrChanged)
-	}
-	if now, err := p.r.Lstat(realRel); err != nil || !os.SameFile(now, ffi) {
-		return nil, readErr(rel, ErrChanged)
-	}
-	src, err := io.ReadAll(io.LimitReader(f, p.max+1))
-	if err != nil {
-		return nil, readErr(rel, err)
-	}
-	if int64(len(src)) > p.max {
-		return nil, ignored(rel, TooLarge)
-	}
-	if frontMatterIgnore(src) {
-		return nil, ignored(rel, FrontMatter)
-	}
-	return src, nil
+	return realRel, lfi, nil
 }
 
 // resolve follows every symlink in rel and returns the result relative to
@@ -471,11 +508,18 @@ func (p *Policy) resolve(rel string) (string, error) {
 // error, and fails before visiting anything if .screeignore or the git rules
 // that apply to the root cannot be read.
 func (p *Policy) Walk(ctx context.Context, fn func(rel string, src []byte, err error) error) error {
+	_, err := p.walk(ctx, func(rel string, src []byte, _ fs.FileInfo, err error) error { return fn(rel, src, err) })
+	return err
+}
+
+// WalkStat is Walk that also passes the FileInfo of each allowed file as it
+// was opened, matching src.
+func (p *Policy) WalkStat(ctx context.Context, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) error {
 	_, err := p.walk(ctx, fn)
 	return err
 }
 
-func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, err error) error) (rules, error) {
+func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) (rules, error) {
 	rs, err := p.load()
 	if err != nil {
 		return rs, err
@@ -495,14 +539,14 @@ func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, err e
 			if d != nil && d.IsDir() {
 				rel += "/"
 			}
-			return fn(rel, nil, readErr(rel, err))
+			return fn(rel, nil, nil, readErr(rel, err))
 		}
 		if d.IsDir() {
 			r, cause := p.dirReason(rel, rs)
 			if r == Allowed {
 				return nil
 			}
-			if err := fn(rel+"/", nil, &IgnoredError{Path: rel + "/", Reason: r, Cause: cause}); err != nil {
+			if err := fn(rel+"/", nil, nil, &IgnoredError{Path: rel + "/", Reason: r, Cause: cause}); err != nil {
 				return err
 			}
 			return filepath.SkipDir
@@ -511,24 +555,24 @@ func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, err e
 			return nil
 		}
 		if _, err := p.Clean(rel); err != nil {
-			return fn(rel, nil, err)
+			return fn(rel, nil, nil, err)
 		}
 		resolve := d.Type()&fs.ModeSymlink != 0
 		if resolve {
 			if real, err := filepath.EvalSymlinks(abs); err == nil {
 				if fi, err := os.Stat(real); err == nil && fi.IsDir() {
 					if _, ok := relUnder(p.root, real); !ok {
-						return fn(rel+"/", nil, ignored(rel+"/", OutsideRoot))
+						return fn(rel+"/", nil, nil, ignored(rel+"/", OutsideRoot))
 					}
 					return nil
 				}
 			}
 		}
 		if r := p.nameReason(rel); r != Allowed {
-			return fn(rel, nil, ignored(rel, r))
+			return fn(rel, nil, nil, ignored(rel, r))
 		}
-		src, err := p.read(rel, resolve, rs)
-		return fn(rel, src, err)
+		src, fi, err := p.read(rel, resolve, rs)
+		return fn(rel, src, fi, err)
 	})
 }
 
@@ -574,16 +618,22 @@ type Summary struct {
 	Ignored      map[Reason][]string
 	IgnoreErrors []string // bad patterns and directives, each prefixed with its file name
 	ReadErrors   []string // files or folders that could not be read, with the reason
+	// Reincluded lists allowed files that an earlier .screeignore rule
+	// excluded and a "!" rule re-included, as
+	// `"path" (.screeignore line N: !pattern)`.
+	Reincluded []string
 }
 
 // Scan walks the root and counts allowed and ignored files by reason. Files
 // that fail to read for other reasons are listed in ReadErrors.
 func (p *Policy) Scan(ctx context.Context) (Summary, error) {
 	s := Summary{Ignored: map[Reason][]string{}}
-	rs, err := p.walk(ctx, func(rel string, src []byte, err error) error {
+	var allowed []string
+	rs, err := p.walk(ctx, func(rel string, src []byte, _ fs.FileInfo, err error) error {
 		var ie *IgnoredError
 		switch {
 		case err == nil:
+			allowed = append(allowed, rel)
 			s.Allowed++
 			s.Bytes += int64(len(src))
 		case errors.As(err, &ie):
@@ -596,6 +646,15 @@ func (p *Policy) Scan(ctx context.Context) (Summary, error) {
 		}
 		return nil
 	})
+	p.mu.Lock()
+	lines := p.ignLines
+	p.mu.Unlock()
+	for _, rel := range allowed {
+		if _, n := rs.m.Explain(rel, false); n > 0 && n <= len(lines) {
+			s.Reincluded = append(s.Reincluded, fmt.Sprintf("%s (%s line %d: %s)",
+				strconv.Quote(rel), IgnoreFileName, n, strings.TrimSpace(lines[n-1])))
+		}
+	}
 	p.mu.Lock()
 	for _, e := range append(slices.Clone(p.dirErrs), p.m.Errors()...) {
 		s.IgnoreErrors = append(s.IgnoreErrors, IgnoreFileName+" "+e)
@@ -636,7 +695,7 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 	if p.stamp == st {
 		return p.m, p.loadErr
 	}
-	p.m, p.loadErr = nil, nil
+	p.m, p.loadErr, p.ignLines = nil, nil, nil
 	p.allow, p.dirErrs = DefaultHiddenAllow, nil
 	if st.missing {
 		p.m = ignore.ParseWith(nil, p.opts)
@@ -649,6 +708,7 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 			p.m = ignore.ParseWith(rest, p.opts)
 			p.allow = append(slices.Clone(DefaultHiddenAllow), allow...)
 			p.dirErrs = errs
+			p.ignLines = strings.Split(string(rest), "\n")
 		}
 	}
 	p.stamp = st

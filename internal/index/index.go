@@ -31,6 +31,11 @@ type Indexer struct {
 	// MinBackoff is the first pause after the embedding API is unavailable;
 	// each further failure doubles it, up to MaxBackoff. 0 means 30 s.
 	MinBackoff time.Duration
+	// OnStale, when set, receives the paths whose hits Search dropped because
+	// the policy now refuses them or they are gone, so the process that
+	// writes the index can drop their rows. Nil means leave them; the
+	// writer's watcher or next sync removes them.
+	OnStale func(paths []string)
 
 	mu         sync.Mutex
 	pauseUntil time.Time
@@ -98,10 +103,11 @@ func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err
 	clean, err := ix.Policy.Canonical(rel)
 	if err == nil {
 		var src []byte
-		src, err = ix.Policy.Read(clean)
+		var fi fs.FileInfo
+		src, fi, err = ix.Policy.ReadStat(clean)
 		switch {
 		case err == nil:
-			return ix.indexSrc(ctx, clean, src)
+			return ix.indexSrc(ctx, clean, src, fi)
 		case errors.Is(err, fs.ErrNotExist):
 			return ix.remove(ctx, clean)
 		}
@@ -118,13 +124,21 @@ func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err
 }
 
 // indexSrc stores src as the content of rel, embedding it only if its hash
-// changed.
-func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte) (bool, error) {
+// changed. fi is the file as opened; its mtime and size are recorded so
+// search can tell when the file changed since.
+func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.FileInfo) (bool, error) {
 	sum := sha256.Sum256(src)
 	hash := hex.EncodeToString(sum[:])
-	have, err := ix.Store.FileHash(ctx, rel)
-	if err != nil || have == hash {
+	st := &store.FileStat{Mtime: fi.ModTime().UnixNano(), Size: fi.Size()}
+	have, haveSt, err := ix.Store.FileInfo(ctx, rel)
+	if err != nil {
 		return false, err
+	}
+	if have == hash {
+		if haveSt == nil || *haveSt != *st {
+			return false, ix.Store.SetFileStat(ctx, rel, *st)
+		}
+		return false, nil
 	}
 
 	pieces := chunk.Split(string(src))
@@ -141,7 +155,7 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte) (bool, 
 			return false, fmt.Errorf("%q: %w", rel, err)
 		}
 	}
-	if err := ix.Store.ReplaceFile(ctx, rel, hash, time.Now().Unix(), chunks, vecs); err != nil {
+	if err := ix.Store.ReplaceFile(ctx, rel, hash, time.Now().Unix(), st, chunks, vecs); err != nil {
 		return false, fmt.Errorf("%q: %w", rel, err)
 	}
 	ix.logf("indexed %q (%d chunks)", rel, len(chunks))
@@ -193,7 +207,7 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 		seen = map[string]bool{}
 		keep []string // folders that could not be read: keep their rows
 	)
-	err := ix.Policy.Walk(ctx, func(rel string, src []byte, err error) error {
+	err := ix.Policy.WalkStat(ctx, func(rel string, src []byte, fi fs.FileInfo, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -210,7 +224,7 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 			ix.logf("error: %v", err)
 			return nil
 		}
-		changed, err := ix.indexSrc(ctx, rel, src)
+		changed, err := ix.indexSrc(ctx, rel, src, fi)
 		switch {
 		case errors.Is(err, embed.ErrUnavailable):
 			if st.Deferred == 0 {
@@ -258,7 +272,49 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit
 	if err != nil {
 		return nil, err
 	}
-	return ix.Store.Search(ctx, vecs[0], k)
+	// Over-fetch, since hits the policy now refuses are dropped.
+	hits, err := ix.Store.Search(ctx, vecs[0], max(k, min(2*k, 100)))
+	if err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{}
+	var stale []string
+	out := hits[:0]
+	for _, h := range hits {
+		ok, seen := allowed[h.Path]
+		if !seen {
+			ok = ix.stillAllowed(h)
+			allowed[h.Path] = ok
+			if !ok {
+				stale = append(stale, h.Path)
+			}
+		}
+		if ok {
+			out = append(out, h)
+		}
+	}
+	if len(out) > k {
+		out = out[:k]
+	}
+	if len(stale) > 0 && ix.OnStale != nil {
+		ix.OnStale(stale)
+	}
+	return out, nil
+}
+
+// stillAllowed re-checks a hit's file against the current rules: a stat-only
+// Check, and a full Read (for front matter) when the file's mtime or size
+// differs from what was indexed. Any refusal or error drops the hit.
+func (ix *Indexer) stillAllowed(h store.Hit) bool {
+	fi, err := ix.Policy.Check(h.Path)
+	if err != nil {
+		return false
+	}
+	if h.Stat != nil && h.Stat.Mtime == fi.ModTime().UnixNano() && h.Stat.Size == fi.Size() {
+		return true
+	}
+	_, err = ix.Policy.Read(h.Path)
+	return err == nil
 }
 
 func (ix *Indexer) logf(format string, args ...any) {

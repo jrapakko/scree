@@ -24,6 +24,16 @@ func TestFrontMatterIgnore(t *testing.T) {
 		{"hash without space", "---\nscree: ignore#x\n---\n", false},
 		{"empty", "", false},
 		{"not first line", "\n---\nscree: ignore\n---\n", false},
+		{"double-quoted key", "---\n\"scree\": ignore\n---\n", true},
+		{"single-quoted key", "---\n'scree': ignore\n---\n", true},
+		{"space before colon", "---\nscree : ignore\n---\n", true},
+		{"tab after colon", "---\nscree:\tignore\n---\n", true},
+		{"upper case value", "---\nscree: IGNORE\n---\n", true},
+		{"quoted mixed case and comment", "---\nscree: \"Ignore\"   # c\n---\n", true},
+		{"nested two spaces", "---\n  scree: ignore\n---\n", false},
+		{"other key", "---\nscreen: ignore\n---\n", false},
+		{"whole line quoted", "---\n\"scree: ignore\"\n---\n", false},
+		{"mismatched quotes", "---\nscree: \"ignore'\n---\n", false},
 	}
 	for _, c := range cases {
 		if got := frontMatterIgnore([]byte(c.src)); got != c.want {
