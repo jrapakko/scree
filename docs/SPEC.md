@@ -41,24 +41,29 @@ Library choices are starting points. Check each project's current docs before co
 5. Split by heading, embed the chunks, then delete the file's old rows and insert the new ones. Within a section, a chunk is closed at a blank line once it reaches about 2500 characters, and it is hard-capped at 3500, even mid-line or inside a code fence; an overlong line is cut on a character boundary. Each heading is capped at 120 characters.
 6. On delete or rename, remove the old path's rows.
 
-The watcher re-adds its watches after a folder is renamed, so edits under the new name are seen. It exits with an error when the index file or the notes folder is removed or replaced, and relies on its supervisor (systemd, Docker) to restart it.
+The watcher re-adds its watches after a folder is renamed, so edits under the new name are seen. It never watches a folder the policy skips (hidden, gitignored, a nested repository, or excluded by `.screeignore`), and it re-adds its watches after any ignore file changes. It exits with an error when the index file or the notes folder is removed or replaced, and relies on its supervisor (systemd, Docker) to restart it.
 
 One process writes to the index. Files are indexed one at a time, so a large re-index cannot spike memory.
+
+## What gets indexed
+
+Markdown files (`.md`, `.markdown`) anywhere in the indexed folder, including the root forge, CI and agent folders listed under Ignoring files (pull-request templates, `.claude/agents`, Cursor and Codex rules written in markdown), minus whatever the ignore layers exclude. Nothing else: no code, no YAML, no JSON.
 
 ## Ignoring files
 
 An ignored file is never read for indexing, never sent to the embedding API, never returned by `search_notes`, and refused by `read_note` and `reindex(path)`. Ignoring is the way to keep private notes from leaving the machine.
 
-Three layers, checked in this order:
+Four layers, checked in this order:
 
 1. **Built-in rules, always on:**
-   - Hidden files and folders, meaning any path segment starting with `.` (`.git`, `.obsidian`, `.trash`). The one exception is `.screeignore` itself, which is watched but never indexed.
+   - Hidden files and folders, meaning any path segment starting with `.` (`.git`, `.obsidian`, `.trash`), with two exceptions. `.screeignore` itself is watched but never indexed. And these folders **at the root** of the indexed folder are searched like any other: `.claude/` (except `.claude/worktrees/`, which holds full copies of the repo), `.github/`, `.gitlab/`, `.gitea/`, `.forgejo/`, `.cursor/`, `.codex/`, `.gemini/`, `.windsurf/`, `.circleci/` and `.buildkite/`. The same name deeper in the tree, and any hidden segment inside them, stays hidden. Every other rule applies inside them.
    - Anything that isn't `.md` or `.markdown`.
    - Symlinks whose target resolves outside the notes folder. A symlink inside it is followed like a normal file, and every rule here, including the extension and `.screeignore`, applies to both the link path and the resolved target. Symlinked folders are never descended.
    - Files larger than 1 MB, which are usually exports or logs rather than notes. `SCREE_MAX_FILE_BYTES` changes the limit.
    - File names containing control characters or invalid UTF-8 (unsafe name).
    - Non-regular files such as FIFOs and devices, which are skipped without being opened.
-2. **`.screeignore`** at the root of the notes folder, using gitignore syntax: one pattern per line, `#` comments, `!` to re-include, a leading `/` anchors to the root, a trailing `/` matches folders only, and `**` matches any depth. Only the root file is read, not nested ones. Example:
+2. **Git's ignore rules**, when the folder is inside a git work tree (a `.git` folder or file in it or any folder above it): every `.gitignore` from the work tree's top down, `.git/info/exclude`, and the global excludes file (`core.excludesFile` from `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` or the repo's config, default `$XDG_CONFIG_HOME/git/ignore`; `[include]` is not followed). Git's semantics apply: a pattern is relative to the folder of its `.gitignore`, a deeper file overrides a shallower one, and a file inside an excluded folder cannot be re-included, so excluded folders such as `node_modules/` are never descended. A folder that holds its own `.git` (a nested repository or submodule) is skipped. One divergence: a tracked file that matches a pattern is still ignored, since scree does not read git's index. A `.gitignore` that cannot be read excludes its folder. `-gitignore=false` turns this layer off.
+3. **`.screeignore`** at the root of the notes folder, using gitignore syntax: one pattern per line, `#` comments, `!` to re-include, a leading `/` anchors to the root, a trailing `/` matches folders only, and `**` matches any depth. Only the root file is read, not nested ones. It is applied after git's rules and can only exclude more. Example:
 
    ```
    # journal stays local
@@ -71,7 +76,9 @@ Three layers, checked in this order:
    Unlike git, `!` can re-include a file inside an excluded folder, which the example relies on: each pattern is checked against the file and every folder above it, and the last match wins.
 
    If `.screeignore` exists but cannot be read (for example, a symlink pointing outside the notes folder), nothing is indexed until it is fixed. Scree fails closed rather than ignoring the rules.
-3. **Front matter opt-out** for a single note, without touching the ignore file:
+
+   A line `include-hidden .name/` adds another root folder to that list (one segment starting with `.`; `.git` is refused; write `\include-hidden` for a literal pattern). To drop a default, exclude it with an ordinary pattern such as `/.cursor/`.
+4. **Front matter opt-out** for a single note, without touching the ignore file:
 
    ```
    ---
@@ -85,9 +92,9 @@ When the rules change, the index follows:
 
 - Editing `.screeignore` triggers a sync. Newly ignored files are removed from the index, and newly included ones are indexed.
 - Adding `scree: ignore` to a note removes it on the next save. Removing the line re-indexes it.
-- `.gitignore` is not read. Notes folders often ignore files in git for reasons that have nothing to do with search.
+- Editing a `.gitignore` at any level triggers a sync, like `.screeignore`. Changes to `.git/info/exclude` or the global excludes file are picked up on the next sync (session start, `reindex`, or any ignore-file edit).
 
-`scree doctor` reports how many files each layer ignored. A hidden folder or a folder `.screeignore` excludes outright counts as one entry. `scree doctor -v` lists the ignored paths, so a pattern can be checked before it matters.
+`scree doctor` reports how many files each layer ignored, including `.gitignore` (with nested repositories counted separately). A hidden folder or a folder `.screeignore` excludes outright counts as one entry. `scree doctor -v` lists the ignored paths, so a pattern can be checked before it matters.
 
 ## Tools and commands
 

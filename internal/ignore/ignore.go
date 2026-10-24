@@ -1,9 +1,10 @@
 // Package ignore matches slash-separated paths against gitignore-style
 // patterns, as used by a notes folder's .screeignore file.
 //
-// It differs from git in one way: a "!" rule can re-include a file inside an
-// excluded folder, because each rule is checked against the file and every
-// ancestor folder and the last matching rule wins.
+// Matcher.Match differs from git in one way: a "!" rule can re-include a file
+// inside an excluded folder, because each rule is checked against the file and
+// every ancestor folder and the last matching rule wins. GitRules applies the
+// same patterns the way git does.
 package ignore
 
 import (
@@ -150,18 +151,24 @@ func (r rule) applies(segs []string, isDir bool) bool {
 		if r.dirOnly && !dir {
 			continue
 		}
-		if matchSegs(r.segs, segs[:n]) {
+		if matchSegs(r.segs, segs[:n], false) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchSegs(pat, name []string) bool {
+// matchSegs matches pattern segments against path segments. With git set, a
+// trailing "**" matches one or more segments, as in git, so "a/**" matches
+// what is inside a but not a itself; otherwise it also matches none.
+func matchSegs(pat, name []string, git bool) bool {
 	for len(pat) > 0 {
 		if pat[0] == "**" {
+			if git && len(pat) == 1 {
+				return len(name) > 0
+			}
 			for k := 0; k <= len(name); k++ {
-				if matchSegs(pat[1:], name[k:]) {
+				if matchSegs(pat[1:], name[k:], git) {
 					return true
 				}
 			}
@@ -176,6 +183,30 @@ func matchSegs(pat, name []string) bool {
 		pat, name = pat[1:], name[1:]
 	}
 	return len(name) == 0
+}
+
+// MatchSelf applies the rules to the slash-separated path rel itself, not to
+// the folders above it, with git's meaning of a trailing "**". matched reports
+// whether any rule matched; negated reports whether the last one that did was
+// a "!" rule. This is the per-file step of git's matching; see GitRules.
+func (m *Matcher) MatchSelf(rel string, isDir bool) (matched, negated bool) {
+	return m.matchSelf(strings.Split(rel, "/"), isDir)
+}
+
+func (m *Matcher) matchSelf(segs []string, isDir bool) (matched, negated bool) {
+	if m == nil {
+		return false, false
+	}
+	for i := len(m.rules) - 1; i >= 0; i-- {
+		r := m.rules[i]
+		if r.dirOnly && !isDir {
+			continue
+		}
+		if matchSegs(r.segs, segs, true) {
+			return true, r.neg
+		}
+	}
+	return false, false
 }
 
 // Prunable reports whether everything under the folder dirRel is ignored, so

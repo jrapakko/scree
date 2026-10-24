@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,7 +44,7 @@ Usage:
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
 
-Every command takes -notes and -db. Environment:
+Every command takes -notes, -db and -gitignore. Environment:
   SCREE_NOTES         notes folder (required unless -notes is given)
   SCREE_DB            index file (default $XDG_DATA_HOME/scree/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
@@ -61,7 +62,7 @@ type config struct {
 	notes, db, model, url, apiKey string
 	dims                          int
 	maxBytes                      int64
-	zdr                           bool
+	zdr, gitignore                bool
 }
 
 func main() {
@@ -106,6 +107,7 @@ func flags(name string, cfg *config) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	fs.StringVar(&cfg.notes, "notes", os.Getenv("SCREE_NOTES"), "notes folder")
 	fs.StringVar(&cfg.db, "db", envOr("SCREE_DB", defaultDB()), "index file")
+	fs.BoolVar(&cfg.gitignore, "gitignore", true, "honor .gitignore, .git/info/exclude and core.excludesFile")
 	cfg.model = envOr("SCREE_MODEL", "openai/text-embedding-3-small")
 	cfg.url = envOr("SCREE_EMBED_URL", "https://openrouter.ai/api/v1/embeddings")
 	cfg.apiKey = os.Getenv("OPENROUTER_API_KEY")
@@ -180,7 +182,7 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
 		return nil, fmt.Errorf("notes folder %s is not a directory", root)
 	}
-	p, err := policy.Open(root, cfg.maxBytes)
+	p, err := policy.OpenOptions(root, policy.Options{MaxBytes: cfg.maxBytes, GitIgnore: cfg.gitignore})
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +371,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	}
 	defer closeIndexer(ix)
 	report(true, "notes folder %s", ix.Root())
-	doctorScan(ctx, ix, *verbose, report, warn)
+	doctorScan(ctx, ix, cfg.gitignore, *verbose, report, warn)
 
 	st, err := ix.Store.Stats(ctx)
 	report(err == nil, "index %s: %d notes, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
@@ -412,7 +414,7 @@ func runDoctor(ctx context.Context, args []string) error {
 }
 
 // doctorScan reports what the ignore layers do to the notes folder.
-func doctorScan(ctx context.Context, ix *index.Indexer, verbose bool, report func(bool, string, ...any), warn func(string, ...any)) {
+func doctorScan(ctx context.Context, ix *index.Indexer, gitignore, verbose bool, report func(bool, string, ...any), warn func(string, ...any)) {
 	sum, err := ix.Policy.Scan(ctx)
 	if err != nil {
 		report(false, "notes: %v (nothing will be indexed)", err)
@@ -422,10 +424,28 @@ func doctorScan(ctx context.Context, ix *index.Indexer, verbose bool, report fun
 	report(true, "notes: %d indexable", sum.Allowed)
 	report(true, "built-in: %d hidden, %d not markdown, %d outside notes folder, %d too large, %d unsafe name",
 		n(policy.Hidden), n(policy.NotMarkdown), n(policy.OutsideRoot), n(policy.TooLarge), n(policy.UnsafeName))
+	switch {
+	case ix.Policy.GitTop() != "":
+		nested := "nested repositories"
+		if n(policy.NestedRepo) == 1 {
+			nested = "nested repository"
+		}
+		report(true, "%s: %d (%d %s)", policy.GitIgnore.Layer(), n(policy.GitIgnore), n(policy.NestedRepo), nested)
+	case !gitignore:
+		report(true, "%s: off (-gitignore=false)", policy.GitIgnore.Layer())
+	default:
+		report(true, "%s: not a git work tree", policy.GitIgnore.Layer())
+	}
 	report(true, "%s: %d", policy.IgnoreFile.Layer(), n(policy.IgnoreFile))
 	report(true, "%s: %d", policy.FrontMatter.Layer(), n(policy.FrontMatter))
 	for _, e := range sum.IgnoreErrors {
-		report(false, "%s %s", policy.IgnoreFileName, e)
+		// A bad .screeignore line is scree's own config; a bad pattern in a
+		// .gitignore or git excludes file is only worth a warning.
+		if strings.HasPrefix(e, policy.IgnoreFileName+" ") {
+			report(false, "%s", e)
+		} else {
+			warn("%s", e)
+		}
 	}
 	if len(sum.ReadErrors) > 0 {
 		warn("unreadable: %d (doctor -v lists them)", len(sum.ReadErrors))

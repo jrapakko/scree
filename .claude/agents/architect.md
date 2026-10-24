@@ -11,7 +11,7 @@ Start by reading `docs/SPEC.md` and `README.md`, then the packages under `intern
 
 Your job:
 - Turn a requested change into a concrete plan: which packages and functions change, new types or schema, migration of existing indexes, and what tests prove it works.
-- Review existing design against the spec's constraints: single static binary with CGO disabled, roughly 20–50 MB idle memory, one writer process (`scree watch`), markdown as source of truth, index rebuildable at any time.
+- Review existing design against the spec's constraints: single static binary with CGO disabled, roughly 20–50 MB idle memory, one writer per index (the process holding its lock: `scree serve` in a Claude Code session, or `scree watch`), markdown as source of truth, index rebuildable at any time.
 - Call out trade-offs and name the option you recommend. Do not list options you would not pick.
 
 Rules:

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,6 +28,9 @@ const Debounce = 1500 * time.Millisecond
 // file are still the ones it started with. A variable so tests can shorten it.
 var HealthInterval = 10 * time.Second
 
+// onWatcher, when set by a test, receives the watcher Run creates.
+var onWatcher func(*fsnotify.Watcher)
+
 // Run watches the notes folder until ctx is done. It does not do an initial
 // sync; call ix.Sync first. It returns an error if the notes folder or the
 // index file is removed or replaced, so a supervisor can restart it.
@@ -36,10 +40,12 @@ func Run(ctx context.Context, ix *index.Indexer) error {
 		return err
 	}
 	defer w.Close()
+	if onWatcher != nil {
+		onWatcher(w)
+	}
 
 	root := ix.Root()
-	ignoreFile := filepath.Join(root, policy.IgnoreFileName)
-	if err := addTree(w, root); err != nil {
+	if err := addTree(w, ix, root); err != nil {
 		return err
 	}
 
@@ -139,45 +145,74 @@ func Run(ctx context.Context, ix *index.Indexer) error {
 				// name would otherwise reuse them, still carrying old paths.
 				dropWatches(w, ev.Name)
 			}
-			name := filepath.Base(ev.Name)
-			if strings.HasPrefix(name, ".") && ev.Name != ignoreFile {
+			if dropEvent(ix, ev.Name) {
 				continue
 			}
 			if ev.Has(fsnotify.Create) {
 				// Lstat: a symlinked folder is never watched or descended.
 				if fi, err := os.Lstat(ev.Name); err == nil && fi.IsDir() {
-					// A new or moved-in folder: watch it and pick up its notes.
-					addTree(w, ev.Name)
-					queueTree(ev.Name, queue)
+					// A new or moved-in folder: watch it and pick up its
+					// notes, unless the policy skips it.
+					addTree(w, ix, ev.Name)
+					queueTree(ix, ev.Name, queue)
 					continue
 				}
 			}
 			queue(ev.Name)
 		case abs := <-ready:
 			// One path at a time, on this goroutine, so there is one writer.
-			if handle(ctx, ix, abs) && resyncC == nil {
+			if handle(ctx, w, ix, abs) && resyncC == nil {
 				armResync()
 			}
 		}
 	}
 }
 
+// dropEvent reports whether an event for abs can be ignored without a
+// look: a hidden path the policy skips both as a file and as a folder.
+// .screeignore and every .gitignore always pass, and so does a path under an
+// allowed root folder such as .github/. Other ignored paths pass too, so
+// handle can drop stale rows.
+func dropEvent(ix *index.Indexer, abs string) bool {
+	rel, err := ix.Rel(abs)
+	if err != nil || rel == "." {
+		return false
+	}
+	if rel == policy.IgnoreFileName || path.Base(rel) == policy.GitIgnoreFileName {
+		return false
+	}
+	if !strings.HasPrefix(rel, ".") && !strings.Contains(rel, "/.") {
+		return false
+	}
+	return ix.Policy.CheckName(rel) == policy.Hidden && ix.Policy.SkipDir(rel) == policy.Hidden
+}
+
+// isIgnoreFile reports whether rel is .screeignore or any .gitignore.
+func isIgnoreFile(rel string) bool {
+	return rel == policy.IgnoreFileName || path.Base(rel) == policy.GitIgnoreFileName
+}
+
 // handle indexes or removes one changed path. It reports whether a note was
 // deferred because the embedding API is unavailable.
-func handle(ctx context.Context, ix *index.Indexer, abs string) (deferred bool) {
+func handle(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, abs string) (deferred bool) {
 	rel, err := ix.Rel(abs)
 	if err != nil {
 		return false
 	}
-	if rel == policy.IgnoreFileName {
-		// The rules changed: drop newly ignored notes, add newly included ones.
+	if isIgnoreFile(rel) {
+		// The rules changed: watch newly included folders and drop newly
+		// ignored ones, then sync, which also picks up anything created
+		// while the watches were changing.
+		if err := syncWatches(w, ix); err != nil {
+			ix.Log.Printf("watch: %v", err)
+		}
 		st, err := ix.Sync(ctx)
 		if err != nil {
 			ix.Log.Printf("error: %v", err)
 			return false
 		}
 		ix.Log.Printf("%s changed: %d notes, %d indexed, %d removed, %d failed, %d deferred",
-			policy.IgnoreFileName, st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
+			rel, st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
 		return st.Deferred > 0
 	}
 	fi, err := os.Lstat(abs)
@@ -219,33 +254,88 @@ func dropWatches(w *fsnotify.Watcher, abs string) {
 	}
 }
 
-func addTree(w *fsnotify.Watcher, root string) error {
-	dropWatches(w, root)
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
+// skipDir reports whether the folder abs is not watched: the policy skips
+// it (hidden, gitignored, a nested repository, or excluded by .screeignore),
+// or it is not under the root. The root itself is always watched.
+func skipDir(ix *index.Indexer, abs string) bool {
+	if abs == ix.Root() {
+		return false
+	}
+	rel, err := ix.Rel(abs)
+	switch {
+	case err != nil:
+		return true
+	case rel == ".":
+		return false
+	}
+	return ix.Policy.SkipDir(rel) != policy.Allowed
+}
+
+// walkDirs calls fn for every folder under top that is watched, without
+// descending into the ones the policy skips.
+func walkDirs(ix *index.Indexer, top string, fn func(string) error) error {
+	return filepath.WalkDir(top, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
 			return nil
 		}
-		if !d.IsDir() {
-			return nil
-		}
-		if p != root && strings.HasPrefix(d.Name(), ".") {
+		if skipDir(ix, p) {
 			return filepath.SkipDir
 		}
-		return w.Add(p)
+		return fn(p)
 	})
 }
 
-func queueTree(root string, queue func(string)) {
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+// addTree drops the watches on top and everything under it, then watches
+// every folder there the policy allows.
+func addTree(w *fsnotify.Watcher, ix *index.Indexer, top string) error {
+	dropWatches(w, top)
+	return walkDirs(ix, top, w.Add)
+}
+
+// syncWatches makes the watch list match the policy after an ignore file
+// changed: it adds folders that are now allowed and removes the ones that
+// are now skipped. Unlike addTree it never drops a watch that stays.
+func syncWatches(w *fsnotify.Watcher, ix *index.Indexer) error {
+	want := map[string]bool{}
+	err := walkDirs(ix, ix.Root(), func(p string) error {
+		want[p] = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, p := range w.WatchList() {
+		if !want[p] {
+			w.Remove(p)
+		}
+	}
+	have := map[string]bool{}
+	for _, p := range w.WatchList() {
+		have[p] = true
+	}
+	for p := range want {
+		if !have[p] {
+			if err := w.Add(p); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// queueTree queues every file under top, in the folders the policy allows.
+func queueTree(ix *index.Indexer, top string, queue func(string)) {
+	filepath.WalkDir(top, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
-			return filepath.SkipDir
+		if d.IsDir() {
+			if skipDir(ix, p) {
+				return filepath.SkipDir
+			}
+			return nil
 		}
-		if !d.IsDir() {
-			queue(p)
-		}
+		queue(p)
 		return nil
 	})
 }

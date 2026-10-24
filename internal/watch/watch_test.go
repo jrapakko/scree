@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/jrapakko/scree/internal/embed"
 	"github.com/jrapakko/scree/internal/index"
 	"github.com/jrapakko/scree/internal/policy"
@@ -274,4 +276,178 @@ func TestWatchExitsWhenRootMoved(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "removed or moved") {
 		t.Fatalf("Run = %v", err)
 	}
+}
+
+// startRepo is start over a git work tree: dir/notes holds a .git folder and
+// .gitignore with the given content. HOME is isolated so the user's git
+// config never applies. It returns the folder, the indexed paths, and the
+// folders being watched, relative to the root.
+func startRepo(t *testing.T, gitignore string, prepare func(root string)) (string, func() []string, func() []string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	var watcher atomic.Pointer[fsnotify.Watcher]
+	onWatcher = func(w *fsnotify.Watcher) { watcher.Store(w) }
+	t.Cleanup(func() { onWatcher = nil })
+	_, root, paths := start(t, func(_, root string) {
+		os.MkdirAll(filepath.Join(root, ".git"), 0o755)
+		if gitignore != "" {
+			os.WriteFile(filepath.Join(root, ".gitignore"), []byte(gitignore), 0o644)
+		}
+		if prepare != nil {
+			prepare(root)
+		}
+	})
+	watched := func() []string {
+		var got []string
+		for _, p := range watcher.Load().WatchList() {
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, filepath.ToSlash(rel))
+		}
+		slices.Sort(got)
+		return got
+	}
+	return root, paths, watched
+}
+
+func writeFile(t *testing.T, p, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// canary writes a note and waits until it is indexed, which proves events
+// written before it have been seen.
+func canary(t *testing.T, root string, paths func() []string, name string) {
+	t.Helper()
+	writeFile(t, filepath.Join(root, name), "# C\nx\n")
+	waitFor(t, name+" indexed", func() bool { return slices.Contains(paths(), name) })
+	time.Sleep(Debounce + 500*time.Millisecond)
+}
+
+func TestWatchSkipsGitignoredDirs(t *testing.T) {
+	_, _, watched := startRepo(t, "node_modules/\n", func(root string) {
+		for _, d := range []string{"node_modules/a/b", "docs/sub", "vendor/lib/.git", "vendor/lib/x", ".claude/agents", ".claude/worktrees/w", ".github", ".obsidian"} {
+			os.MkdirAll(filepath.Join(root, d), 0o755)
+		}
+	})
+	want := []string{".", ".claude", ".claude/agents", ".github", "docs", "docs/sub", "vendor"}
+	if got := watched(); !slices.Equal(got, want) {
+		t.Fatalf("watched = %v\nwant %v", got, want)
+	}
+}
+
+func TestWatchCreatedIgnoredDir(t *testing.T) {
+	root, paths, watched := startRepo(t, "node_modules/\n", nil)
+	writeFile(t, filepath.Join(root, "node_modules", "a", "b.md"), "# B\nx\n")
+	canary(t, root, paths, "canary.md")
+	if got := paths(); !slices.Equal(got, []string{"canary.md"}) {
+		t.Errorf("paths = %v", got)
+	}
+	if got := watched(); !slices.Equal(got, []string{"."}) {
+		t.Errorf("watched = %v", got)
+	}
+}
+
+func TestWatchGitignoreEdit(t *testing.T) {
+	root, paths, _ := startRepo(t, "", func(root string) {
+		writeFile(t, filepath.Join(root, "docs", "x.md"), "# X\nx\n")
+		writeFile(t, filepath.Join(root, "a.md"), "# A\na\n")
+	})
+	if got := paths(); !slices.Equal(got, []string{"a.md", "docs/x.md"}) {
+		t.Fatalf("initial paths = %v", got)
+	}
+	ign := filepath.Join(root, ".gitignore")
+	writeFile(t, ign, "docs/\n")
+	waitFor(t, "docs/x.md removed", func() bool { return slices.Equal(paths(), []string{"a.md"}) })
+	writeFile(t, ign, "# nothing\n")
+	waitFor(t, "docs/x.md back", func() bool { return slices.Equal(paths(), []string{"a.md", "docs/x.md"}) })
+}
+
+func TestWatchNestedGitignoreEdit(t *testing.T) {
+	root, paths, _ := startRepo(t, "", func(root string) {
+		writeFile(t, filepath.Join(root, "docs", "x.md"), "# X\nx\n")
+		writeFile(t, filepath.Join(root, "docs", "y.md"), "# Y\ny\n")
+	})
+	ign := filepath.Join(root, "docs", ".gitignore")
+	writeFile(t, ign, "x.md\n")
+	waitFor(t, "docs/x.md removed", func() bool { return slices.Equal(paths(), []string{"docs/y.md"}) })
+	if err := os.Remove(ign); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "docs/x.md back", func() bool { return slices.Equal(paths(), []string{"docs/x.md", "docs/y.md"}) })
+}
+
+func TestWatchUnignoredDirGetsWatched(t *testing.T) {
+	root, paths, watched := startRepo(t, "gen/\n", func(root string) {
+		writeFile(t, filepath.Join(root, "gen", "old.md"), "# O\no\n")
+	})
+	if got := paths(); len(got) != 0 {
+		t.Fatalf("initial paths = %v", got)
+	}
+	writeFile(t, filepath.Join(root, ".gitignore"), "# gen is back\n")
+	waitFor(t, "gen/old.md indexed", func() bool { return slices.Equal(paths(), []string{"gen/old.md"}) })
+	if got := watched(); !slices.Contains(got, "gen") {
+		t.Fatalf("watched = %v", got)
+	}
+	writeFile(t, filepath.Join(root, "gen", "new.md"), "# N\nn\n")
+	waitFor(t, "gen/new.md indexed", func() bool { return slices.Equal(paths(), []string{"gen/new.md", "gen/old.md"}) })
+
+	// Ignoring it again drops the watch.
+	writeFile(t, filepath.Join(root, ".gitignore"), "gen/\n")
+	waitFor(t, "gen removed", func() bool { return len(paths()) == 0 })
+	if got := watched(); slices.Contains(got, "gen") {
+		t.Errorf("watched = %v", got)
+	}
+}
+
+func TestWatchAllowlistedHiddenDir(t *testing.T) {
+	root, paths, watched := startRepo(t, "", nil)
+	writeFile(t, filepath.Join(root, ".github", "ISSUE_TEMPLATE", "bug.md"), "# Bug\nx\n")
+	waitFor(t, "bug.md indexed", func() bool {
+		return slices.Equal(paths(), []string{".github/ISSUE_TEMPLATE/bug.md"})
+	})
+	if got := watched(); !slices.Contains(got, ".github/ISSUE_TEMPLATE") {
+		t.Errorf("watched = %v", got)
+	}
+	writeFile(t, filepath.Join(root, ".github", "ISSUE_TEMPLATE", "feature.md"), "# F\nx\n")
+	waitFor(t, "feature.md indexed", func() bool { return len(paths()) == 2 })
+}
+
+func TestWatchWorktreesIgnored(t *testing.T) {
+	root, paths, watched := startRepo(t, "", func(root string) {
+		os.MkdirAll(filepath.Join(root, ".claude", "agents"), 0o755)
+	})
+	writeFile(t, filepath.Join(root, ".claude", "worktrees", "w", "README.md"), "# W\nx\n")
+	writeFile(t, filepath.Join(root, ".claude", "agents", "a.md"), "# A\nx\n")
+	canary(t, root, paths, "canary.md")
+	if got := paths(); !slices.Equal(got, []string{".claude/agents/a.md", "canary.md"}) {
+		t.Errorf("paths = %v", got)
+	}
+	for _, p := range watched() {
+		if strings.Contains(p, "worktrees") {
+			t.Errorf("watching %s", p)
+		}
+	}
+}
+
+func TestWatchIncludeHiddenEdit(t *testing.T) {
+	root, paths, _ := startRepo(t, "", func(root string) {
+		writeFile(t, filepath.Join(root, ".foo", "a.md"), "# A\nx\n")
+	})
+	if got := paths(); len(got) != 0 {
+		t.Fatalf("initial paths = %v", got)
+	}
+	writeFile(t, filepath.Join(root, ".screeignore"), "include-hidden .foo/\n")
+	waitFor(t, ".foo/a.md indexed", func() bool { return slices.Equal(paths(), []string{".foo/a.md"}) })
+	writeFile(t, filepath.Join(root, ".foo", "b.md"), "# B\nx\n")
+	waitFor(t, ".foo/b.md indexed", func() bool { return slices.Equal(paths(), []string{".foo/a.md", ".foo/b.md"}) })
 }

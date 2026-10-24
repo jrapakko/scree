@@ -1,7 +1,7 @@
 // Package policy decides which files under the notes folder scree may read.
 // Every note read goes through a Policy, so indexing, search, read_note and
-// reindex all apply the same built-in rules, .screeignore patterns and
-// front-matter opt-outs.
+// reindex all apply the same built-in rules, git's ignore rules, .screeignore
+// patterns and front-matter opt-outs.
 package policy
 
 import (
@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -29,6 +30,17 @@ const IgnoreFileName = ".screeignore"
 // maxIgnoreBytes caps the size of .screeignore.
 const maxIgnoreBytes = 256 << 10
 
+// DefaultHiddenAllow lists the hidden folders that are searched like any
+// other when they sit at the root: forge, CI and agent folders. A line
+// "include-hidden .name/" in .screeignore adds to it.
+var DefaultHiddenAllow = []string{
+	".claude", ".github", ".gitlab", ".gitea", ".forgejo", ".cursor",
+	".codex", ".gemini", ".windsurf", ".circleci", ".buildkite",
+}
+
+// includeHidden is the .screeignore directive that adds to the allowlist.
+const includeHidden = "include-hidden"
+
 // Reason says why a path may not be read.
 type Reason int
 
@@ -41,6 +53,8 @@ const (
 	NotMarkdown
 	OutsideRoot
 	TooLarge
+	GitIgnore
+	NestedRepo
 	IgnoreFile
 	FrontMatter
 )
@@ -62,6 +76,10 @@ func (r Reason) String() string {
 		return "outside notes folder"
 	case TooLarge:
 		return "too large"
+	case GitIgnore:
+		return ".gitignore"
+	case NestedRepo:
+		return "nested repository"
 	case IgnoreFile:
 		return ".screeignore"
 	case FrontMatter:
@@ -71,11 +89,13 @@ func (r Reason) String() string {
 }
 
 // Layer names the ignore layer the reason belongs to: "built-in",
-// ".screeignore" or "front matter". It is empty for Allowed.
+// ".gitignore", ".screeignore" or "front matter". It is empty for Allowed.
 func (r Reason) Layer() string {
 	switch r {
 	case Allowed:
 		return ""
+	case GitIgnore, NestedRepo:
+		return ".gitignore"
 	case IgnoreFile:
 		return ".screeignore"
 	case FrontMatter:
@@ -105,6 +125,9 @@ var ErrIgnored = errors.New("ignored")
 type IgnoredError struct {
 	Path   string
 	Reason Reason
+	// Cause is set when a read failure led to the refusal, such as a
+	// folder skipped because its .gitignore cannot be read.
+	Cause error
 }
 
 func (e *IgnoredError) Error() string { return fmt.Sprintf("%q is ignored (%s)", e.Path, e.Reason) }
@@ -127,16 +150,33 @@ type Policy struct {
 	root  string // the root with symlinks resolved
 	r     *os.Root
 	max   int64
+	git   *gitRepo // nil when the git layer is off or the root is not in a work tree
 
 	mu      sync.Mutex
 	m       *ignore.Matcher
+	allow   []string // root hidden folders that are searched
+	dirErrs []string // bad include-hidden directives
 	stamp   fileStamp
 	loadErr error
 }
 
-// Open opens the notes folder at root. Notes larger than maxBytes are
-// refused; maxBytes <= 0 means DefaultMaxBytes.
+// Options configures OpenOptions.
+type Options struct {
+	MaxBytes  int64 // notes larger than this are refused; <= 0 means DefaultMaxBytes
+	GitIgnore bool  // honor .gitignore, .git/info/exclude and core.excludesFile when the root is in a git work tree
+}
+
+// Open opens the notes folder at root with the git layer on. Notes larger
+// than maxBytes are refused; maxBytes <= 0 means DefaultMaxBytes.
 func Open(root string, maxBytes int64) (*Policy, error) {
+	return OpenOptions(root, Options{MaxBytes: maxBytes, GitIgnore: true})
+}
+
+// OpenOptions opens the notes folder at root. With o.GitIgnore set, it looks
+// for a git work tree at or above the root; a .git file that cannot be
+// parsed is an error.
+func OpenOptions(root string, o Options) (*Policy, error) {
+	maxBytes := o.MaxBytes
 	given, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("notes folder: %w", err)
@@ -152,11 +192,27 @@ func Open(root string, maxBytes int64) (*Policy, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxBytes
 	}
-	return &Policy{given: given, root: resolved, r: r, max: maxBytes}, nil
+	p := &Policy{given: given, root: resolved, r: r, max: maxBytes, allow: DefaultHiddenAllow}
+	if o.GitIgnore {
+		if p.git, err = findRepo(resolved); err != nil {
+			r.Close()
+			return nil, err
+		}
+	}
+	return p, nil
 }
 
 // Close releases the root folder handle.
 func (p *Policy) Close() error { return p.r.Close() }
+
+// GitTop returns the top of the git work tree the root is in, or "" when it
+// is not in one or the git layer is off.
+func (p *Policy) GitTop() string {
+	if p.git == nil {
+		return ""
+	}
+	return p.git.top
+}
 
 // Root returns the notes folder with symlinks resolved.
 func (p *Policy) Root() string { return p.root }
@@ -218,10 +274,12 @@ func relUnder(root, abs string) (string, bool) {
 	return rel, true
 }
 
-// CheckName applies the rules that need no file access: a valid, safe name,
-// no hidden segment, a markdown extension, and the most recently loaded
-// .screeignore patterns. It returns Allowed when none of them refuse rel. A
-// file that passes may still be refused by Read.
+// CheckName applies the rules that need no file content: a valid, safe name,
+// no hidden segment outside the allowed root folders, a markdown extension,
+// git's ignore rules, and the most recently loaded .screeignore patterns. It
+// stats at most one .gitignore per folder above rel. It returns Allowed when
+// none of them refuse rel. A file that passes may still be refused by Read,
+// which also fails when the git rules cannot be loaded.
 func (p *Policy) CheckName(rel string) Reason {
 	clean, err := p.Clean(rel)
 	if err != nil {
@@ -229,8 +287,13 @@ func (p *Policy) CheckName(rel string) Reason {
 		errors.As(err, &ie)
 		return ie.Reason
 	}
-	if r := nameReason(clean); r != Allowed {
+	if r := p.nameReason(clean); r != Allowed {
 		return r
+	}
+	if v, err := p.gitView(); err == nil && v != nil {
+		if r := v.fileReason(clean, true); r != Allowed {
+			return r
+		}
 	}
 	p.mu.Lock()
 	m := p.m
@@ -249,19 +312,40 @@ func (p *Policy) Read(rel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if r := nameReason(clean); r != Allowed {
-		return nil, ignored(clean, r)
-	}
-	m, err := p.matcher()
+	rs, err := p.load()
 	if err != nil {
 		return nil, err
 	}
-	return p.read(clean, true, m)
+	if r := p.nameReason(clean); r != Allowed {
+		return nil, ignored(clean, r)
+	}
+	return p.read(clean, true, rs)
+}
+
+// rules are the loaded ignore rules for one operation.
+type rules struct {
+	m *ignore.Matcher
+	g *gitView // nil when the git layer does not apply
+}
+
+// load loads .screeignore and the git rules. Either failing is an error, so
+// callers fail closed.
+func (p *Policy) load() (rules, error) {
+	m, err := p.matcher()
+	if err != nil {
+		return rules{}, err
+	}
+	g, err := p.gitView()
+	if err != nil {
+		return rules{}, err
+	}
+	return rules{m: m, g: g}, nil
 }
 
 // read runs the checks after the name rules on rel. With resolve false, rel
-// is known to contain no symlinks.
-func (p *Policy) read(rel string, resolve bool, m *ignore.Matcher) ([]byte, error) {
+// is known to contain no symlinks and to sit in no nested repository.
+func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
+	m := rs.m
 	realRel := rel
 	if resolve {
 		real, err := filepath.EvalSymlinks(filepath.Join(p.root, filepath.FromSlash(rel)))
@@ -276,7 +360,7 @@ func (p *Policy) read(rel string, resolve bool, m *ignore.Matcher) ([]byte, erro
 			if unsafeName(realRel) {
 				return nil, ignored(rel, UnsafeName)
 			}
-			if r := nameReason(realRel); r != Allowed {
+			if r := p.nameReason(realRel); r != Allowed {
 				return nil, ignored(rel, r)
 			}
 		}
@@ -290,6 +374,13 @@ func (p *Policy) read(rel string, resolve bool, m *ignore.Matcher) ([]byte, erro
 	}
 	if fi.Size() > p.max {
 		return nil, ignored(rel, TooLarge)
+	}
+	if rs.g != nil {
+		for _, x := range []string{rel, realRel} {
+			if r := rs.g.fileReason(x, resolve); r != Allowed {
+				return nil, ignored(rel, r)
+			}
+		}
 	}
 	if m.Match(rel, false) || m.Match(realRel, false) {
 		return nil, ignored(rel, IgnoreFile)
@@ -321,16 +412,23 @@ func (p *Policy) read(rel string, resolve bool, m *ignore.Matcher) ([]byte, erro
 
 // Walk calls fn for every file under the root. src is set for files the
 // policy allows; refusals pass an *IgnoredError, and read failures pass the
-// error. Hidden folders and folders .screeignore fully excludes are reported
-// once, as "dir/", and not descended; symlinked folders are never descended.
-// Walk stops when fn returns an error, and fails before visiting anything if
-// .screeignore exists but cannot be read.
+// error. Hidden folders, nested repositories, and folders git or .screeignore
+// fully excludes are reported once, as "dir/", and not descended or listed;
+// symlinked folders are never descended. .gitignore files and the root
+// .screeignore are skipped without a report. Walk stops when fn returns an
+// error, and fails before visiting anything if .screeignore or the git rules
+// that apply to the root cannot be read.
 func (p *Policy) Walk(ctx context.Context, fn func(rel string, src []byte, err error) error) error {
-	m, err := p.matcher()
+	_, err := p.walk(ctx, fn)
+	return err
+}
+
+func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, err error) error) (rules, error) {
+	rs, err := p.load()
 	if err != nil {
-		return err
+		return rs, err
 	}
-	return filepath.WalkDir(p.root, func(abs string, d fs.DirEntry, err error) error {
+	return rs, filepath.WalkDir(p.root, func(abs string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -348,20 +446,16 @@ func (p *Policy) Walk(ctx context.Context, fn func(rel string, src []byte, err e
 			return fn(rel, nil, readErr(rel, err))
 		}
 		if d.IsDir() {
-			switch {
-			case strings.HasPrefix(d.Name(), "."):
-				err = fn(rel+"/", nil, ignored(rel+"/", Hidden))
-			case m.Prunable(rel):
-				err = fn(rel+"/", nil, ignored(rel+"/", IgnoreFile))
-			default:
+			r, cause := p.dirReason(rel, rs)
+			if r == Allowed {
 				return nil
 			}
-			if err != nil {
+			if err := fn(rel+"/", nil, &IgnoredError{Path: rel + "/", Reason: r, Cause: cause}); err != nil {
 				return err
 			}
 			return filepath.SkipDir
 		}
-		if rel == IgnoreFileName {
+		if rel == IgnoreFileName || d.Name() == GitIgnoreFileName {
 			return nil
 		}
 		if _, err := p.Clean(rel); err != nil {
@@ -378,19 +472,55 @@ func (p *Policy) Walk(ctx context.Context, fn func(rel string, src []byte, err e
 				}
 			}
 		}
-		if r := nameReason(rel); r != Allowed {
+		if r := p.nameReason(rel); r != Allowed {
 			return fn(rel, nil, ignored(rel, r))
 		}
-		src, err := p.read(rel, resolve, m)
+		src, err := p.read(rel, resolve, rs)
 		return fn(rel, src, err)
 	})
+}
+
+// dirReason decides whether a walk skips the folder rel, in this order:
+// Hidden, NestedRepo, GitIgnore (cause is set when its .gitignore cannot be
+// read), IgnoreFile. The git checks run before anything in the folder is
+// listed or read.
+func (p *Policy) dirReason(rel string, rs rules) (Reason, error) {
+	p.mu.Lock()
+	allow := p.allow
+	p.mu.Unlock()
+	if hiddenReason(strings.Split(rel, "/"), true, allow) != Allowed {
+		return Hidden, nil
+	}
+	if rs.g != nil {
+		if r, cause := rs.g.dirReason(rel); r != Allowed {
+			return r, cause
+		}
+	}
+	if rs.m.Prunable(rel) {
+		return IgnoreFile, nil
+	}
+	return Allowed, nil
+}
+
+// SkipDir reports whether the folder rel (a clean store key) is skipped, as
+// Walk decides it: Allowed, Hidden, NestedRepo, GitIgnore or IgnoreFile. When
+// the ignore rules cannot be loaded it applies the built-in rule only; Read
+// still refuses every file then.
+func (p *Policy) SkipDir(rel string) Reason {
+	rs, err := p.load()
+	if err != nil {
+		rs = rules{}
+	}
+	r, _ := p.dirReason(rel, rs)
+	return r
 }
 
 // Summary counts what a Scan found.
 type Summary struct {
 	Allowed      int
+	Bytes        int64 // total size of the allowed files
 	Ignored      map[Reason][]string
-	IgnoreErrors []string // bad .screeignore patterns
+	IgnoreErrors []string // bad patterns and directives, each prefixed with its file name
 	ReadErrors   []string // files or folders that could not be read, with the reason
 }
 
@@ -398,21 +528,30 @@ type Summary struct {
 // that fail to read for other reasons are listed in ReadErrors.
 func (p *Policy) Scan(ctx context.Context) (Summary, error) {
 	s := Summary{Ignored: map[Reason][]string{}}
-	err := p.Walk(ctx, func(rel string, _ []byte, err error) error {
+	rs, err := p.walk(ctx, func(rel string, src []byte, err error) error {
 		var ie *IgnoredError
 		switch {
 		case err == nil:
 			s.Allowed++
+			s.Bytes += int64(len(src))
 		case errors.As(err, &ie):
 			s.Ignored[ie.Reason] = append(s.Ignored[ie.Reason], rel)
+			if ie.Cause != nil {
+				s.ReadErrors = append(s.ReadErrors, ie.Cause.Error())
+			}
 		default:
 			s.ReadErrors = append(s.ReadErrors, err.Error())
 		}
 		return nil
 	})
 	p.mu.Lock()
-	s.IgnoreErrors = p.m.Errors()
+	for _, e := range append(slices.Clone(p.dirErrs), p.m.Errors()...) {
+		s.IgnoreErrors = append(s.IgnoreErrors, IgnoreFileName+" "+e)
+	}
 	p.mu.Unlock()
+	if rs.g != nil {
+		s.IgnoreErrors = append(s.IgnoreErrors, rs.g.patErrs...)
+	}
 	return s, err
 }
 
@@ -439,12 +578,14 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 	st, err := p.statIgnore()
 	if err != nil {
 		p.m, p.stamp, p.loadErr = nil, fileStamp{}, nil
+		p.allow, p.dirErrs = DefaultHiddenAllow, nil
 		return nil, err
 	}
 	if p.stamp == st {
 		return p.m, p.loadErr
 	}
 	p.m, p.loadErr = nil, nil
+	p.allow, p.dirErrs = DefaultHiddenAllow, nil
 	if st.missing {
 		p.m = ignore.Parse(nil)
 	} else {
@@ -452,7 +593,10 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 		if err != nil {
 			p.loadErr = err
 		} else {
-			p.m = ignore.Parse(data)
+			allow, rest, errs := parseDirectives(data)
+			p.m = ignore.Parse(rest)
+			p.allow = append(slices.Clone(DefaultHiddenAllow), allow...)
+			p.dirErrs = errs
 		}
 	}
 	p.stamp = st
@@ -496,16 +640,63 @@ func (p *Policy) readIgnore() ([]byte, error) {
 	return data, nil
 }
 
-// nameReason applies the built-in name rules to a clean, safe path.
-func nameReason(rel string) Reason {
-	for _, part := range strings.Split(rel, "/") {
-		if strings.HasPrefix(part, ".") {
-			return Hidden
+// parseDirectives takes the "include-hidden .name/" lines out of .screeignore
+// text. Each becomes an empty line in rest, so pattern line numbers stay
+// right. A bad directive is reported as "line N: ..." and allows nothing.
+// "\include-hidden" stays a pattern.
+func parseDirectives(data []byte) (allow []string, rest []byte, errs []string) {
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		t := strings.TrimRight(strings.TrimSuffix(line, "\r"), " \t")
+		arg, ok := strings.CutPrefix(t, includeHidden)
+		if !ok || (arg != "" && arg[0] != ' ' && arg[0] != '\t') {
+			continue
 		}
+		lines[i] = ""
+		arg = strings.TrimSpace(arg)
+		name, slash := strings.CutSuffix(arg, "/")
+		if !slash || !strings.HasPrefix(name, ".") || name == "." || name == ".." || name == ".git" ||
+			strings.ContainsAny(name, "/*?[]\\") || unsafeName(name) {
+			errs = append(errs, fmt.Sprintf("line %d: bad %s %q", i+1, includeHidden, arg))
+			continue
+		}
+		allow = append(allow, name)
 	}
-	ext := strings.ToLower(path.Ext(rel))
-	if ext != ".md" && ext != ".markdown" {
-		return NotMarkdown
+	return allow, []byte(strings.Join(lines, "\n")), errs
+}
+
+// nameReason applies the built-in name rules to a clean, safe path, using the
+// most recently loaded hidden-folder allowlist.
+func (p *Policy) nameReason(rel string) Reason {
+	p.mu.Lock()
+	allow := p.allow
+	p.mu.Unlock()
+	if r := hiddenReason(strings.Split(rel, "/"), false, allow); r != Allowed {
+		return r
+	}
+	switch strings.ToLower(path.Ext(rel)) {
+	case ".md", ".markdown", ".mdc":
+		return Allowed
+	}
+	return NotMarkdown
+}
+
+// hiddenReason returns Hidden when a segment of the path segs starts with
+// ".", except a first segment in allow that names a folder (isDir says
+// whether the last segment is one). .claude/worktrees is always hidden: it
+// holds full copies of the repo.
+func hiddenReason(segs []string, isDir bool, allow []string) Reason {
+	if len(segs) >= 2 && segs[0] == ".claude" && segs[1] == "worktrees" {
+		return Hidden
+	}
+	for i, s := range segs {
+		if !strings.HasPrefix(s, ".") {
+			continue
+		}
+		if i == 0 && (isDir || len(segs) > 1) && slices.Contains(allow, s) {
+			continue
+		}
+		return Hidden
 	}
 	return Allowed
 }

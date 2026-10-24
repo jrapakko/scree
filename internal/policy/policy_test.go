@@ -397,12 +397,21 @@ func TestReasonStrings(t *testing.T) {
 	if s := (&IgnoredError{Path: "a.md", Reason: TooLarge}).Error(); s != `"a.md" is ignored (too large)` {
 		t.Errorf("Error() = %s", s)
 	}
-	for r, layer := range map[Reason]string{Hidden: "built-in", OutsideRoot: "built-in", IgnoreFile: ".screeignore", FrontMatter: "front matter"} {
+	for r, layer := range map[Reason]string{
+		Hidden: "built-in", OutsideRoot: "built-in", GitIgnore: ".gitignore", NestedRepo: ".gitignore",
+		IgnoreFile: ".screeignore", FrontMatter: "front matter",
+	} {
 		if r.Layer() != layer {
 			t.Errorf("%s.Layer() = %s", r, r.Layer())
 		}
 	}
 	if OutsideRoot.String() != "outside notes folder" {
 		t.Error(OutsideRoot.String())
+	}
+	if GitIgnore.String() != ".gitignore" || NestedRepo.String() != "nested repository" {
+		t.Error(GitIgnore.String(), NestedRepo.String())
+	}
+	if !(TooLarge < GitIgnore && GitIgnore < NestedRepo && NestedRepo < IgnoreFile) {
+		t.Error("git reasons are out of order")
 	}
 }

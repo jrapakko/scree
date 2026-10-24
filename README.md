@@ -79,9 +79,10 @@ Every embedding request asks OpenRouter to route only to endpoints with zero dat
 
 ### Ignoring files
 
-An ignored file is never read for indexing, never sent to the embedding API, and refused by `read_note` and `reindex`. Three layers decide:
+An ignored file is never read for indexing, never sent to the embedding API, and refused by `read_note` and `reindex`. Four layers decide:
 
-- **Built-in:** hidden files and folders (`.git`, `.obsidian`), anything that isn't `.md` or `.markdown`, symlinks that lead outside the notes folder, files over `SCREE_MAX_FILE_BYTES`, and names with control characters.
+- **Built-in:** hidden files and folders, except the root `.claude/` (not `.claude/worktrees/`), `.github/`, `.gitlab/`, `.gitea/`, `.forgejo/`, `.cursor/`, `.codex/`, `.gemini/`, `.windsurf/`, `.circleci/` and `.buildkite/`; anything that isn't `.md` or `.markdown`; symlinks that lead outside the folder; files over `SCREE_MAX_FILE_BYTES`; and names with control characters.
+- **`.gitignore`:** in a git repo, everything git ignores (nested `.gitignore` files, `.git/info/exclude`, your global excludes file). Ignored folders such as `node_modules/` are never read. `-gitignore=false` turns this off.
 - **`.screeignore`** at the root of the notes folder, in gitignore syntax.
 - **Front matter:** `scree: ignore` in a note's front matter.
 
@@ -92,6 +93,8 @@ journal/
 /inbox/scratch.md
 !journal/public.md
 ```
+
+`include-hidden .name/` in `.screeignore` indexes another root hidden folder, and a pattern like `/.cursor/` drops one of the defaults.
 
 ```
 ---
