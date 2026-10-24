@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -107,9 +108,13 @@ func (s *Store) UpdateVocab(ctx context.Context, put []VocabFile, del []string) 
 	return tx.Commit()
 }
 
-// InVocab reports whether any of words (already lowercased) is in the code
-// vocabulary: one lookup on the table's primary key.
-func (s *Store) InVocab(ctx context.Context, words []string) (bool, error) {
+// InVocabAndNotes reports whether any of words (already lowercased) is in
+// the code vocabulary and also occurs in the notes, as keyword search would
+// match it: one primary-key lookup, then one FTS5 query over the names
+// found, each as a quoted phrase. The phrase is tokenized as the notes
+// were, so pagefetcher matches PageFetcher, and golang.org/x/sync matches
+// the same tokens in a row. A name only in code never counts.
+func (s *Store) InVocabAndNotes(ctx context.Context, words []string) (bool, error) {
 	if len(words) == 0 {
 		return false, nil
 	}
@@ -117,33 +122,85 @@ func (s *Store) InVocab(ctx context.Context, words []string) (bool, error) {
 	for i, w := range words {
 		args[i] = w
 	}
-	q := `SELECT 1 FROM vocab WHERE name IN (?` + strings.Repeat(`, ?`, len(words)-1) + `) LIMIT 1`
+	found, err := s.column(ctx, `SELECT name FROM vocab WHERE name IN (?`+strings.Repeat(`, ?`, len(words)-1)+`)`, args...)
+	if err != nil || len(found) == 0 {
+		return false, err
+	}
+	for i, n := range found {
+		found[i] = phrase(n)
+	}
+	return s.inNotes(ctx, strings.Join(found, " OR "))
+}
+
+// phrase quotes name as an FTS5 phrase, with inner quotes doubled.
+func phrase(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
+
+// inNotes reports whether the FTS5 query match finds any chunk.
+func (s *Store) inNotes(ctx context.Context, match string) (bool, error) {
 	var one int
-	err := s.db.QueryRowContext(ctx, q, args...).Scan(&one)
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT 1`, match).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	return err == nil, err
 }
 
-// VocabStats returns the vocabulary's size, the number of files it was read
-// from, and up to sample of its names in order.
-func (s *Store) VocabStats(ctx context.Context, sample int) (names, files int, some []string, err error) {
+// VocabStats returns the vocabulary's size, how many of its names also
+// occur in the notes (see InVocabAndNotes), the number of files it was read
+// from, and up to sample of the names that occur in the notes, in order.
+// No name found only in code is returned. One-token names are matched
+// against the keyword index's terms in one join; the others, such as
+// dotted module paths, by one phrase query each.
+func (s *Store) VocabStats(ctx context.Context, sample int) (names, inNotes, files int, some []string, err error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM vocab), (SELECT count(*) FROM vocab_files)`).
 		Scan(&names, &files); err != nil {
-		return 0, 0, nil, err
+		return 0, 0, 0, nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM vocab ORDER BY name LIMIT ?`, sample)
+	found, err := s.column(ctx, `SELECT v.name FROM chunks_terms t JOIN vocab v ON v.name = t.term`)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, 0, nil, err
+	}
+	// Names with a character the tokenizer splits on: GLOB's [^-_a-z0-9]
+	// is any other character.
+	multi, err := s.column(ctx, `SELECT name FROM vocab WHERE name GLOB '*[^-_a-z0-9]*'`)
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	for _, n := range multi {
+		ok, err := s.inNotes(ctx, phrase(n))
+		if err != nil {
+			return 0, 0, 0, nil, err
+		}
+		if ok {
+			found = append(found, n)
+		}
+	}
+	slices.Sort(found)
+	found = slices.Compact(found)
+	return names, len(found), files, found[:min(sample, len(found))], nil
+}
+
+// VocabNames returns up to n of the vocabulary's names in order, whether or
+// not the notes hold them. It is for tests; nothing should print its
+// result, since a name only in code may be a misread string.
+func (s *Store) VocabNames(ctx context.Context, n int) ([]string, error) {
+	return s.column(ctx, `SELECT name FROM vocab ORDER BY name LIMIT ?`, n)
+}
+
+// column returns the one text column of query's rows.
+func (s *Store) column(ctx context.Context, query string, args ...any) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
+	var out []string
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
-			return 0, 0, nil, err
+			return nil, err
 		}
-		some = append(some, n)
+		out = append(out, n)
 	}
-	return names, files, some, rows.Err()
+	return out, rows.Err()
 }

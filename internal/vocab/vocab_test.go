@@ -352,7 +352,7 @@ func TestVendoredAndLimits(t *testing.T) {
 	}
 	long := "a" + strings.Repeat("B", MaxNameBytes)
 	check(t, "a.go", "package a\nfunc "+long+"() {}\nfunc okName() {}\n", []string{"okname"}, []string{strings.ToLower(long)})
-	// A huge line (minified code) is skipped, not parsed.
+	// A huge line (minified code) gives no names.
 	check(t, "b.js", "const "+strings.Repeat("x", maxLine)+"Yy = 1\nconst fineName = 2\n", []string{"finename"}, nil)
 }
 
@@ -428,4 +428,28 @@ export { aaName as bbName } from 'zz'
 		"apikey", "longsecret", "nextname", "realfunc")
 	exact(t, "b.go", "package b\n\nimport (\n\t\"github.com/acme/fooBar\"\n\tsecretName = \"zzzTopSecret\"\n\t\"github.com/acme/afterEnd\"\n)\n",
 		"foobar")
+}
+
+// TestLongLineState: a line over maxLine gives no names but still moves the
+// string, comment and docstring state, so what follows it is read in step.
+func TestLongLineState(t *testing.T) {
+	pad := strings.Repeat("x", maxLine+4)
+	exact(t, "a.js", "const tpl = `"+pad+"\nexport const leakName = 1\n`\nconst afterName = 1\n", "aftername")
+	exact(t, "b.js", "/* "+pad+"\nconst leakName = 1\n*/\nconst afterName = 1\n", "aftername")
+	exact(t, "c.py", "x = \"\"\""+pad+"\nclass LeakClass: pass\n\"\"\"\nclass AfterClass: pass\n", "afterclass")
+	exact(t, "d.go", "package d\n\nvar (\n\tblob = `"+pad+"\nghp_AbcSecret1\n`\n\tnextName = 1\n)\n", "nextname")
+	// The long line's own names are dropped, not those of the next line.
+	exact(t, "e.go", "package e\n\nvar longName = `"+pad+"`\nvar shortName = 1\n", "shortname")
+}
+
+// TestMisparseRepros: shapes that used to put text in a name position.
+func TestMisparseRepros(t *testing.T) {
+	exact(t, "a.go", "package a\n\nvar (\n\tblob = `"+strings.Repeat("y", 4100)+"\nghp_AbcSecret1\n`\n)\n")
+	exact(t, "b.js", "export hunter2IsMyPassword\nexport default hunter2IsMyPassword\nexport { realName }\n", "realname")
+	exact(t, "c.ts", "export type { TypeName } from 'm'\nexport * as nsName from 'm'\nimport defName from 'm'\n",
+		"defname", "nsname", "typename")
+	exact(t, "requirements.txt", "ghp_AbcSecret1:x@github.com/r\nuser/repo\nname@https://example.com/x\n"+
+		"git+https://example.com/x.git\nhttps://tok@example.com/x\ngit+ssh://git@example.com/x\nokpkg @ https://example.com/w\n"+
+		"verpkg<2,>=1\nmarkpkg;python_version<'3'\nparenpkg (>=1)\nnotpkg!=1\ntildepkg~=1\n",
+		"markpkg", "notpkg", "okpkg", "parenpkg", "tildepkg", "verpkg")
 }

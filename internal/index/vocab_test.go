@@ -67,9 +67,9 @@ func writeFixture(t *testing.T, root string, files map[string]string) {
 
 func vocabNames(t *testing.T, ix *Indexer) []string {
 	t.Helper()
-	n, _, names, err := ix.Store.VocabStats(context.Background(), 1000)
-	if err != nil || n != len(names) {
-		t.Fatalf("VocabStats = %d, %q, %v", n, names, err)
+	names, err := ix.Store.VocabNames(context.Background(), 1000)
+	if err != nil {
+		t.Fatalf("VocabNames = %q, %v", names, err)
 	}
 	return names
 }
@@ -159,6 +159,17 @@ func TestResolveVocab(t *testing.T) {
 	if _, err := ix.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// Names in the vocabulary that no note holds stay semantic until a note
+	// mentions them.
+	for _, q := range []string{"is `zustand` used for state", "upgrade golang.org/x/sync", "useCartTotal", "FileHash"} {
+		if got := ix.Resolve(ctx, Auto, q); got != Semantic {
+			t.Errorf("before the note: Resolve(%q) = %q, want semantic", q, got)
+		}
+	}
+	write(t, ix.Root(), "docs/stack.md", "# Stack\nState lives in Zustand. We pin golang.org/x/sync.\n")
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
 	for _, c := range []struct {
 		mode  Mode
 		query string
@@ -169,6 +180,9 @@ func TestResolveVocab(t *testing.T) {
 		{Auto, "which version of psycopg do we pin", Hybrid},
 		{"", "is `zustand` used for state", Hybrid},
 		{Auto, "upgrade golang.org/x/sync", Hybrid},
+		{Auto, "upgrade golang.org/x", Semantic}, // not a vocabulary name
+		{Auto, "useCartTotal", Semantic},         // only in code
+		{Auto, "the FileHash type", Semantic},    // only in code
 		{Auto, "how do I sync the index", Semantic},
 		{Auto, "run the new build", Semantic},
 		{Auto, "sync run new", Semantic},

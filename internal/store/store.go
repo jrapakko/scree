@@ -60,13 +60,15 @@ CREATE TABLE IF NOT EXISTS vocab_files(
 // text, heading and path, so the text is not stored twice. The triggers keep
 // it in step with chunks inside the same transaction as every write. With
 // "_" and "-" as token characters, identifiers such as PURGE_OLD_RECORDS
-// or R7-Q2 stay one token.
+// or R7-Q2 stay one token. chunks_terms lists the index's tokens, for
+// checking the code vocabulary against the notes (see Store.VocabStats).
 const ftsSchema = `
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 	text, heading, path,
 	content='chunks', content_rowid='id',
 	tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_terms USING fts5vocab(chunks_fts, 'row');
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
 	INSERT INTO chunks_fts(rowid, text, heading, path) VALUES (new.id, new.text, new.heading, new.path);
 END;
@@ -84,6 +86,7 @@ const dropFTS = `
 DROP TRIGGER IF EXISTS chunks_ai;
 DROP TRIGGER IF EXISTS chunks_ad;
 DROP TRIGGER IF EXISTS chunks_au;
+DROP TABLE IF EXISTS chunks_terms;
 DROP TABLE IF EXISTS chunks_fts;
 `
 

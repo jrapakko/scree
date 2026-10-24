@@ -752,21 +752,24 @@ func doctorKeyword(ctx context.Context, s *store.Store, chunks int, verbose bool
 	}
 }
 
-// doctorVocab reports the code vocabulary auto mode routes on, and with
-// verbose, up to 20 of its names.
+// doctorVocab reports the code vocabulary auto mode routes on: how many
+// names were read and how many of them the notes also hold, and with
+// verbose, up to 20 of the latter. A name found only in code is never
+// printed: it may be text the extractor misread from a string.
 func doctorVocab(ctx context.Context, s *store.Store, verbose bool, report func(bool, string, ...any)) {
-	names, files, some, err := s.VocabStats(ctx, 20)
+	names, inNotes, files, some, err := s.VocabStats(ctx, 20)
 	if err != nil {
 		report(false, "code vocabulary: %v", err)
 		return
 	}
-	report(true, "code vocabulary: %d names from %d manifests and source files (names only; never embedded)", names, files)
+	report(true, "code vocabulary: %d names from %d manifests and source files, %d also in the notes (names only; never embedded)",
+		names, files, inNotes)
 	if verbose && len(some) > 0 {
 		q := make([]string, len(some))
 		for i, n := range some {
 			q[i] = strconv.Quote(n)
 		}
-		fmt.Printf("  vocabulary sample: %s\n", strings.Join(q, " "))
+		fmt.Printf("  vocabulary sample (names also in the notes): %s\n", strings.Join(q, " "))
 	}
 }
 

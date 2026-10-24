@@ -20,7 +20,7 @@ func searchFixture(t *testing.T) (notes, db string) {
 	t.Helper()
 	notes = filepath.Join(tempDir(t), "notes")
 	mkdir(t, notes)
-	src := "# Ops\n\nrun PURGE_OLD_RECORDS nightly\n"
+	src := "# Ops\n\nrun PURGE_OLD_RECORDS nightly via the PageFetcher\n"
 	if err := os.WriteFile(filepath.Join(notes, "ops.md"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -34,11 +34,11 @@ func searchFixture(t *testing.T) (notes, db string) {
 	if err := s.CheckRoot(root); err != nil {
 		t.Fatal(err)
 	}
-	chunks := []store.Chunk{{Path: "ops.md", Heading: "Ops", Line: 1, EndLine: 3, Text: "# Ops\n\nrun PURGE_OLD_RECORDS nightly"}}
+	chunks := []store.Chunk{{Path: "ops.md", Heading: "Ops", Line: 1, EndLine: 3, Text: "# Ops\n\nrun PURGE_OLD_RECORDS nightly via the PageFetcher"}}
 	if err := s.ReplaceFile(context.Background(), "ops.md", "h", 1, nil, chunks, [][]float32{{1, 0}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateVocab(context.Background(), []store.VocabFile{{Path: "app.py", Hash: "h", Names: []string{"pagefetcher"}}}, nil); err != nil {
+	if err := s.UpdateVocab(context.Background(), []store.VocabFile{{Path: "app.py", Hash: "h", Names: []string{"codeonlyhelper", "pagefetcher"}}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	return notes, db
@@ -82,16 +82,22 @@ func TestCLISearchKeywordJSON(t *testing.T) {
 		runDoctor(context.Background(), []string{"-v", "-offline", "-notes", notes, "-db", db})
 	})
 	for _, want := range []string{"ok   keyword index: 1 chunks", "ok   keyword index integrity check",
-		"ok   code vocabulary: 1 names from 1 manifests and source files", `  vocabulary sample: "pagefetcher"`} {
+		"ok   code vocabulary: 2 names from 1 manifests and source files, 1 also in the notes",
+		`  vocabulary sample (names also in the notes): "pagefetcher"` + "\n"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor lacks %q:\n%s", want, out)
 		}
+	}
+	// A name found only in code is never printed.
+	if strings.Contains(out, "codeonlyhelper") {
+		t.Errorf("doctor prints a code-only name:\n%s", out)
 	}
 }
 
 // TestCLISearchDefaultsToAuto: with no -mode, a plain query runs semantic
 // and an identifier query hybrid, as the JSON mode field and the XML
-// note say. A name from the code vocabulary also gives hybrid.
+// note say. A name from the code vocabulary that the notes also hold gives
+// hybrid; one only in code does not.
 func TestCLISearchDefaultsToAuto(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -102,7 +108,8 @@ func TestCLISearchDefaultsToAuto(t *testing.T) {
 	t.Setenv("SCREE_EMBED_URL", api.URL)
 	t.Setenv("OPENROUTER_API_KEY", "test-key")
 	t.Setenv("SCREE_ZDR", "0")
-	for q, want := range map[string]string{"nightly run": "semantic", "purge_old_records": "hybrid", "does the PageFetcher purge?": "hybrid"} {
+	for q, want := range map[string]string{"nightly run": "semantic", "purge_old_records": "hybrid", "does the PageFetcher purge?": "hybrid",
+		"does the codeonlyhelper purge?": "semantic"} {
 		var runErr error
 		out := captureStdout(t, func() {
 			runErr = runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "json", q})

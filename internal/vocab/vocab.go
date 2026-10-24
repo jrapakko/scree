@@ -19,7 +19,7 @@ import (
 // Version names the extraction rules. An index whose names were read under
 // another version reads every file again; bump it whenever a change to this
 // package would give different names for the same file.
-const Version = "3"
+const Version = "4"
 
 // MaxNameBytes is the longest name kept; longer ones are dropped.
 const MaxNameBytes = 128
@@ -226,9 +226,11 @@ func mixed(names []string) []string {
 	return out
 }
 
-// lines calls fn for each line of src, without its line ending. Lines over
-// maxLine bytes (minified or generated code) are skipped.
-func lines(src []byte, fn func(line string)) {
+// lines calls fn for each line of src, without its line ending. Every line
+// goes through fn, so a scanner's string, comment and list state stays in
+// step, but the names fn appends to *out for a line over maxLine bytes
+// (minified or generated code) are dropped.
+func lines(src []byte, out *[]string, fn func(line string)) {
 	for len(src) > 0 {
 		l := src
 		if i := bytes.IndexByte(src, '\n'); i >= 0 {
@@ -236,30 +238,34 @@ func lines(src []byte, fn func(line string)) {
 		} else {
 			src = nil
 		}
-		if len(l) <= maxLine {
-			fn(strings.TrimSuffix(string(l), "\r"))
+		n := len(*out)
+		fn(strings.TrimSuffix(string(l), "\r"))
+		if len(l) > maxLine {
+			*out = (*out)[:n]
 		}
 	}
 }
 
-// maxLine is the longest line read.
+// maxLine is the longest line whose names are kept.
 const maxLine = 4096
 
-// pep508Name is the distribution name at the start of a requirement.
-var pep508Name = regexp.MustCompile(`^\s*([A-Za-z0-9][A-Za-z0-9._-]*)`)
+// pep508Name is the distribution name at the start of a requirement. It
+// must be followed by the end, whitespace (as before "name @ url") or a
+// character that starts extras, a version specifier or a marker, so
+// "user:token@host/path" and "git+https://..." give no name.
+var pep508Name = regexp.MustCompile(`^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?:$|[\s\[;(,<>=!~])`)
 
 // requirements reads package names from a pip requirements file: the name
-// before any extras, version specifier, marker or URL. Options (-r, -e,
-// --hash), URLs and paths are skipped.
+// before any extras, version specifier, marker or " @ url". Options (-r,
+// -e, --hash), URLs and paths are skipped.
 func requirements(src []byte) []string {
 	var out []string
-	lines(src, func(l string) {
+	lines(src, &out, func(l string) {
 		if i := strings.Index(l, " #"); i >= 0 {
 			l = l[:i]
 		}
 		l = strings.TrimSpace(l)
-		if l == "" || l[0] == '#' || l[0] == '-' || l[0] == '.' || l[0] == '/' ||
-			(strings.Contains(l, "://") && !strings.Contains(l, "@")) {
+		if l == "" || l[0] == '#' || l[0] == '-' || l[0] == '.' || l[0] == '/' {
 			return
 		}
 		if m := pep508Name.FindStringSubmatch(l); m != nil {
@@ -349,7 +355,7 @@ func pyproject(src []byte) []string {
 	table := ""
 	inDeps := false // inside a multi-line [project] dependencies array
 	skip := 0       // depth inside another multi-line array
-	lines(src, func(l string) {
+	lines(src, &out, func(l string) {
 		if skip > 0 {
 			skip = max(skip+bracketDepth(l), 0)
 			return
@@ -439,7 +445,7 @@ func cargo(src []byte) []string {
 	var out []string
 	table := ""
 	skip := 0 // depth inside a multi-line array
-	lines(src, func(l string) {
+	lines(src, &out, func(l string) {
 		if skip > 0 {
 			skip = max(skip+bracketDepth(l), 0)
 			return
@@ -489,7 +495,7 @@ func packageJSON(src []byte) []string {
 func goMod(src []byte) []string {
 	var out []string
 	inBlock := false
-	lines(src, func(l string) {
+	lines(src, &out, func(l string) {
 		l = strings.TrimSpace(l)
 		if strings.HasSuffix(l, "// indirect") {
 			return
@@ -576,7 +582,7 @@ func python(src []byte) []string {
 	var out []string
 	paren := 0   // lines left in a parenthesized import list, 0 outside one
 	triple := "" // delimiter of the """ or ''' string the line is in
-	lines(src, func(l string) {
+	lines(src, &out, func(l string) {
 		if triple != "" {
 			if strings.Contains(l, triple) {
 				triple = ""
@@ -715,13 +721,17 @@ var (
 	jsDecl = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?` +
 		`(?:function\s*\*?|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)`)
 	jsDestructure = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s*[{\[]([^}\]]*)[}\]]`)
-	jsImport      = regexp.MustCompile(`^\s*(?:import|export)\b(.*)`)
-	jsFrom        = regexp.MustCompile(`\s+from\s*$`)
+	jsImport      = regexp.MustCompile(`^\s*(import|export)\b(.*)`)
+	// jsExport is how an export statement that is not a declaration starts:
+	// a braced list, *, or type and a braced list. A bare name after export
+	// is not a name position.
+	jsExport = regexp.MustCompile(`^\s*(?:\{|\*|type\s*\{)`)
+	jsFrom   = regexp.MustCompile(`\s+from\s*$`)
 	// jsSpecs is a list of jsSpec, or a line of one.
 	jsSpecs = regexp.MustCompile(`^\s*(?:` + jsSpec + `(?:\s*,\s*` + jsSpec + `)*)?\s*,?\s*$`)
 	// jsClause is what may follow import or export before the module
-	// specifier: a default name, * as name, and a braced list, opened or
-	// closed on the line.
+	// specifier: a default name (for import; see jsExport), * as name, and
+	// a braced list, opened or closed on the line.
 	jsClause = regexp.MustCompile(`^\s*(?:type\s+)?(?:[\w$]+\s*(?:,\s*)?)?(?:\*(?:\s+as\s+[\w$]+)?\s*)?` +
 		`(?:\{([^{}]*)(\})?\s*)?$`)
 )
@@ -737,7 +747,7 @@ func javascript(src []byte) []string {
 	var out []string
 	var cs cState
 	brace := 0 // lines left in a braced import or export list, 0 outside one
-	lines(src, func(l string) {
+	lines(src, &out, func(l string) {
 		l = cs.strip(l, false)
 		if i := strings.IndexByte(l, ';'); i >= 0 {
 			l = l[:i]
@@ -771,7 +781,10 @@ func javascript(src []byte) []string {
 			return
 		}
 		if m := jsImport.FindStringSubmatch(l); m != nil {
-			rest := m[1]
+			rest := m[2]
+			if m[1] == "export" && !jsExport.MatchString(rest) {
+				return
+			}
 			if i := strings.IndexAny(rest, `="'`+"`("); i >= 0 {
 				rest = rest[:i]
 			}
@@ -806,7 +819,7 @@ func golang(src []byte) []string {
 	var out []string
 	var cs cState
 	group := ""
-	lines(src, func(raw string) {
+	lines(src, &out, func(raw string) {
 		code := !cs.comment && !cs.tick // the line starts in code
 		l := cs.strip(raw, true)
 		if group != "" {
