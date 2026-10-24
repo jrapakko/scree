@@ -2,6 +2,7 @@
 package index
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/jrapakko/scree/internal/chunk"
 	"github.com/jrapakko/scree/internal/embed"
@@ -313,8 +315,45 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	return st, nil
 }
 
-// Search embeds query and returns the k nearest chunks. An empty index
-// returns no hits without calling the API.
+// Mode selects how Search finds chunks.
+type Mode string
+
+const (
+	// Hybrid merges vector and keyword search by reciprocal rank fusion.
+	Hybrid Mode = "hybrid"
+	// Semantic is vector search only.
+	Semantic Mode = "semantic"
+	// Keyword is FTS5 search only; it makes no embedding call.
+	Keyword Mode = "keyword"
+)
+
+// ParseMode returns the Mode named s; "" is Hybrid.
+func ParseMode(s string) (Mode, error) {
+	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
+	case "":
+		return Hybrid, nil
+	case Hybrid, Semantic, Keyword:
+		return m, nil
+	}
+	return "", fmt.Errorf("mode must be hybrid, semantic or keyword, not %q", s)
+}
+
+// Fusion weights for the two sides of a hybrid search, and the rank offset
+// of reciprocal rank fusion.
+const (
+	wVec    = 1.0
+	wFTS    = 1.0
+	rrfBase = 60
+)
+
+// keywordHint is added to a failed embedding call's error.
+const keywordHint = `; mode="keyword" still works without the embedding API`
+
+// Search returns the k chunks that best match query, by mode: vector
+// search (which embeds query), keyword search over chunk text, heading and
+// path (no API call), or both merged by reciprocal rank fusion. Each hit's
+// Match says which side found it. An empty index returns no hits without
+// calling the API.
 //
 // Every hit is re-checked against the current rules, and a hit from a file
 // that changed since it was indexed gets its current line range, found in
@@ -322,22 +361,45 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 // if its text is no longer there, the hit is kept with Stale set. Chunks
 // with identical text in several files are folded into one hit, with the
 // other copies in Also. Paths dropped or changed are passed to OnStale.
-func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit, error) {
+func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) ([]store.Hit, error) {
+	if mode == "" {
+		mode = Hybrid
+	}
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
 	}
-	e := ix.QueryEmbedder
-	if e == nil {
-		e = ix.Embedder
-	}
-	vecs, err := e.Embed(ctx, []string{query})
-	if err != nil {
-		return nil, err
-	}
 	// Over-fetch, since refused hits are dropped and duplicates folded.
-	hits, err := ix.Store.Search(ctx, vecs[0], min(max(4*k, 40), 200))
-	if err != nil {
-		return nil, err
+	fetch := min(max(4*k, 40), 200)
+	var vec, kw []store.Hit
+	if mode != Keyword {
+		e := ix.QueryEmbedder
+		if e == nil {
+			e = ix.Embedder
+		}
+		vecs, err := e.Embed(ctx, []string{query})
+		if err != nil {
+			return nil, fmt.Errorf("%w%s", err, keywordHint)
+		}
+		if vec, err = ix.Store.Search(ctx, vecs[0], fetch); err != nil {
+			return nil, err
+		}
+	}
+	if mode != Semantic {
+		if q, ok := ftsQuery(query); ok {
+			var err error
+			if kw, err = ix.Store.Keyword(ctx, q, fetch); err != nil {
+				return nil, err
+			}
+		}
+	}
+	var hits []store.Hit
+	switch mode {
+	case Semantic:
+		hits = vec
+	case Keyword:
+		hits = kw
+	default:
+		hits = fuse(vec, kw)
 	}
 	files := map[string]*fileView{}
 	var requeue []string
@@ -359,7 +421,7 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit
 		}
 		out = append(out, h)
 	}
-	out, err = ix.foldDuplicates(ctx, out)
+	out, err := ix.foldDuplicates(ctx, out)
 	if err != nil {
 		return nil, err
 	}
@@ -370,6 +432,99 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit
 		ix.OnStale(requeue)
 	}
 	return out, nil
+}
+
+// fuse merges vector and keyword hits by reciprocal rank fusion: a chunk
+// scores the sum of w/(rrfBase+rank) over the lists it is in (rank is
+// 1-based). Ties go to the better single rank, then the lower chunk id. A
+// chunk in both lists keeps its vector distance and has Match MatchBoth.
+func fuse(vec, kw []store.Hit) []store.Hit {
+	type entry struct {
+		hit   store.Hit
+		score float64
+		best  int
+	}
+	byID := map[int64]*entry{}
+	var all []*entry
+	add := func(hits []store.Hit, w float64) {
+		for i, h := range hits {
+			rank := i + 1
+			e, ok := byID[h.ID]
+			if !ok {
+				e = &entry{hit: h, best: rank}
+				byID[h.ID] = e
+				all = append(all, e)
+			} else {
+				e.hit.Match = store.MatchBoth
+				e.best = min(e.best, rank)
+			}
+			e.score += w / float64(rrfBase+rank)
+		}
+	}
+	add(vec, wVec)
+	add(kw, wFTS)
+	slices.SortStableFunc(all, func(a, b *entry) int {
+		switch {
+		case a.score != b.score:
+			if a.score > b.score {
+				return -1
+			}
+			return 1
+		case a.best != b.best:
+			return a.best - b.best
+		}
+		return cmp.Compare(a.hit.ID, b.hit.ID)
+	})
+	out := make([]store.Hit, len(all))
+	for i, e := range all {
+		out[i] = e.hit
+	}
+	return out
+}
+
+// Limits on the keyword query built from user text.
+const (
+	maxFTSTerms     = 32
+	maxFTSTermBytes = 64
+)
+
+// ftsQuery turns user text into an FTS5 query that is never parsed as FTS
+// syntax: it splits on whitespace, strips control characters and trims
+// .,;:!?()[]{}"' from each end of a word (not _ or -), keeps at most
+// maxFTSTerms words of at most maxFTSTermBytes, and writes each one as a
+// quoted string with inner quotes doubled, joined with OR. Inside quotes,
+// AND, NEAR, *, ^ and col: are plain text. ok is false when no word is
+// left, and keyword search is skipped.
+func ftsQuery(q string) (string, bool) {
+	var terms []string
+	for _, f := range strings.Fields(q) {
+		f = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, f)
+		f = strings.Trim(f, `.,;:!?()[]{}"'`)
+		if f == "" {
+			continue
+		}
+		if len(f) > maxFTSTermBytes {
+			f = f[:runeCut(f, maxFTSTermBytes)]
+		}
+		terms = append(terms, `"`+strings.ReplaceAll(f, `"`, `""`)+`"`)
+		if len(terms) == maxFTSTerms {
+			break
+		}
+	}
+	return strings.Join(terms, " OR "), len(terms) > 0
+}
+
+// runeCut returns the largest index <= n that does not split a rune in s.
+func runeCut(s string, n int) int {
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return n
 }
 
 // TestHooks lets tests observe Search. Nil outside tests.

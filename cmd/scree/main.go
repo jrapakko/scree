@@ -41,7 +41,9 @@ Usage:
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
                            -http is loopback only unless -allow-remote)
-  scree search [-k n] "query"
+  scree search [-k n] [-mode hybrid|semantic|keyword] [-format xml|json] "query"
+                           -mode keyword makes no API call; -format json
+                           prints one object per hit, the stable format for evals
   scree reindex [-all] [path]
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
@@ -476,18 +478,30 @@ func runSearch(ctx context.Context, args []string) error {
 	var cfg config
 	fs := flags("search", &cfg)
 	k := fs.Int("k", 8, "number of results")
+	modeFlag := fs.String("mode", "hybrid", "hybrid, semantic or keyword (keyword makes no API call)")
+	format := fs.String("format", "xml", "xml, or json for one object per hit")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return errors.New(`usage: scree search [-k n] "query"`)
+		return errors.New(`usage: scree search [-k n] [-mode hybrid|semantic|keyword] [-format xml|json] "query"`)
+	}
+	mode, err := index.ParseMode(*modeFlag)
+	if err != nil {
+		return err
+	}
+	if *format != "xml" && *format != "json" {
+		return fmt.Errorf("format must be xml or json, not %q", *format)
 	}
 	ix, err := open(&cfg, true)
 	if err != nil {
 		return err
 	}
 	defer closeIndexer(ix)
-	hits, err := ix.Search(ctx, fs.Arg(0), *k)
+	hits, err := ix.Search(ctx, fs.Arg(0), *k, mode)
 	if err != nil {
 		return err
+	}
+	if *format == "json" {
+		return mcpserver.WriteJSON(os.Stdout, hits)
 	}
 	fmt.Println(mcpserver.FormatHits(hits, ""))
 	return nil
@@ -627,6 +641,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	} else {
 		st, err := ix.Store.Stats(ctx)
 		report(err == nil, "index %s: %d files, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
+		doctorKeyword(ctx, ix.Store, st.Chunks, *verbose, report)
 		have, _ = ix.Store.Model()
 		synced, _ := ix.Store.Meta(writer.SyncedAtKey)
 		if synced == "" {
@@ -675,6 +690,29 @@ func runDoctor(ctx context.Context, args []string) error {
 		return errors.New("doctor found problems")
 	}
 	return nil
+}
+
+// doctorKeyword reports the keyword index: its row count must equal chunks,
+// and with verbose, FTS5's integrity check (which scans everything) must
+// pass.
+func doctorKeyword(ctx context.Context, s *store.Store, chunks int, verbose bool, report func(bool, string, ...any)) {
+	n, err := s.KeywordRows(ctx)
+	switch {
+	case err != nil:
+		report(false, "keyword index: %v", err)
+		return
+	case n != chunks:
+		report(false, "keyword index: %d rows for %d chunks; run `scree reindex -all`", n, chunks)
+		return
+	}
+	report(true, "keyword index: %d chunks", n)
+	if verbose {
+		if err := s.CheckKeywordIndex(ctx); err != nil {
+			report(false, "keyword index integrity check: %v; run `scree reindex -all`", err)
+		} else {
+			report(true, "keyword index integrity check")
+		}
+	}
 }
 
 // costModel is the model doctor prices, at costPerMTokens dollars per

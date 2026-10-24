@@ -83,7 +83,7 @@ func TestSyncIndexesChangesAndRemovals(t *testing.T) {
 		t.Fatalf("first sync = %+v", st)
 	}
 
-	hits, err := ix.Search(ctx, "cherry", 1)
+	hits, err := ix.Search(ctx, "cherry", 1, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestSyncIndexesChangesAndRemovals(t *testing.T) {
 	if st.Indexed != 1 || st.Removed != 1 {
 		t.Fatalf("third sync = %+v", st)
 	}
-	hits, _ = ix.Search(ctx, "date", 5)
+	hits, _ = ix.Search(ctx, "date", 5, Hybrid)
 	if len(hits) != 1 || hits[0].Heading != "Dates" {
 		t.Fatalf("hits after change = %+v", hits)
 	}
@@ -369,7 +369,7 @@ func TestPauseExpires(t *testing.T) {
 
 func TestSearchEmptyIndexSkipsEmbed(t *testing.T) {
 	ix, fe := setup(t)
-	hits, err := ix.Search(context.Background(), "apple", 3)
+	hits, err := ix.Search(context.Background(), "apple", 3, Hybrid)
 	if err != nil || hits != nil || fe.calls != 0 {
 		t.Fatalf("hits %v, err %v, calls %d", hits, err, fe.calls)
 	}
@@ -382,7 +382,7 @@ func TestSearchUsesQueryEmbedder(t *testing.T) {
 	q := &fakeEmbedder{}
 	ix.QueryEmbedder = q
 	calls := fe.calls
-	if _, err := ix.Search(context.Background(), "apple", 1); err != nil || q.calls != 1 || fe.calls != calls {
+	if _, err := ix.Search(context.Background(), "apple", 1, Hybrid); err != nil || q.calls != 1 || fe.calls != calls {
 		t.Fatalf("err %v, query calls %d, index calls %d -> %d", err, q.calls, calls, fe.calls)
 	}
 }
@@ -455,7 +455,7 @@ func TestSyncRaceKeepsOldRows(t *testing.T) {
 // searchPaths runs Search and returns the distinct hit paths.
 func searchPaths(t *testing.T, ix *Indexer, q string, k int) []string {
 	t.Helper()
-	hits, err := ix.Search(context.Background(), q, k)
+	hits, err := ix.Search(context.Background(), q, k, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +586,7 @@ func TestBackfillLinesWithoutEmbedding(t *testing.T) {
 	if missing, _ := ix.Store.MissingLines(ctx, "a.md"); missing {
 		t.Error("end_line not filled")
 	}
-	hits, err := ix.Search(ctx, "banana", 2)
+	hits, err := ix.Search(ctx, "banana", 2, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,7 +634,7 @@ func TestBackfillSkipsWhenChunkingDiffers(t *testing.T) {
 // searchOne runs Search and returns the hit from path, failing if none.
 func searchOne(t *testing.T, ix *Indexer, q, path string) store.Hit {
 	t.Helper()
-	hits, err := ix.Search(context.Background(), q, 8)
+	hits, err := ix.Search(context.Background(), q, 8, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,7 +683,7 @@ func TestSearchReadsChangedFileOnce(t *testing.T) {
 	reads := 0
 	TestHooks.SearchRead = func(string) { reads++ }
 	defer func() { TestHooks.SearchRead = nil }()
-	hits, err := ix.Search(context.Background(), "apple", 8)
+	hits, err := ix.Search(context.Background(), "apple", 8, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +738,7 @@ func dupFiles(paths ...string) map[string]string {
 
 func TestCollapseDuplicates(t *testing.T) {
 	ix := indexed(t, dupFiles("docs/print/x.md", "docs/wiki-build/x.md", "docs/x.md"))
-	hits, err := ix.Search(context.Background(), "apple", 8)
+	hits, err := ix.Search(context.Background(), "apple", 8, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,7 +753,7 @@ func TestCollapseDuplicates(t *testing.T) {
 
 func TestCollapseCapsAlso(t *testing.T) {
 	ix := indexed(t, dupFiles("a.md", "b/a.md", "c/a.md", "d/a.md", "e/a.md", "f/a.md"))
-	hits, err := ix.Search(context.Background(), "apple", 8)
+	hits, err := ix.Search(context.Background(), "apple", 8, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -765,7 +765,7 @@ func TestCollapseCapsAlso(t *testing.T) {
 func TestCollapseSkipsRefusedCopy(t *testing.T) {
 	ix := indexed(t, dupFiles("docs/print/x.md", "docs/wiki-build/x.md", "docs/x.md"))
 	write(t, ix.Root(), ".screeignore", "docs/print/\n") // no sync
-	hits, err := ix.Search(context.Background(), "apple", 8)
+	hits, err := ix.Search(context.Background(), "apple", 8, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +780,7 @@ func TestCollapseKeepsK(t *testing.T) {
 		files[fmt.Sprintf("n%d.md", i)] = fmt.Sprintf("# N%d\n%s\n", i, strings.Repeat("apple ", i+1))
 	}
 	ix := indexed(t, files)
-	hits, err := ix.Search(context.Background(), "apple", 8)
+	hits, err := ix.Search(context.Background(), "apple", 8, Hybrid)
 	if err != nil {
 		t.Fatal(err)
 	}

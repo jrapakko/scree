@@ -304,7 +304,7 @@ func TestSearchQueuesChangedForWriter(t *testing.T) {
 	before, _ := a.Indexer.Store.FileHash(ctx, "a.md")
 
 	os.WriteFile(filepath.Join(e.root, "a.md"), []byte("# a.md\ntext, changed\n"), 0o644)
-	if _, err := b.Indexer.Search(ctx, "text", 4); err != nil {
+	if _, err := b.Indexer.Search(ctx, "text", 4, index.Hybrid); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.Lock()
@@ -314,7 +314,7 @@ func TestSearchQueuesChangedForWriter(t *testing.T) {
 		t.Error("a reader created a queue")
 	}
 	start := time.Now()
-	if _, err := a.Indexer.Search(ctx, "text", 4); err != nil {
+	if _, err := a.Indexer.Search(ctx, "text", 4, index.Hybrid); err != nil {
 		t.Fatal(err)
 	}
 	for {

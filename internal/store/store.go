@@ -1,5 +1,5 @@
 // Package store keeps chunks and their vectors in SQLite, using the vec1
-// extension for nearest-neighbor search.
+// extension for nearest-neighbor search and FTS5 for keyword search.
 package store
 
 import (
@@ -18,7 +18,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/driver"
+	"github.com/ncruces/go-sqlite3/ext/fts5"
 	"github.com/ncruces/go-sqlite3/ext/vec1"
 )
 
@@ -48,6 +50,37 @@ CREATE TABLE IF NOT EXISTS chunks(
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 `
 
+// ftsSchema is the keyword index: an external-content FTS5 table over chunk
+// text, heading and path, so the text is not stored twice. The triggers keep
+// it in step with chunks inside the same transaction as every write. With
+// "_" and "-" as token characters, identifiers such as DELETE_STALE_INTAKE
+// or D1-Q4 stay one token.
+const ftsSchema = `
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+	text, heading, path,
+	content='chunks', content_rowid='id',
+	tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
+);
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+	INSERT INTO chunks_fts(rowid, text, heading, path) VALUES (new.id, new.text, new.heading, new.path);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+	INSERT INTO chunks_fts(chunks_fts, rowid, text, heading, path) VALUES ('delete', old.id, old.text, old.heading, old.path);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF text, heading, path ON chunks BEGIN
+	INSERT INTO chunks_fts(chunks_fts, rowid, text, heading, path) VALUES ('delete', old.id, old.text, old.heading, old.path);
+	INSERT INTO chunks_fts(rowid, text, heading, path) VALUES (new.id, new.text, new.heading, new.path);
+END;
+`
+
+// dropFTS removes the keyword index and its triggers, for Reset.
+const dropFTS = `
+DROP TRIGGER IF EXISTS chunks_ai;
+DROP TRIGGER IF EXISTS chunks_ad;
+DROP TRIGGER IF EXISTS chunks_au;
+DROP TABLE IF EXISTS chunks_fts;
+`
+
 // Store is an open index database.
 type Store struct {
 	db   *sql.DB
@@ -60,7 +93,7 @@ var ErrIndexGone = errors.New("index file was removed or replaced")
 
 // SchemaVersion is recorded as meta "schema" once the tables have every
 // column this version uses.
-const SchemaVersion = "2"
+const SchemaVersion = "3"
 
 // Chunk is a stored piece of a note.
 type Chunk struct {
@@ -111,9 +144,21 @@ type Hit struct {
 	// Stat is the file as it was indexed; nil for rows from before it was
 	// recorded.
 	Stat *FileStat
-	// Distance is the cosine distance to the query: 0 is identical, 2 is opposite.
+	// Match says which search found the hit; "" is treated as semantic.
+	Match Match
+	// Distance is the cosine distance to the query: 0 is identical, 2 is
+	// opposite. It is meaningful only when Match is not MatchKeyword.
 	Distance float64
 }
+
+// Match says which side of a search found a hit.
+type Match string
+
+const (
+	MatchSemantic Match = "semantic"
+	MatchKeyword  Match = "keyword"
+	MatchBoth     Match = "both"
+)
 
 // Open opens or creates the index at path. A missing parent folder is
 // created with mode 0700; an existing one is left alone. The database and
@@ -127,7 +172,9 @@ func Open(path string) (*Store, error) {
 	}
 	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() +
 		"?_pragma=busy_timeout(10000)&_pragma=synchronous(normal)"
-	db, err := driver.Open(dsn, vec1.Register)
+	// driver.Open's second callback runs before close, so both extensions
+	// are registered from the one open callback.
+	db, err := driver.Open(dsn, registerExtensions)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +200,14 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	return s, nil
+}
+
+// registerExtensions registers vec1 and FTS5 on a new connection.
+func registerExtensions(c *sqlite3.Conn) error {
+	if err := vec1.Register(c); err != nil {
+		return err
+	}
+	return fts5.Register(c)
 }
 
 // CheckFile returns ErrIndexGone if the file at the index path is no longer
@@ -254,7 +309,8 @@ func createVecs(ctx context.Context, conn *sql.Conn) error {
 // migrate brings an index from an older version up to SchemaVersion. The
 // columns it adds are NULL in existing rows, which callers treat as
 // unknown: files.mtime and files.size (search re-reads the file), and
-// chunks.end_line (filled in by the next sync without re-embedding).
+// chunks.end_line (filled in by the next sync without re-embedding). Text
+// hashes and the keyword index are built from the stored chunks.
 func migrate(ctx context.Context, conn *sql.Conn) error {
 	for _, add := range []struct{ table, col string }{
 		{"files", "mtime"}, {"files", "size"}, {"chunks", "end_line"},
@@ -270,6 +326,9 @@ func migrate(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if err := backfillTextHash(ctx, conn); err != nil {
+		return err
+	}
+	if err := createFTS(ctx, conn); err != nil {
 		return err
 	}
 	_, err := conn.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES('schema', ?)
@@ -323,6 +382,26 @@ func backfillTextHash(ctx context.Context, conn *sql.Conn) error {
 			}
 		}
 	}
+}
+
+// createFTS creates the keyword index and its triggers unless they exist.
+// A new table over existing chunks is filled from them with 'rebuild',
+// which reads the stored text; nothing is re-embedded.
+func createFTS(ctx context.Context, conn *sql.Conn) error {
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE name = 'chunks_fts'`).Scan(&n); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
+		return fmt.Errorf("creating keyword index: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("building keyword index: %w", err)
+	}
+	return nil
 }
 
 func hasColumn(ctx context.Context, conn *sql.Conn, table, col string) (bool, error) {
@@ -625,7 +704,7 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 	defer rows.Close()
 	var hits []Hit
 	for rows.Next() {
-		var h Hit
+		h := Hit{Match: MatchSemantic}
 		var mtime, size, end sql.NullInt64
 		var th sql.NullString
 		if err := rows.Scan(&h.ID, &th, &h.Path, &h.Heading, &h.Line, &end, &h.Text, &h.Distance, &mtime, &size); err != nil {
@@ -636,6 +715,52 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
+}
+
+// Keyword returns up to n chunks matching the FTS5 query match, best first
+// by BM25, with text weighted 1 and heading and path 0.5 each. match must
+// be built from quoted terms (see index.ftsQuery), never raw user text.
+func (s *Store) Keyword(ctx context.Context, match string, n int) ([]Hit, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.id, c.text_hash, c.path, c.heading, c.line, c.end_line, c.text, f.mtime, f.size
+		FROM (SELECT rowid, bm25(chunks_fts, 1.0, 0.5, 0.5) AS rank FROM chunks_fts
+			WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?) AS k
+		JOIN chunks c ON c.id = k.rowid
+		LEFT JOIN files f ON f.path = c.path
+		ORDER BY k.rank, c.id`, match, n)
+	if err != nil {
+		return nil, fmt.Errorf("store: keyword search: %w", err)
+	}
+	defer rows.Close()
+	var hits []Hit
+	for rows.Next() {
+		h := Hit{Match: MatchKeyword}
+		var mtime, size, end sql.NullInt64
+		var th sql.NullString
+		if err := rows.Scan(&h.ID, &th, &h.Path, &h.Heading, &h.Line, &end, &h.Text, &mtime, &size); err != nil {
+			return nil, err
+		}
+		h.EndLine, h.TextHash = int(end.Int64), th.String
+		h.Stat = statOf(mtime, size)
+		hits = append(hits, h)
+	}
+	return hits, rows.Err()
+}
+
+// KeywordRows returns the number of rows in the keyword index, counted from
+// its own per-row table (a count on the external-content table itself
+// would read chunks).
+func (s *Store) KeywordRows(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM chunks_fts_docsize`).Scan(&n)
+	return n, err
+}
+
+// CheckKeywordIndex runs FTS5's integrity check, which compares the keyword
+// index with the chunks it was built from. It scans everything.
+func (s *Store) CheckKeywordIndex(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO chunks_fts(chunks_fts, rank) VALUES('integrity-check', 1)`)
+	return err
 }
 
 // Stats summarizes the index.
@@ -661,7 +786,9 @@ func (s *Store) ChunkCount(ctx context.Context) (int, error) {
 
 // Reset deletes everything, including the recorded model.
 func (s *Store) Reset(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	// The keyword index goes first, so deleting the chunks fires no triggers;
+	// init recreates it empty.
+	_, err := s.db.ExecContext(ctx, dropFTS+`
 		DROP TABLE IF EXISTS vecs;
 		DELETE FROM chunks;
 		DELETE FROM files;

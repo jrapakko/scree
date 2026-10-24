@@ -1,0 +1,13 @@
+# Identifier queries over this repo's README.md and docs/SPEC.md: query, file, heading substring.
+# Keyword mode must put a chunk of that file whose heading contains the substring in the top 3.
+SCREE_FIRST_SYNC_MB	README.md	Configure
+XDG_DATA_HOME	README.md	Configure
+SCREE_HTTP_TOKEN	README.md	Claude Code
+CLAUDE_PROJECT_DIR	README.md	Claude Code
+scree-mcp-docker	README.md	Docker
+include-hidden	docs/SPEC.md	Ignoring files
+core.excludesFile	docs/SPEC.md	Ignoring files
+writer.lock	docs/SPEC.md	How indexing works
+-allow-remote	docs/SPEC.md	Tools and commands
+fsnotify	docs/SPEC.md	Go stack
+SCREE_ZDR	README.md	Privacy
