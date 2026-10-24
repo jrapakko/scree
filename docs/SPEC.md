@@ -202,7 +202,7 @@ Cost: indexing measured about $0.0025 per MB of markdown with `openai/text-embed
 ## Open items
 
 - **Human view.** Decide between plain files in an editor and a small local search page over the same index.
-- **MCP registry.** The license, CI, release workflow and OCI label are done. Still to do: cut `v0.1.0`, build an MCPB bundle, write `server.json` for `io.github.jrapakko/scree`, and publish with `mcp-publisher`.
+- **MCP registry.** The license, CI, release workflow, OCI label and tagged releases are done. Still to do: build an MCPB bundle, write `server.json` for `io.github.jrapakko/scree`, and publish with `mcp-publisher`.
 - **Base image pinning.** The Dockerfile's `golang` and distroless images are referenced by tag. Pin them by digest once something like Dependabot keeps the digests current.
 - **Docker and worktrees.** `scree mcp -docker` mounts only the work tree, so a worktree whose git dir lives in the main repository outside the mount cannot be read in the container, and it requires `CLAUDE_PROJECT_DIR` to lift to the same work tree, not just the same repository as native `serve` allows.
 - **Docker on SELinux.** The only way to make the read-only mount readable is `SCREE_MOUNT_OPTS=ro,z` (or `ro,Z`), which permanently relabels every file in the folder on the host. A label-free option, such as `--security-opt label=disable` for that one container, is not offered yet. The container also gets no proxy variables; only the docker CLI does.
