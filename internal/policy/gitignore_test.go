@@ -147,7 +147,9 @@ func TestGitignoreInfoExcludeAndGlobal(t *testing.T) {
 	wantReason(t, err, GitIgnore)
 }
 
-func TestGitignoreRepoConfigWins(t *testing.T) {
+// The repository's .git/config is never read, so it cannot name an excludes
+// file; the user's ~/.gitconfig beats $XDG_CONFIG_HOME/git/config.
+func TestGitignoreUserConfigOrder(t *testing.T) {
 	top := repoFixture(t)
 	home := os.Getenv("HOME")
 	write(t, filepath.Join(home, ".config", "git", "config"), "[core]\nexcludesfile = /nonexistent\n")
@@ -156,7 +158,7 @@ func TestGitignoreRepoConfigWins(t *testing.T) {
 	write(t, filepath.Join(home, "a"), "a.md\n")
 	write(t, filepath.Join(home, "b"), "b.md\n")
 	p := open(t, top, 0)
-	if p.CheckName("a.md") != Allowed || p.CheckName("b.md") != GitIgnore {
+	if p.CheckName("a.md") != GitIgnore || p.CheckName("b.md") != Allowed {
 		t.Errorf("CheckName(a.md) = %s, CheckName(b.md) = %s", p.CheckName("a.md"), p.CheckName("b.md"))
 	}
 }
@@ -382,7 +384,7 @@ func TestGitignoreBadPatternNamed(t *testing.T) {
 	write(t, filepath.Join(top, "docs", "a.md"), "a")
 	p := open(t, top, 0)
 	s := scan(t, p)
-	want := []string{`.screeignore line 1: bad pattern "["`, `docs/.gitignore line 3: bad pattern "["`}
+	want := []string{`.screeignore line 1: bad pattern`, `docs/.gitignore line 3: bad pattern`}
 	if !reflect.DeepEqual(s.IgnoreErrors, want) {
 		t.Errorf("IgnoreErrors = %q\nwant %q", s.IgnoreErrors, want)
 	}
@@ -576,8 +578,8 @@ func TestIncludeHiddenBad(t *testing.T) {
 	p := open(t, root, 0)
 	s := scan(t, p)
 	var want []string
-	for i, b := range bad {
-		want = append(want, ".screeignore line "+string(rune('1'+i))+`: bad include-hidden "`+b+`"`)
+	for i := range bad {
+		want = append(want, ".screeignore line "+string(rune('1'+i))+": bad include-hidden directive")
 	}
 	if !reflect.DeepEqual(s.IgnoreErrors, want) {
 		t.Errorf("IgnoreErrors = %q\nwant %q", s.IgnoreErrors, want)
@@ -638,7 +640,7 @@ func TestPatternLineNumbersWithDirective(t *testing.T) {
 	write(t, filepath.Join(root, ".screeignore"), "include-hidden .foo/\nok.md\n[\n")
 	p := open(t, root, 0)
 	s := scan(t, p)
-	if want := []string{`.screeignore line 3: bad pattern "["`}; !reflect.DeepEqual(s.IgnoreErrors, want) {
+	if want := []string{`.screeignore line 3: bad pattern`}; !reflect.DeepEqual(s.IgnoreErrors, want) {
 		t.Errorf("IgnoreErrors = %q, want %q", s.IgnoreErrors, want)
 	}
 }

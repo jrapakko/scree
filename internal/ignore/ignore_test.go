@@ -1,6 +1,7 @@
 package ignore
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -238,9 +239,22 @@ func TestNFCMatching(t *testing.T) {
 			t.Errorf("%q does not match %q", c.pattern, c.path)
 		}
 	}
-	// Errors quote the line as written.
-	if errs := Parse([]byte("[" + nfd)).Errors(); len(errs) != 1 || !strings.Contains(errs[0], nfd) {
-		t.Errorf("Errors() = %q", errs)
+}
+
+// Errors name the line only. The pattern could be text from a file the
+// user never meant to show, so it is never repeated.
+func TestParseErrorsHaveNoText(t *testing.T) {
+	data := "ok.md\n[secret-pattern\n  # fine\nOPENROUTER_API_KEY=sk-or-v1-FAKE [bad\n"
+	for _, o := range []Options{{}, {FoldCase: true}} {
+		errs := ParseWith([]byte(data), o).Errors()
+		if want := []string{"line 2: bad pattern", "line 4: bad pattern"}; !slices.Equal(errs, want) {
+			t.Errorf("Errors() = %q, want %q", errs, want)
+		}
+		for _, e := range errs {
+			if strings.Contains(e, "secret") || strings.Contains(e, "sk-or") || strings.Contains(e, "[") {
+				t.Errorf("error echoes the pattern: %q", e)
+			}
+		}
 	}
 }
 

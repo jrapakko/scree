@@ -37,7 +37,7 @@ func (s folderSource) String() string {
 // resolveFolder picks the folder to index. serve passes useProjectDir=true.
 // explicit is the -notes value ("" if not given) and is used as is. A folder
 // found any other way is lifted to its git root, and refused if it is the
-// home directory or a filesystem root.
+// home directory, a folder above it, or a filesystem root.
 func resolveFolder(explicit string, useProjectDir bool) (root string, src folderSource, err error) {
 	if explicit != "" {
 		root, err := filepath.Abs(explicit)
@@ -69,26 +69,40 @@ func resolveFolder(explicit string, useProjectDir bool) (root string, src folder
 			src = gitRootOfCwd
 		}
 	}
-	if isHomeOrFSRoot(root) {
-		return "", 0, fmt.Errorf("%s is your home directory (or a filesystem root); pass -notes %s to index it anyway", root, root)
+	if isHomeOrAbove(root) {
+		return "", 0, fmt.Errorf("%s is your home directory, a folder above it, or a filesystem root; pass -notes %s to index it anyway", root, root)
 	}
 	return root, src, nil
 }
 
-// isHomeOrFSRoot reports whether the resolved folder dir is the resolved home
-// directory or a filesystem root.
-func isHomeOrFSRoot(dir string) bool {
+// isHomeOrAbove reports whether the resolved folder dir is a filesystem (or
+// volume) root, the home directory, or a folder above it. Home is compared
+// with its symlinks resolved.
+func isHomeOrAbove(dir string) bool {
 	if filepath.Dir(dir) == dir {
 		return true
 	}
 	home, err := os.UserHomeDir()
-	if err != nil {
+	if err != nil || home == "" {
 		return false
 	}
 	if h, err := filepath.EvalSymlinks(home); err == nil {
 		home = h
 	}
-	return dir == home
+	if home, err = filepath.Abs(home); err != nil {
+		return false
+	}
+	_, under := relUnder(dir, home)
+	return under
+}
+
+// relUnder reports whether path is dir or inside it.
+func relUnder(dir, path string) (string, bool) {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
 }
 
 // gitRoot walks up from dir to the nearest folder containing a ".git"

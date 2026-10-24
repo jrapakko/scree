@@ -191,3 +191,43 @@ func TestWriteRootFile(t *testing.T) {
 		t.Errorf("mode %v", fi.Mode().Perm())
 	}
 }
+
+func TestResolveHomeAncestors(t *testing.T) {
+	tmp := tempDir(t)
+	home := filepath.Join(tmp, "home", "u")
+	repo := filepath.Join(home, "code", "r")
+	mkdir(t, repo)
+	t.Setenv("HOME", home)
+	for _, dir := range []string{home, filepath.Join(tmp, "home"), tmp, "/"} {
+		if dir == "/" && gitRoot("/") != "" {
+			continue
+		}
+		t.Setenv("CLAUDE_PROJECT_DIR", dir)
+		if _, _, err := resolveFolder("", true); err == nil || !strings.Contains(err.Error(), "a folder above it") {
+			t.Errorf("%s: err = %v", dir, err)
+		}
+		// An explicit -notes on the command line stays unguarded.
+		if root, _, err := resolveFolder(dir, false); err != nil || root != dir {
+			t.Errorf("-notes %s: %q, %v", dir, root, err)
+		}
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", repo)
+	if root, _, err := resolveFolder("", true); err != nil || root != repo {
+		t.Errorf("repo: %q, %v", root, err)
+	}
+
+	// A symlinked HOME is compared resolved.
+	link := filepath.Join(tmp, "homelink")
+	if err := os.Symlink(home, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("HOME", link)
+	t.Setenv("CLAUDE_PROJECT_DIR", filepath.Join(tmp, "home"))
+	if _, _, err := resolveFolder("", true); err == nil {
+		t.Error("symlinked HOME: the folder above it was not refused")
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", repo)
+	if root, _, err := resolveFolder("", true); err != nil || root != repo {
+		t.Errorf("symlinked HOME, repo: %q, %v", root, err)
+	}
+}

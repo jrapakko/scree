@@ -28,9 +28,6 @@ const DefaultMaxBytes int64 = 1 << 20
 // IgnoreFileName is the ignore file read from the root of the notes folder.
 const IgnoreFileName = ".screeignore"
 
-// maxIgnoreBytes caps the size of .screeignore.
-const maxIgnoreBytes = 256 << 10
-
 // DefaultHiddenAllow lists the hidden folders that are searched like any
 // other when they sit at the root: forge, CI and agent folders. A line
 // "include-hidden .name/" in .screeignore adds to it.
@@ -164,13 +161,12 @@ type Policy struct {
 	git   *gitRepo       // nil when the git layer is off or the root is not in a work tree
 	opts  ignore.Options // how patterns match: NFC always, case folded on case-insensitive filesystems
 
-	mu       sync.Mutex
-	m        *ignore.Matcher
-	allow    []string // root hidden folders that are searched
-	dirErrs  []string // bad include-hidden directives
-	ignLines []string // .screeignore's lines, for naming the rule that re-included a file
-	stamp    fileStamp
-	loadErr  error
+	mu      sync.Mutex
+	m       *ignore.Matcher
+	allow   []string // root hidden folders that are searched
+	dirErrs []string // bad include-hidden directives
+	stamp   fileStamp
+	loadErr error
 }
 
 // Options configures OpenOptions.
@@ -619,8 +615,8 @@ type Summary struct {
 	IgnoreErrors []string // bad patterns and directives, each prefixed with its file name
 	ReadErrors   []string // files or folders that could not be read, with the reason
 	// Reincluded lists allowed files that an earlier .screeignore rule
-	// excluded and a "!" rule re-included, as
-	// `"path" (.screeignore line N: !pattern)`.
+	// excluded and a "!" rule re-included, as `"path" (.screeignore line N)`.
+	// The rule's text is never shown: messages carry no file content.
 	Reincluded []string
 }
 
@@ -646,13 +642,9 @@ func (p *Policy) Scan(ctx context.Context) (Summary, error) {
 		}
 		return nil
 	})
-	p.mu.Lock()
-	lines := p.ignLines
-	p.mu.Unlock()
 	for _, rel := range allowed {
-		if _, n := rs.m.Explain(rel, false); n > 0 && n <= len(lines) {
-			s.Reincluded = append(s.Reincluded, fmt.Sprintf("%s (%s line %d: %s)",
-				strconv.Quote(rel), IgnoreFileName, n, strings.TrimSpace(lines[n-1])))
+		if _, n := rs.m.Explain(rel, false); n > 0 {
+			s.Reincluded = append(s.Reincluded, fmt.Sprintf("%s (%s line %d)", strconv.Quote(rel), IgnoreFileName, n))
 		}
 	}
 	p.mu.Lock()
@@ -695,20 +687,23 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 	if p.stamp == st {
 		return p.m, p.loadErr
 	}
-	p.m, p.loadErr, p.ignLines = nil, nil, nil
+	p.m, p.loadErr = nil, nil
 	p.allow, p.dirErrs = DefaultHiddenAllow, nil
 	if st.missing {
 		p.m = ignore.ParseWith(nil, p.opts)
 	} else {
-		data, err := p.readIgnore()
-		if err != nil {
+		data, rst, err := p.readIgnore()
+		switch {
+		case err != nil:
 			p.loadErr = err
-		} else {
+		case rst.missing:
+			p.m = ignore.ParseWith(nil, p.opts)
+		default:
 			allow, rest, errs := parseDirectives(data)
 			p.m = ignore.ParseWith(rest, p.opts)
 			p.allow = append(slices.Clone(DefaultHiddenAllow), allow...)
 			p.dirErrs = errs
-			p.ignLines = strings.Split(string(rest), "\n")
+			st = rst
 		}
 	}
 	p.stamp = st
@@ -716,45 +711,27 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 }
 
 func (p *Policy) statIgnore() (fileStamp, error) {
-	fi, err := p.r.Stat(IgnoreFileName)
-	if errors.Is(err, fs.ErrNotExist) {
-		if _, lerr := p.r.Lstat(IgnoreFileName); errors.Is(lerr, fs.ErrNotExist) {
-			return fileStamp{ok: true, missing: true}, nil
-		}
-		return fileStamp{}, fmt.Errorf("read %s: dangling symlink: %w", IgnoreFileName, err)
-	}
+	st, err := p.statRootRepoFile(IgnoreFileName)
 	if err != nil {
 		return fileStamp{}, fmt.Errorf("read %s: %w", IgnoreFileName, err)
 	}
-	return fileStamp{ok: true, mod: fi.ModTime().UnixNano(), size: fi.Size()}, nil
+	return st, nil
 }
 
-func (p *Policy) readIgnore() ([]byte, error) {
-	f, err := p.r.Open(IgnoreFileName)
+// readIgnore reads .screeignore, which comes with the folder, so it is never
+// read through a symlink.
+func (p *Policy) readIgnore() ([]byte, fileStamp, error) {
+	data, st, err := p.readRootRepoFile(IgnoreFileName)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", IgnoreFileName, err)
+		return nil, fileStamp{}, fmt.Errorf("read %s: %w", IgnoreFileName, err)
 	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", IgnoreFileName, err)
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("read %s: not a regular file", IgnoreFileName)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxIgnoreBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", IgnoreFileName, err)
-	}
-	if len(data) > maxIgnoreBytes {
-		return nil, fmt.Errorf("read %s: larger than %d bytes", IgnoreFileName, maxIgnoreBytes)
-	}
-	return data, nil
+	return data, st, nil
 }
 
 // parseDirectives takes the "include-hidden .name/" lines out of .screeignore
 // text. Each becomes an empty line in rest, so pattern line numbers stay
-// right. A bad directive is reported as "line N: ..." and allows nothing.
+// right. A bad directive is reported as "line N: bad include-hidden
+// directive", without its text, and allows nothing.
 // "\include-hidden" stays a pattern.
 func parseDirectives(data []byte) (allow []string, rest []byte, errs []string) {
 	lines := strings.Split(string(data), "\n")
@@ -769,7 +746,7 @@ func parseDirectives(data []byte) (allow []string, rest []byte, errs []string) {
 		name, slash := strings.CutSuffix(arg, "/")
 		if !slash || !strings.HasPrefix(name, ".") || name == "." || name == ".." || name == ".git" ||
 			strings.ContainsAny(name, "/*?[]\\") || unsafeName(name) {
-			errs = append(errs, fmt.Sprintf("line %d: bad %s %q", i+1, includeHidden, arg))
+			errs = append(errs, fmt.Sprintf("line %d: bad %s directive", i+1, includeHidden))
 			continue
 		}
 		allow = append(allow, name)

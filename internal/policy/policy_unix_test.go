@@ -192,3 +192,48 @@ func TestWorktreesPrunedUnlisted(t *testing.T) {
 		t.Errorf("ReadErrors = %q", s.ReadErrors)
 	}
 }
+
+// The repository's .git/config is never read, so it cannot name an excludes
+// file. Both it and the file it names are FIFOs here: opening either would
+// block, or with O_NONBLOCK fail as not a regular file.
+func TestRepoConfigExcludesFileIgnored(t *testing.T) {
+	top := repoFixture(t)
+	fifo := filepath.Join(t.TempDir(), "x")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	write(t, filepath.Join(top, "a.md"), "a")
+	cfg := filepath.Join(top, ".git", "config")
+	for _, step := range []string{"regular config naming a FIFO", "FIFO config"} {
+		os.Remove(cfg)
+		if step == "FIFO config" {
+			if err := syscall.Mkfifo(cfg, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			write(t, cfg, "[core]\n\texcludesFile = "+fifo+"\n")
+		}
+		done := make(chan error, 1)
+		go func() {
+			p, err := Open(top, 0)
+			if err != nil {
+				done <- err
+				return
+			}
+			defer p.Close()
+			s, err := p.Scan(context.Background())
+			if err == nil && (s.Allowed != 1 || len(s.ReadErrors) != 0) {
+				err = errors.New("scan saw the config")
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: %v", step, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: opening the repo config blocked", step)
+		}
+	}
+}

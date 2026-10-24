@@ -33,21 +33,24 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
    install -m 755 bin/scree contrib/scree-mcp contrib/scree-run ~/.local/bin/
    ```
 
-4. **Check and build the index.** `scree-run` loads the settings file and runs a scree command. Change `~/notes` if your notes are elsewhere:
+4. **Check a repo before indexing it.** `scree-run` loads the settings file and runs a scree command. From inside the repo:
 
    ```sh
-   scree-run doctor -v -notes ~/notes && scree-run reindex -notes ~/notes
+   cd ~/code/myrepo
+   scree-run doctor -v
    ```
 
-   `doctor -v` lists every file that will be ignored. Add a [`.screeignore`](#ignoring-files) before indexing if anything private shows up as indexable.
+   `doctor -v` lists every file that will be ignored. Add a [`.screeignore`](#ignoring-files) or `.gitignore` entry before indexing if anything private shows up as indexable.
 
-5. **Connect Claude Code.** Only the wrapper's path is stored, so the key stays out of `~/.claude.json`:
+5. **Turn scree on for the repo.** From the repo's root:
 
    ```sh
-   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp -notes ~/notes
+   claude mcp add scree --scope project -- scree-mcp
    ```
 
-6. **Optional: keep the index current** with the [systemd unit](#background-service-systemd), which runs `scree watch` in the background.
+   This writes `.mcp.json` naming `scree-mcp`, with no key and no paths, so commit it. Claude Code must find `scree-mcp` on its `PATH`. Every session in the repo then keeps its index current, and a repo without this entry is never indexed.
+
+6. **Optional: a notes folder outside any repo.** Use it from the command line: `scree-run reindex -notes ~/notes`, `scree-run search -notes ~/notes "…"`, and the [systemd unit](#background-service-systemd), which runs `scree watch -notes ~/notes` to keep it current. To search it from Claude Code, run `claude mcp add scree --scope project -- scree-mcp` in `~/notes` and start Claude Code there. It isn't a git repo, so the folder is `~/notes` itself. There is no Claude Code server for `~/notes` except a session started in `~/notes`. If you registered scree at user scope before, remove that registration with `claude mcp remove scree --scope user`.
 
 ## Build
 
@@ -71,7 +74,7 @@ Settings come from environment variables. The [settings file](#settings-file) is
 | `SCREE_ZDR` | `1`; set `0` for endpoints other than OpenRouter |
 | `SCREE_HTTP_TOKEN` | none; required with `serve -allow-remote`, and enforced on loopback if set |
 
-The folder comes from `-notes`. Without it, `serve` uses the project directory Claude Code passes in `CLAUDE_PROJECT_DIR`, and other commands use the git root of the current directory (or the current directory outside git). A folder found this way is refused if it is your home directory.
+The folder comes from `-notes` on the command line. Without it, commands use the git root of the current directory (or the current directory outside git). Under Claude Code, `serve` always indexes the git root of the repo Claude Code runs in, and refuses `-notes`, `-db` and `SCREE_DB`. A folder found automatically is refused if it is your home directory or a folder above it.
 
 Changing the model or dimensions requires `scree reindex -all`. The index records which model built it and refuses to mix them.
 
@@ -129,13 +132,15 @@ Write one `NAME=value` per line, and wrap values in single quotes, as step 2 doe
 
 ### Claude Code
 
-`contrib/scree-mcp` loads the settings file and runs `scree serve`. Claude Code stores only the wrapper's path, so the key stays out of `~/.claude.json`:
+`contrib/scree-mcp` loads the settings file and runs `scree serve`. Claude Code stores only the wrapper's name, so the key stays out of `~/.claude.json`. Install it, then register it in each repo, from the repo's root:
 
 ```sh
 mkdir -p ~/.local/bin
 install -m 755 bin/scree contrib/scree-mcp ~/.local/bin/
-claude mcp add scree --scope user -- ~/.local/bin/scree-mcp -notes ~/notes
+claude mcp add scree --scope project -- scree-mcp
 ```
+
+The wrapper passes Claude Code's `CLAUDE_PROJECT_DIR` through, and `serve` indexes the git root above it. A folder outside any repo, such as `~/notes`, is searched from the command line (`scree-run search -notes ~/notes "…"`), or from a Claude Code session started in that folder after the same `claude mcp add` there.
 
 The wrapper refuses to start if the settings file is missing, not owned by you, or readable by group or others. Install `scree` in the same folder as the wrapper: it runs that binary and nothing found through `PATH`.
 
@@ -149,6 +154,8 @@ Stdio through the wrapper is the recommended setup. `serve -http` listens on loo
 printf 'SCREE_HTTP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.config/scree/env
 scree-run serve -notes ~/notes -http 0.0.0.0:7077 -allow-remote
 ```
+
+Run this from a terminal, not from inside a Claude Code session, where `CLAUDE_PROJECT_DIR` is set and `serve` refuses `-notes`.
 
 A client then needs the header. If you add it with `claude mcp add --transport http ... --header "Authorization: Bearer $SCREE_HTTP_TOKEN"`, expanding the variable at the shell keeps the token out of your shell history, but Claude Code still stores the expanded header in `~/.claude.json`.
 
@@ -206,7 +213,7 @@ For Claude Code, the MCP server runs one container per session over stdio. `cont
 install -m 755 contrib/scree-mcp-docker ~/.local/bin/scree-mcp
 ```
 
-`SCREE_DOCKER` (`docker` or `podman` only), `SCREE_IMAGE` and `SCREE_DATA_VOLUME` (a volume name, not a path) in the settings file change the engine, image and volume. `SCREE_MOUNT_OPTS` (default `ro`) sets the mount options; on SELinux hosts set it to `ro,z`, as explained below. Like `scree-mcp`, the Docker wrapper ignores inherited settings and takes no arguments.
+`SCREE_DOCKER` (`docker` or `podman` only), `SCREE_IMAGE` and `SCREE_DATA_VOLUME` (a volume name, not a path) in the settings file change the engine, image and volume. `SCREE_MOUNT_OPTS` (default `ro`) sets the mount options and accepts only `ro`, `ro,z` or `ro,Z`; on SELinux hosts set it to `ro,z`, as explained below. The wrapper never mounts your home directory, a folder above it, or `/`, and lifts to the git root only through a `.git` you own that is not a symlink, never in or above a sticky folder such as `/tmp`. Like `scree-mcp`, the Docker wrapper ignores inherited settings and takes no arguments.
 
 Inside a container, `serve -http` has to bind a non-loopback address to be reachable through a published port, so it needs `-allow-remote` and `SCREE_HTTP_TOKEN`. Publish the port on the host's loopback only, for example `-p 127.0.0.1:7077:7077`.
 
@@ -220,6 +227,7 @@ The `watch` and `serve` containers share the `scree-data` volume. SQLite's WAL m
 - `scree watch` exits with an error if the index file or the folder disappears or is replaced, so systemd or Docker restarts it. In `serve`, the writer stops and searches report it. Watches are re-added when a folder is renamed or an ignore file changes. The index directory is created 0700 and its files are 0600.
 - Search results are `<hit>` elements of at most 3500 characters each, and one response is at most 64 KB. `read_note` returns the note in a `<note>` element. The server tells the client to treat both as data, not instructions.
 - Vectors live in [vec1](https://sqlite.org/vec1), SQLite's vector extension, with a flat (exact) cosine index. It is compiled to WebAssembly by [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3), which is what keeps the binary CGO-free.
+- scree never follows a symlink for git's ignore files (`.gitignore`, `.git/info/exclude`, a `.git` file) or `.screeignore`, never reads a repository's `.git/config`, and never prints the content of any of them: messages name the file and line only.
 - One policy decides what may be read, and indexing, search, `read_note` and `reindex` all go through it. Symlinks are followed only inside the notes folder, and the rules are checked on their target too. Symlinked folders are not descended.
 
 Idle memory is about 13–15 MB per process.

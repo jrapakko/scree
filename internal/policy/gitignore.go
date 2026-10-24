@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -31,8 +30,8 @@ var matchAll = ignore.Parse([]byte("*\n"))
 type gitRepo struct {
 	top     string   // the work tree top, symlinks resolved
 	prefix  string   // the root relative to top: "" or "a/b/"
-	common  string   // the git common dir, for info/exclude and config
-	configs []string // git config files, lowest precedence first
+	common  string   // the git common dir, for info/exclude
+	configs []string // the user's git config files, lowest precedence first
 	home    string   // for "~/" in core.excludesFile; "" if unknown
 	xdgIgn  string   // the default global excludes file; "" if unknown
 	opts    ignore.Options
@@ -91,7 +90,7 @@ func newRepo(root, top, dotGit string) (*gitRepo, error) {
 	switch {
 	case fi.IsDir():
 	case fi.Mode().IsRegular():
-		data, err := readCapped(dotGit)
+		data, _, err := readRepoFile(dotGit)
 		if err != nil {
 			return nil, err
 		}
@@ -108,15 +107,15 @@ func newRepo(root, top, dotGit string) (*gitRepo, error) {
 		return nil, errors.New(".git is not a folder or a file")
 	}
 	common := gitDir
-	switch data, err := readCapped(filepath.Join(gitDir, "commondir")); {
-	case err == nil:
+	switch data, st, err := readRepoFile(filepath.Join(gitDir, "commondir")); {
+	case err != nil:
+		return nil, err
+	case !st.missing:
 		c := strings.TrimSpace(string(data))
 		if !filepath.IsAbs(c) {
 			c = filepath.Join(gitDir, c)
 		}
 		common = c
-	case !errors.Is(err, fs.ErrNotExist):
-		return nil, err
 	}
 
 	prefix := ""
@@ -138,52 +137,9 @@ func newRepo(root, top, dotGit string) (*gitRepo, error) {
 	if g.home != "" {
 		g.configs = append(g.configs, filepath.Join(g.home, ".gitconfig"))
 	}
-	g.configs = append(g.configs, filepath.Join(common, "config"))
+	// The repository's own .git/config is never read: a planted one could
+	// name any file as the excludes file. Only the user's config can.
 	return g, nil
-}
-
-// statFile stamps a file outside the root. A missing file gives a missing
-// stamp; a dangling symlink is an error.
-func statFile(name string) (fileStamp, error) {
-	fi, err := os.Stat(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		if _, lerr := os.Lstat(name); errors.Is(lerr, fs.ErrNotExist) {
-			return fileStamp{ok: true, missing: true}, nil
-		}
-		return fileStamp{}, fmt.Errorf("read %s: dangling symlink: %w", name, err)
-	}
-	if err != nil {
-		return fileStamp{}, fmt.Errorf("read %s: %w", name, err)
-	}
-	return fileStamp{ok: true, mod: fi.ModTime().UnixNano(), size: fi.Size()}, nil
-}
-
-// readCapped reads a regular file of at most maxGitFileBytes.
-func readCapped(name string) ([]byte, error) {
-	f, err := os.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return readCappedFile(f, name)
-}
-
-func readCappedFile(f fs.File, name string) ([]byte, error) {
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: %w", name, ErrNotRegular)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxGitFileBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxGitFileBytes {
-		return nil, fmt.Errorf("%s: larger than %d bytes", name, maxGitFileBytes)
-	}
-	return data, nil
 }
 
 // excludesFile reads core.excludesFile from git config text. ok is false when
@@ -257,7 +213,7 @@ func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
 	stamps := make([]fileStamp, len(g.configs))
 	changed := len(g.cfgStamps) != len(stamps)
 	for i, c := range g.configs {
-		st, err := statFile(c)
+		st, err := statUserFile(c)
 		if err != nil {
 			g.cfgStamps = nil
 			return nil, err
@@ -271,10 +227,10 @@ func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
 			if stamps[i].missing {
 				continue
 			}
-			data, err := readCapped(c)
+			data, _, err := readUserFile(c)
 			if err != nil {
 				g.cfgStamps = nil
-				return nil, fmt.Errorf("read %s: %w", c, stripPath(err))
+				return nil, err
 			}
 			if v, ok := excludesFile(data); ok {
 				excludes, set = v, true
@@ -290,11 +246,11 @@ func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
 		}
 		g.excludes, g.cfgStamps = excludes, stamps
 	}
-	global, err := g.global.load(g.excludes, g.opts)
+	global, err := g.global.load(g.excludes, true, g.opts)
 	if err != nil {
 		return nil, err
 	}
-	exclude, err := g.exclude.load(filepath.Join(g.common, "info", "exclude"), g.opts)
+	exclude, err := g.exclude.load(filepath.Join(g.common, "info", "exclude"), false, g.opts)
 	if err != nil {
 		return nil, err
 	}
@@ -302,15 +258,20 @@ func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
 }
 
 // load returns the rules in the file at name, re-reading it when its stamp
-// changed. An empty name or a missing file means no rules.
-func (f *extFile) load(name string, o ignore.Options) (*ignore.Matcher, error) {
+// changed. An empty name or a missing file means no rules. user says whether
+// the file is user-controlled (symlinks followed) or comes with the repo.
+func (f *extFile) load(name string, user bool, o ignore.Options) (*ignore.Matcher, error) {
 	if name == "" {
 		return nil, nil
 	}
 	if f.path != name {
 		*f = extFile{path: name}
 	}
-	st, err := statFile(name)
+	stat, read := statRepoFile, readRepoFile
+	if user {
+		stat, read = statUserFile, readUserFile
+	}
+	st, err := stat(name)
 	if err != nil {
 		f.stamp = fileStamp{}
 		return nil, err
@@ -320,12 +281,12 @@ func (f *extFile) load(name string, o ignore.Options) (*ignore.Matcher, error) {
 	}
 	f.m = nil
 	if !st.missing {
-		data, err := readCapped(name)
+		data, rst, err := read(name)
 		if err != nil {
 			f.stamp = fileStamp{}
-			return nil, fmt.Errorf("read %s: %w", name, stripPath(err))
+			return nil, err
 		}
-		f.m = ignore.ParseWith(data, o)
+		f.m, st = ignore.ParseWith(data, o), rst
 	}
 	f.stamp = st
 	return f.m, nil
@@ -355,9 +316,9 @@ func (g *gitRepo) fileName(dir string) string {
 }
 
 // dirMatcher returns the rules of the .gitignore in the top-relative folder
-// dir, reloading it when its stamp changed. A file inside the root is read
-// through the root handle, so a symlink leading outside it fails. The caller
-// holds Policy.mu.
+// dir, reloading it when its stamp changed. A .gitignore is never read
+// through a symlink, and a file inside the root is read through the root
+// handle. The caller holds Policy.mu.
 func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 	g := p.git
 	dr := g.dirs[dir]
@@ -368,15 +329,18 @@ func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 	rel, inside := g.rootRel(dir)
 	name := g.fileName(dir)
 	fail := func(err error) (*ignore.Matcher, error) {
-		dr.stamp, dr.m, dr.err = fileStamp{}, nil, fmt.Errorf("%w; folder skipped", readErr(name, err))
+		if inside {
+			err = readErr(name, err)
+		}
+		dr.stamp, dr.m, dr.err = fileStamp{}, nil, fmt.Errorf("%w; folder skipped", err)
 		return nil, dr.err
 	}
 	var st fileStamp
 	var err error
 	if inside {
-		st, err = p.statInRoot(path.Join(rel, GitIgnoreFileName))
+		st, err = p.statRootRepoFile(path.Join(rel, GitIgnoreFileName))
 	} else {
-		st, err = statFile(name)
+		st, err = statRepoFile(name)
 	}
 	if err != nil {
 		return fail(err)
@@ -388,9 +352,9 @@ func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 	if !st.missing {
 		var data []byte
 		if inside {
-			data, err = p.readInRoot(path.Join(rel, GitIgnoreFileName))
+			data, st, err = p.readRootRepoFile(path.Join(rel, GitIgnoreFileName))
 		} else {
-			data, err = readCapped(name)
+			data, st, err = readRepoFile(name)
 		}
 		if err != nil {
 			return fail(err)
@@ -399,33 +363,6 @@ func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 	}
 	dr.stamp = st
 	return dr.m, nil
-}
-
-// statInRoot stamps a file under the root.
-func (p *Policy) statInRoot(rel string) (fileStamp, error) {
-	fi, err := p.r.Stat(rel)
-	if errors.Is(err, fs.ErrNotExist) {
-		if _, lerr := p.r.Lstat(rel); errors.Is(lerr, fs.ErrNotExist) {
-			return fileStamp{ok: true, missing: true}, nil
-		}
-		return fileStamp{}, fmt.Errorf("dangling symlink: %w", err)
-	}
-	if err != nil {
-		return fileStamp{}, err
-	}
-	if !fi.Mode().IsRegular() {
-		return fileStamp{}, ErrNotRegular
-	}
-	return fileStamp{ok: true, mod: fi.ModTime().UnixNano(), size: fi.Size()}, nil
-}
-
-func (p *Policy) readInRoot(rel string) ([]byte, error) {
-	f, err := p.r.Open(rel)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return readCappedFile(f, rel)
 }
 
 // stripPath drops the path a *fs.PathError carries.

@@ -66,7 +66,7 @@ Four layers, checked in this order:
    - Files larger than 1 MB, which are usually exports or logs rather than notes. `SCREE_MAX_FILE_BYTES` changes the limit.
    - File names containing control characters or invalid UTF-8 (unsafe name).
    - Non-regular files such as FIFOs and devices, which are skipped without being opened.
-2. **Git's ignore rules**, when the folder is inside a git work tree (a `.git` folder or file in it or any folder above it): every `.gitignore` from the work tree's top down, `.git/info/exclude`, and the global excludes file (`core.excludesFile` from `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` or the repo's config, default `$XDG_CONFIG_HOME/git/ignore`; `[include]` is not followed). Git's semantics apply: a pattern is relative to the folder of its `.gitignore`, a deeper file overrides a shallower one, and a file inside an excluded folder cannot be re-included, so excluded folders such as `node_modules/` are never descended. A folder that holds its own `.git` (a nested repository or submodule) is skipped. One divergence: a tracked file that matches a pattern is still ignored, since scree does not read git's index. A `.gitignore` that cannot be read excludes its folder. `-gitignore=false` turns this layer off.
+2. **Git's ignore rules**, when the folder is inside a git work tree (a `.git` folder or file in it or any folder above it): every `.gitignore` from the work tree's top down, `.git/info/exclude`, and the global excludes file (`core.excludesFile` from `~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`, default `$XDG_CONFIG_HOME/git/ignore`; `[include]` is not followed). Git's semantics apply: a pattern is relative to the folder of its `.gitignore`, a deeper file overrides a shallower one, and a file inside an excluded folder cannot be re-included, so excluded folders such as `node_modules/` are never descended. A folder that holds its own `.git` (a nested repository or submodule) is skipped. One divergence: a tracked file that matches a pattern is still ignored, since scree does not read git's index. A `.gitignore` that cannot be read excludes its folder. `-gitignore=false` turns this layer off. Git's files are read the way git reads them: a `.gitignore`, `.git/info/exclude` and the `.git` file are never followed through a symlink and must be regular files. The global excludes file is taken only from your own git config (`~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`), never from a repository's `.git/config`. Messages about these files name the file and line, never its content.
 3. **`.screeignore`** at the root of the notes folder, using gitignore syntax: one pattern per line, `#` comments, `!` to re-include, a leading `/` anchors to the root, a trailing `/` matches folders only, and `**` matches any depth. Only the root file is read, not nested ones. It is applied after git's rules and can only exclude more. Example:
 
    ```
@@ -77,9 +77,9 @@ Four layers, checked in this order:
    !journal/public.md
    ```
 
-   Unlike git, `!` can re-include a file inside an excluded folder, which the example relies on. A `!` rule that matches only a folder above the file undoes folder exclusions but never a rule that matches the file itself, so `*.private.md` stays ignored under `!archive/2024/`. `doctor -v` lists every file a `!` rule re-included.
+   Unlike git, `!` can re-include a file inside an excluded folder, which the example relies on. A `!` rule that matches only a folder above the file undoes folder exclusions but never a rule that matches the file itself, so `*.private.md` stays ignored under `!archive/2024/`. `doctor -v` lists every file a `!` rule re-included, with the rule's line number. `doctor` reports bad lines by number only.
 
-   If `.screeignore` exists but cannot be read (for example, a symlink pointing outside the notes folder), nothing is indexed until it is fixed. Scree fails closed rather than ignoring the rules.
+   If `.screeignore` exists but cannot be read, or is a symlink or not a regular file, nothing is indexed until it is fixed. Scree fails closed rather than ignoring the rules.
 
    A line `include-hidden .name/` adds another root folder to that list (one segment starting with `.`; `.git` is refused; write `\include-hidden` for a literal pattern). To drop a default, exclude it with an ordinary pattern such as `/.cursor/`.
 4. **Front matter opt-out** for a single note, without touching the ignore file:
@@ -138,7 +138,7 @@ scree doctor
 scree doctor -v
 ```
 
-Every command takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent.
+Every command takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent. `-notes`, `-db` and `SCREE_DB` are refused by `serve` when `CLAUDE_PROJECT_DIR` is set: under Claude Code, a session's folder and index follow from the repo alone. A folder outside any repo, such as `~/notes`, is searched from the CLI, or from a Claude Code session started in that folder.
 
 `reindex --all` rebuilds from scratch after a model or chunking change.
 

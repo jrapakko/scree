@@ -53,7 +53,7 @@ func ParseWith(data []byte, o Options) *Matcher {
 		line = strings.TrimSuffix(line, "\r")
 		r, ok, err := parseLine(m.key(line))
 		if err != nil {
-			m.errs = append(m.errs, fmt.Sprintf("line %d: bad pattern %q", i+1, line))
+			m.errs = append(m.errs, fmt.Sprintf("line %d: bad pattern", i+1))
 			continue
 		}
 		if !ok {

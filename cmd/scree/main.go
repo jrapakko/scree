@@ -48,7 +48,8 @@ Usage:
 
 Every command takes -notes, -db and -gitignore. The folder is -notes if
 given; for serve, else $CLAUDE_PROJECT_DIR; otherwise the git root of the
-current directory, or the current directory outside git. Environment:
+current directory, or the current directory outside git. Under Claude Code
+(CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB. Environment:
   SCREE_DB            index file (default $XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
@@ -283,6 +284,9 @@ func runServe(ctx context.Context, args []string) error {
 	fs.Parse(args)
 	// stdout belongs to the MCP protocol.
 	log.SetOutput(textsafe.Writer(os.Stderr))
+	if err := checkServeFolder(fs); err != nil {
+		return err
+	}
 	token := os.Getenv("SCREE_HTTP_TOKEN")
 	if *addr != "" {
 		if err := mcpserver.CheckListenAddr(*addr, *allowRemote, token); err != nil {
@@ -327,6 +331,30 @@ func runServe(ctx context.Context, args []string) error {
 	log.Printf("serving MCP on http://%s (%s)", *addr, auth)
 	if err := hs.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	return nil
+}
+
+// errServeFolder refuses -notes, -db and SCREE_DB under Claude Code.
+var errServeFolder = errors.New("serve: -notes, -db and SCREE_DB are for the command line; " +
+	"under Claude Code (CLAUDE_PROJECT_DIR is set) scree indexes the repo it runs in")
+
+// checkServeFolder enforces that a Claude Code session's folder and index
+// follow from the repo alone: with CLAUDE_PROJECT_DIR set, serve refuses
+// -notes, -db and SCREE_DB, whoever passed them. Without it (a container, a
+// terminal, another client) they work as on the command line.
+func checkServeFolder(fs *flag.FlagSet) error {
+	if os.Getenv("CLAUDE_PROJECT_DIR") == "" {
+		return nil
+	}
+	refused := os.Getenv("SCREE_DB") != ""
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "notes" || f.Name == "db" {
+			refused = true
+		}
+	})
+	if refused {
+		return errServeFolder
 	}
 	return nil
 }

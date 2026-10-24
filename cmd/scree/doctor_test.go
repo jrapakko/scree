@@ -57,12 +57,87 @@ func TestDoctorListsReincluded(t *testing.T) {
 	})
 	for _, want := range []string{
 		`ok   .screeignore: 3 ignored, 2 re-included by "!"`,
-		`  re-included: "archive/2024/a.md" (.screeignore line 6: !archive/2024/)`,
-		`  re-included: "journal/public.md" (.screeignore line 3: !journal/public.md)`,
+		`  re-included: "archive/2024/a.md" (.screeignore line 6)`,
+		`  re-included: "journal/public.md" (.screeignore line 3)`,
 		`  ignored (.screeignore): "archive/2024/s.private.md"`,
 	} {
 		if !strings.Contains(out, want+"\n") {
 			t.Errorf("doctor output lacks %q:\n%s", want, out)
 		}
+	}
+}
+
+// Doctor names the git-side files it refuses or cannot parse, never their
+// content, even when a repo links them to a file holding a key.
+func TestDoctorNeverPrintsGitignoreContent(t *testing.T) {
+	const secretText = "OPENROUTER_API_KEY=sk-or-v1-FAKE0123456789 [bad\n"
+	write := func(p, s string) {
+		t.Helper()
+		mkdir(t, filepath.Dir(p))
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	symlink := func(target, name string) {
+		t.Helper()
+		mkdir(t, filepath.Dir(name))
+		if err := os.Symlink(target, name); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	cases := []struct {
+		name  string
+		setup func(repo, secret, home string) (root string)
+		want  string // a line fragment naming the file
+	}{
+		{"nested .gitignore", func(repo, secret, _ string) string {
+			symlink(secret, filepath.Join(repo, "sub", ".gitignore"))
+			return repo
+		}, `unreadable: read "sub/.gitignore": not a regular file (symlinks are not followed); folder skipped`},
+		{"ancestor .gitignore", func(repo, secret, _ string) string {
+			symlink(secret, filepath.Join(repo, "sub", ".gitignore"))
+			return filepath.Join(repo, "sub", "inner")
+		}, "sub/.gitignore: not a regular file (symlinks are not followed); folder skipped"},
+		{"info/exclude", func(repo, secret, _ string) string {
+			symlink(secret, filepath.Join(repo, ".git", "info", "exclude"))
+			return repo
+		}, "info/exclude: not a regular file (symlinks are not followed)"},
+		{".screeignore", func(repo, secret, _ string) string {
+			write(filepath.Join(repo, ".env"), secretText)
+			symlink(".env", filepath.Join(repo, ".screeignore"))
+			return repo
+		}, "read .screeignore: not a regular file (symlinks are not followed)"},
+		{"user excludesFile", func(repo, secret, home string) string {
+			write(filepath.Join(home, ".gitconfig"), "[core]\n\texcludesFile = "+secret+"\n")
+			return repo
+		}, "secret.txt line 1: bad pattern"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := tempDir(t)
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+			for _, v := range []string{"SCREE_DB", "SCREE_NOTES", "OPENROUTER_API_KEY", "CLAUDE_PROJECT_DIR"} {
+				t.Setenv(v, "")
+			}
+			tmp := tempDir(t)
+			secret := filepath.Join(tmp, "secret.txt")
+			write(secret, secretText)
+			repo := filepath.Join(tmp, "repo")
+			mkdir(t, filepath.Join(repo, ".git", "info"))
+			write(filepath.Join(repo, "sub", "inner", "a.md"), "a")
+			write(filepath.Join(repo, "b.md"), "b")
+			root := c.setup(repo, secret, home)
+			out := captureStdout(t, func() {
+				runDoctor(context.Background(), []string{"-v", "-offline", "-notes", root})
+			})
+			if strings.Contains(out, "sk-or-v1-FAKE") || strings.Contains(out, "[bad") {
+				t.Errorf("doctor printed file content:\n%s", out)
+			}
+			if !strings.Contains(out, c.want) {
+				t.Errorf("doctor output lacks %q:\n%s", c.want, out)
+			}
+		})
 	}
 }

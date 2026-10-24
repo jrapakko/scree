@@ -20,6 +20,7 @@
 #                    hosts, ro,z makes it readable but permanently relabels
 #                    every file in the folder on the host.
 set -eu
+prog=scree-mcp-docker
 
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
 # Settings come only from the env file. A project's .mcp.json can launch this
@@ -60,7 +61,6 @@ if [ $# -gt 0 ]; then
 	echo "scree-mcp-docker: takes no arguments; put settings in $env_file" >&2
 	exit 1
 fi
-prog=scree-mcp-docker
 # Read the env file as data, never as shell: each line is NAME=value, with an
 # optional "export " and optional matching quotes around the value. Nothing
 # in a value is expanded or run, so spaces, $(...) and backquotes are kept as
@@ -101,6 +101,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 	export "$name=$value"
 done <"$env_file"
 
+# CLAUDE_PROJECT_DIR comes from Claude Code's environment. It is not in the
+# cleared set above, and the parser refuses it as a line in the env file, so
+# the settings file cannot redirect the mount.
 dir=${CLAUDE_PROJECT_DIR:-}
 if [ -z "$dir" ]; then
 	echo "scree-mcp-docker: CLAUDE_PROJECT_DIR is not set; run it from Claude Code" >&2
@@ -114,25 +117,65 @@ case $dir in
 	exit 1
 	;;
 esac
-# Mount the git work tree's top so .gitignore and .git/info/exclude are visible.
+dir=$(cd -P -- "$dir" 2>/dev/null && pwd -P) || {
+	echo "scree-mcp-docker: cannot open CLAUDE_PROJECT_DIR $CLAUDE_PROJECT_DIR" >&2
+	exit 1
+}
+
+# owner prints the uid that owns $1; sticky succeeds when folder $1 has the
+# sticky bit. Both parse stat or ls output, since test -O and -k are not POSIX.
+owner() {
+	stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null || echo -1
+}
+sticky() {
+	case $(ls -ld -- "$1" 2>/dev/null) in
+	?????????[tT]*) return 0 ;;
+	esac
+	return 1
+}
+# Mount the git work tree's top so .gitignore and .git/info/exclude are
+# visible. Trust only a .git that is ours and not a symlink, and never look
+# for one in or above a shared sticky folder such as /tmp.
+me=$(id -u)
 d=$dir
-while [ "$d" != / ] && [ ! -e "$d/.git" ]; do d=$(dirname "$d"); done
-if [ -e "$d/.git" ]; then dir=$d; fi
+while :; do
+	if sticky "$d"; then break; fi
+	if [ -e "$d/.git" ] || [ -L "$d/.git" ]; then
+		if [ ! -L "$d/.git" ] && { [ -d "$d/.git" ] || [ -f "$d/.git" ]; } &&
+			[ "$(owner "$d/.git")" = "$me" ]; then
+			dir=$d
+		fi
+		break
+	fi
+	if [ "$d" = / ]; then break; fi
+	d=$(dirname -- "$d")
+done
 case $dir in
 *:*)
 	echo "scree-mcp-docker: cannot mount $dir: the path contains ':'" >&2
 	exit 1
 	;;
 esac
-case $dir in
-"$HOME" | /)
-	echo "scree-mcp-docker: refusing to mount $dir" >&2
+# Never mount the home directory, a folder above it, or /.
+home=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || home=$HOME
+refuse=
+case $dir in / | "$home") refuse=1 ;; esac
+case $home/ in "$dir"/*) refuse=1 ;; esac
+if [ -n "$refuse" ]; then
+	echo "scree-mcp-docker: refusing to mount $dir (your home directory, a folder above it, or /)" >&2
+	exit 1
+fi
+opts=${SCREE_MOUNT_OPTS:-ro}
+case $opts in
+ro | ro,z | ro,Z) ;;
+*)
+	echo "scree-mcp-docker: SCREE_MOUNT_OPTS must be ro, ro,z or ro,Z" >&2
 	exit 1
 	;;
 esac
 
-# Build the argument list back to front, keeping the caller's arguments last.
-set -- "${SCREE_IMAGE:-scree:latest}" serve -notes "$dir" "$@"
+# Build the argument list back to front.
+set -- "${SCREE_IMAGE:-scree:latest}" serve -notes "$dir"
 vol=${SCREE_DATA_VOLUME:-scree-data}
 case $vol in
 '' | [!A-Za-z0-9]* | *[!A-Za-z0-9_.-]*)
@@ -140,7 +183,7 @@ case $vol in
 	exit 1
 	;;
 esac
-set -- -v "$dir:$dir:${SCREE_MOUNT_OPTS:-ro}" -v "$vol:/data" "$@"
+set -- -v "$dir:$dir:$opts" -v "$vol:/data" "$@"
 # Pass a variable only if it is set, so unset ones keep the image defaults.
 for v in SCREE_HTTP_TOKEN SCREE_EMBED_URL SCREE_MAX_FILE_BYTES SCREE_ZDR SCREE_DIMENSIONS SCREE_MODEL OPENROUTER_API_KEY; do
 	if eval "[ -n \"\${$v+x}\" ]"; then

@@ -420,3 +420,184 @@ func TestScreeMCPDockerSettingsValidated(t *testing.T) {
 		}
 	}
 }
+
+// mountOf returns the host side of the folder mount in docker's arguments.
+func mountOf(t *testing.T, args []string) string {
+	t.Helper()
+	for i, a := range args {
+		if a == "-v" && i+1 < len(args) && !strings.HasSuffix(args[i+1], ":/data") {
+			return strings.SplitN(args[i+1], ":", 2)[0]
+		}
+	}
+	t.Fatalf("no folder mount in %q", args)
+	return ""
+}
+
+func TestDockerResolvesProjectDir(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	real := filepath.Join(e.dir, "real")
+	link := filepath.Join(e.dir, "link")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, _ := dockerArgs(t, e, link)
+	if got := mountOf(t, args); got != want {
+		t.Errorf("mounted %q, want %q", got, want)
+	}
+	if args[len(args)-1] != want {
+		t.Errorf("serve -notes %q, want %q", args[len(args)-1], want)
+	}
+}
+
+func TestDockerRefusesMissingProjectDir(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	out, lines, err := e.run(t, "scree-mcp-docker", []string{"CLAUDE_PROJECT_DIR=" + filepath.Join(e.dir, "gone")})
+	if err == nil || lines != nil || !strings.Contains(out, "cannot open CLAUDE_PROJECT_DIR") {
+		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
+	}
+}
+
+func TestDockerRefusesHomeAncestors(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	home := filepath.Join(e.dir, "home", "u")
+	if err := os.MkdirAll(filepath.Join(home, "code", "r"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{home, filepath.Join(e.dir, "home"), e.dir, "/"} {
+		out, lines, err := e.run(t, "scree-mcp-docker", []string{"HOME=" + home, "CLAUDE_PROJECT_DIR=" + dir})
+		if err == nil || lines != nil || !strings.Contains(out, "refusing to mount") {
+			t.Errorf("%s: err %v, child ran %v, output %q", dir, err, lines != nil, out)
+		}
+	}
+	// A symlinked HOME is compared resolved.
+	link := filepath.Join(e.dir, "homelink")
+	if err := os.Symlink(home, link); err != nil {
+		t.Fatal(err)
+	}
+	out, lines, err := e.run(t, "scree-mcp-docker", []string{"HOME=" + link, "CLAUDE_PROJECT_DIR=" + filepath.Join(e.dir, "home")})
+	if err == nil || lines != nil || !strings.Contains(out, "refusing to mount") {
+		t.Errorf("symlinked HOME: err %v, child ran %v, output %q", err, lines != nil, out)
+	}
+	args, _ := dockerArgs(t, e, filepath.Join(home, "code", "r"), "HOME="+link)
+	if got := mountOf(t, args); got != filepath.Join(home, "code", "r") {
+		t.Errorf("mounted %q", got)
+	}
+}
+
+func TestDockerMountOptsReadOnly(t *testing.T) {
+	for _, opts := range []string{"rw", "ro,rw", "z", "ro,z,rw", "ro z", ""} {
+		e := setup(t, envFile+"SCREE_MOUNT_OPTS='"+opts+"'\n", 0o600)
+		out, lines, err := e.run(t, "scree-mcp-docker", nil)
+		if opts == "" {
+			// Empty means the default, ro.
+			if err != nil || !slices.Contains(lines, "arg="+e.project+":"+e.project+":ro") {
+				t.Errorf("empty: err %v, output %q, lines %q", err, out, lines)
+			}
+			continue
+		}
+		if err == nil || lines != nil || !strings.Contains(out, "SCREE_MOUNT_OPTS must be") {
+			t.Errorf("%q: err %v, child ran %v, output %q", opts, err, lines != nil, out)
+		}
+	}
+	for _, opts := range []string{"ro", "ro,z", "ro,Z"} {
+		e := setup(t, envFile+"SCREE_MOUNT_OPTS="+opts+"\n", 0o600)
+		args, _ := dockerArgs(t, e, e.project)
+		if !slices.Contains(args, e.project+":"+e.project+":"+opts) {
+			t.Errorf("%q: docker args %q", opts, args)
+		}
+	}
+}
+
+func TestDockerNoLiftThroughSticky(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	sticky := filepath.Join(e.dir, "sticky")
+	p := filepath.Join(sticky, "p")
+	for _, d := range []string{filepath.Join(sticky, ".git"), p} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(sticky, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := dockerArgs(t, e, p)
+	if got := mountOf(t, args); got != p {
+		t.Errorf("mounted %q, want %q", got, p)
+	}
+	// A .git below the sticky folder still lifts.
+	if err := os.Mkdir(filepath.Join(p, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(p, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	args, _ = dockerArgs(t, e, sub)
+	if got := mountOf(t, args); got != p {
+		t.Errorf("mounted %q, want %q", got, p)
+	}
+}
+
+func TestDockerNoLiftThroughSymlinkGit(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	repo := filepath.Join(e.dir, "repo")
+	sub := filepath.Join(repo, "sub")
+	gitdir := filepath.Join(e.dir, "elsewhere.git")
+	for _, d := range []string{sub, gitdir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(gitdir, filepath.Join(repo, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := dockerArgs(t, e, sub)
+	if got := mountOf(t, args); got != sub {
+		t.Errorf("mounted %q, want %q", got, sub)
+	}
+}
+
+func TestDockerNoLiftToForeignGit(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to chown .git to another user")
+	}
+	e := setup(t, envFile, 0o600)
+	repo := filepath.Join(e.dir, "repo")
+	sub := filepath.Join(repo, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(filepath.Join(repo, ".git"), 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := dockerArgs(t, e, sub)
+	if got := mountOf(t, args); got != sub {
+		t.Errorf("mounted %q, want %q", got, sub)
+	}
+}
+
+func TestWrapperRefusesForeignEnvFile(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to chown the env file to another user")
+	}
+	e := setup(t, envFile, 0o600)
+	if err := os.Chown(e.envFile, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range scripts {
+		out, lines, err := e.run(t, s, nil)
+		if err == nil || lines != nil || !strings.Contains(out, s+": "+e.envFile+" is not owned by you") {
+			t.Errorf("%s: err %v, child ran %v, output %q", s, err, lines != nil, out)
+		}
+	}
+}

@@ -9,6 +9,7 @@
 # SCREE_ENV_FILE  env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
 # The scree binary must be installed next to this script.
 set -eu
+prog=scree-mcp
 
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
 # Settings come only from the env file. A project's .mcp.json can launch this
@@ -49,7 +50,6 @@ if [ $# -gt 0 ]; then
 	echo "scree-mcp: takes no arguments; put settings in $env_file" >&2
 	exit 1
 fi
-prog=scree-mcp
 # Read the env file as data, never as shell: each line is NAME=value, with an
 # optional "export " and optional matching quotes around the value. Nothing
 # in a value is expanded or run, so spaces, $(...) and backquotes are kept as
