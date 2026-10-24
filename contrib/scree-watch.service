@@ -1,0 +1,12 @@
+[Unit]
+Description=scree: keep the markdown notes index current
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/scree/env
+ExecStart=%h/.local/bin/scree watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
