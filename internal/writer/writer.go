@@ -40,7 +40,7 @@ const (
 	Waiting               // another process holds the lock
 	Syncing               // holding the lock, first sync running
 	Watching              // holding the lock, watching for changes
-	Skipped               // holding nothing: the first sync was not started (step 6's cap)
+	Skipped               // holding nothing: the first sync of a new index was over FirstSyncMax
 	Stopped               // the writer failed; see Status.Err
 )
 
@@ -170,7 +170,7 @@ func (w *Writer) hold(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.logf("sync done: %d notes, %d indexed, %d removed, %d failed, %d deferred",
+	w.logf("sync done: %d files, %d indexed, %d removed, %d failed, %d deferred",
 		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
 	// A first sync allocates much more than watching does; hand the heap
 	// back now rather than holding it for the life of the session.
@@ -272,7 +272,7 @@ func (w *Writer) Note(ctx context.Context) string {
 	}
 	if !w.syncedOnce(ctx) {
 		if st.Phase == Syncing {
-			return fmt.Sprintf("[index incomplete: first sync in progress, %d notes indexed so far]", st.Indexed)
+			return fmt.Sprintf("[index incomplete: first sync in progress, %d files indexed so far]", st.Indexed)
 		}
 		return fmt.Sprintf("[index incomplete: another scree process (pid %d) is building it]", st.HolderPID)
 	}

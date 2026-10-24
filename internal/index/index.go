@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/jrapakko/scree/internal/chunk"
 	"github.com/jrapakko/scree/internal/embed"
@@ -31,10 +32,11 @@ type Indexer struct {
 	// MinBackoff is the first pause after the embedding API is unavailable;
 	// each further failure doubles it, up to MaxBackoff. 0 means 30 s.
 	MinBackoff time.Duration
-	// OnStale, when set, receives the paths whose hits Search dropped because
-	// the policy now refuses them or they are gone, so the process that
-	// writes the index can drop their rows. Nil means leave them; the
-	// writer's watcher or next sync removes them.
+	// OnStale, when set, receives the paths whose hits Search dropped (the
+	// policy now refuses them, or they are gone) or found changed since they
+	// were indexed, so the process that writes the index can re-index them.
+	// Search never re-embeds itself. Nil means leave them; the writer's
+	// watcher or next sync catches up.
 	OnStale func(paths []string)
 	// Progress, when set, is called after each file Sync handles, with the
 	// counts so far.
@@ -278,7 +280,7 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 		switch {
 		case errors.Is(err, embed.ErrUnavailable):
 			if st.Deferred == 0 {
-				ix.logf("error: %v; deferring notes until the API is back", err)
+				ix.logf("error: %v; deferring files until the API is back", err)
 			}
 			st.Deferred++
 		case err != nil:
@@ -313,6 +315,13 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 
 // Search embeds query and returns the k nearest chunks. An empty index
 // returns no hits without calling the API.
+//
+// Every hit is re-checked against the current rules, and a hit from a file
+// that changed since it was indexed gets its current line range, found in
+// the file read for that check (each file is read at most once per search);
+// if its text is no longer there, the hit is kept with Stale set. Chunks
+// with identical text in several files are folded into one hit, with the
+// other copies in Also. Paths dropped or changed are passed to OnStale.
 func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit, error) {
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
@@ -325,50 +334,247 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit
 	if err != nil {
 		return nil, err
 	}
-	// Over-fetch, since hits the policy now refuses are dropped.
-	hits, err := ix.Store.Search(ctx, vecs[0], max(k, min(2*k, 100)))
+	// Over-fetch, since refused hits are dropped and duplicates folded.
+	hits, err := ix.Store.Search(ctx, vecs[0], min(max(4*k, 40), 200))
 	if err != nil {
 		return nil, err
 	}
-	allowed := map[string]bool{}
-	var stale []string
+	files := map[string]*fileView{}
+	var requeue []string
 	out := hits[:0]
 	for _, h := range hits {
-		ok, seen := allowed[h.Path]
+		fv, seen := files[h.Path]
 		if !seen {
-			ok = ix.stillAllowed(h)
-			allowed[h.Path] = ok
-			if !ok {
-				stale = append(stale, h.Path)
+			fv = ix.check(h)
+			files[h.Path] = fv
+			if !fv.ok || fv.changed {
+				requeue = append(requeue, h.Path)
 			}
 		}
-		if ok {
-			out = append(out, h)
+		if !fv.ok {
+			continue
 		}
+		if fv.changed {
+			fv.locate(&h)
+		}
+		out = append(out, h)
+	}
+	out, err = ix.foldDuplicates(ctx, out)
+	if err != nil {
+		return nil, err
 	}
 	if len(out) > k {
 		out = out[:k]
 	}
-	if len(stale) > 0 && ix.OnStale != nil {
-		ix.OnStale(stale)
+	if len(requeue) > 0 && ix.OnStale != nil {
+		ix.OnStale(requeue)
 	}
 	return out, nil
 }
 
-// stillAllowed re-checks a hit's file against the current rules: a stat-only
-// Check, and a full Read (for front matter) when the file's mtime or size
-// differs from what was indexed. Any refusal or error drops the hit.
-func (ix *Indexer) stillAllowed(h store.Hit) bool {
+// TestHooks lets tests observe Search. Nil outside tests.
+var TestHooks struct {
+	SearchRead func(path string) // Search reads a changed file
+}
+
+// fileView is what Search learned about one hit file.
+type fileView struct {
+	ok      bool   // the policy still allows it
+	changed bool   // its mtime or size differs from what was indexed
+	cur     string // when changed: its content, LF-normalized
+	norm    *normText
+}
+
+// check re-checks a hit's file against the current rules: a stat-only
+// Check, and a full Read (for front matter, and to locate the hit) when the
+// file's mtime or size differs from what was indexed. Any refusal or error
+// drops the file's hits.
+func (ix *Indexer) check(h store.Hit) *fileView {
 	fi, err := ix.Policy.Check(h.Path)
 	if err != nil {
-		return false
+		return &fileView{}
 	}
 	if h.Stat != nil && h.Stat.Mtime == fi.ModTime().UnixNano() && h.Stat.Size == fi.Size() {
-		return true
+		return &fileView{ok: true}
 	}
-	_, err = ix.Policy.Read(h.Path)
-	return err == nil
+	if TestHooks.SearchRead != nil {
+		TestHooks.SearchRead(h.Path)
+	}
+	src, err := ix.Policy.Read(h.Path)
+	if err != nil {
+		return &fileView{}
+	}
+	return &fileView{ok: true, changed: true, cur: strings.ReplaceAll(string(src), "\r\n", "\n")}
 }
+
+// maxOccurrences caps how many matches of a chunk Search considers in one
+// file.
+const maxOccurrences = 16
+
+// locate sets h's line range to where its text is in the current file:
+// first an exact match, then one ignoring whitespace differences, each time
+// the occurrence nearest the stored line. Not found, h is marked Stale and
+// loses its range.
+func (fv *fileView) locate(h *store.Hit) {
+	cur := fv.cur
+	if i, ok := nearest(cur, h.Text, h.Line, func(i int) int { return lineAt(cur, i) }); ok {
+		h.Line, h.EndLine = lineAt(cur, i), lineAt(cur, i+len(h.Text)-1)
+		return
+	}
+	if t := collapse(h.Text); t != "" {
+		if fv.norm == nil {
+			fv.norm = normalize(cur)
+		}
+		n := fv.norm
+		if i, ok := nearest(n.text, t, h.Line, func(i int) int { return lineAt(cur, n.orig[i]) }); ok {
+			h.Line, h.EndLine = lineAt(cur, n.orig[i]), lineAt(cur, n.orig[i+len(t)-1])
+			return
+		}
+	}
+	h.Line, h.EndLine, h.Stale = 0, 0, true
+}
+
+// nearest returns the index in s of the match of t, among the first
+// maxOccurrences, whose line (from lineOf) is closest to want.
+func nearest(s, t string, want int, lineOf func(i int) int) (int, bool) {
+	if t == "" {
+		return 0, false
+	}
+	best, bestDist := -1, 0
+	for from, seen := 0, 0; seen < maxOccurrences && from <= len(s); seen++ {
+		i := strings.Index(s[from:], t)
+		if i < 0 {
+			break
+		}
+		i += from
+		if d := abs(lineOf(i) - want); best < 0 || d < bestDist {
+			best, bestDist = i, d
+		}
+		from = i + 1
+	}
+	return best, best >= 0
+}
+
+// normText is a file's text with every run of whitespace collapsed to one
+// space; orig maps each byte of text to its offset in the file.
+type normText struct {
+	text string
+	orig []int
+}
+
+// normalize builds the collapsed form of s, once per file per search.
+func normalize(s string) *normText {
+	var b strings.Builder
+	orig := make([]int, 0, len(s))
+	space := false
+	for i, r := range s {
+		if unicode.IsSpace(r) {
+			space = b.Len() > 0
+			continue
+		}
+		if space {
+			b.WriteByte(' ')
+			orig = append(orig, i-1) // the byte before r is whitespace
+			space = false
+		}
+		n := b.Len()
+		b.WriteRune(r)
+		for range b.Len() - n {
+			orig = append(orig, i) // every byte of r maps to its start
+		}
+	}
+	return &normText{text: b.String(), orig: orig}
+}
+
+// collapse is normalize without the offsets.
+func collapse(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// maxCopies caps the copies of one chunk Search looks up and checks;
+// maxAlso caps how many it lists.
+const (
+	maxCopies = 64
+	maxAlso   = 3
+)
+
+// foldDuplicates folds hits with the same text hash into one, keeping the
+// group's best rank. The hit shown is the copy with the fewest path
+// segments, then the shortest path, then the first in byte order. The other
+// copies are looked up in the store, not only among the fetched hits, and
+// each must pass Policy.Check; up to maxAlso go in Also, the count of the
+// rest in AlsoMore. A hit with no text hash is its own group.
+func (ix *Indexer) foldDuplicates(ctx context.Context, hits []store.Hit) ([]store.Hit, error) {
+	var order []string
+	groups := map[string][]int{}
+	for i, h := range hits {
+		key := h.TextHash
+		if key == "" {
+			key = fmt.Sprintf("\x00%d", i)
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], i)
+	}
+	out := make([]store.Hit, 0, len(order))
+	for _, key := range order {
+		members := groups[key]
+		best := members[0]
+		for _, m := range members[1:] {
+			if primaryLess(hits[m].Path, hits[best].Path) {
+				best = m
+			}
+		}
+		h := hits[best]
+		if h.TextHash != "" {
+			copies, err := ix.Store.Copies(ctx, h.TextHash, h.ID, maxCopies)
+			if err != nil {
+				return nil, err
+			}
+			allowed := map[string]bool{}
+			var also []store.Copy
+			for _, c := range copies {
+				ok, seen := allowed[c.Path]
+				if !seen {
+					_, err := ix.Policy.Check(c.Path)
+					ok = err == nil
+					allowed[c.Path] = ok
+				}
+				if ok {
+					also = append(also, c)
+				}
+			}
+			if len(also) > maxAlso {
+				h.AlsoMore = len(also) - maxAlso
+				also = also[:maxAlso]
+			}
+			h.Also = also
+		}
+		out = append(out, h)
+	}
+	return out, nil
+}
+
+// primaryLess orders duplicate copies: fewer path segments, then a shorter
+// path, then byte order.
+func primaryLess(a, b string) bool {
+	if sa, sb := strings.Count(a, "/"), strings.Count(b, "/"); sa != sb {
+		return sa < sb
+	}
+	if len(a) != len(b) {
+		return len(a) < len(b)
+	}
+	return a < b
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// lineAt returns the 1-based line of byte offset i in s.
+func lineAt(s string, i int) int { return 1 + strings.Count(s[:i], "\n") }
 
 func (ix *Indexer) logf(format string, args ...any) {
 	if ix.Log != nil {

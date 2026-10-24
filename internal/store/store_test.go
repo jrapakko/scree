@@ -417,3 +417,54 @@ func TestEndLineRoundTrip(t *testing.T) {
 		t.Error("MissingLines on a new row")
 	}
 }
+
+func TestMigrateTextHash(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same := []Chunk{{Text: "shared"}, {Text: "own a"}}
+	if err := s.ReplaceFile(ctx, "a.md", "h", 1, nil, same, [][]float32{{1, 0}, {0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceFile(ctx, "b.md", "h", 1, nil, []Chunk{{Text: "shared", Line: 4, EndLine: 6}}, [][]float32{{1, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	// Make it look like an index from before text_hash.
+	for _, q := range []string{`DROP INDEX chunks_text_hash`, `ALTER TABLE chunks DROP COLUMN text_hash`} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var missing int
+	if err := s.db.QueryRow(`SELECT count(*) FROM chunks WHERE text_hash IS NULL`).Scan(&missing); err != nil || missing != 0 {
+		t.Fatalf("%d rows without a hash, %v", missing, err)
+	}
+	hits, err := s.Search(ctx, []float32{1, 0}, 1)
+	if err != nil || len(hits) != 1 || hits[0].TextHash != TextHash("shared") {
+		t.Fatalf("hit = %+v, %v", hits, err)
+	}
+	copies, err := s.Copies(ctx, hits[0].TextHash, hits[0].ID, 10)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("Copies = %+v, %v", copies, err)
+	}
+	other := "a.md"
+	if hits[0].Path == "a.md" {
+		other = "b.md"
+	}
+	if copies[0].Path != other {
+		t.Errorf("copy = %+v, want %s", copies[0], other)
+	}
+	if len(TextHash("x")) != 32 {
+		t.Errorf("TextHash length %d", len(TextHash("x")))
+	}
+}

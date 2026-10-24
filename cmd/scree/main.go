@@ -37,7 +37,7 @@ var version = "dev"
 const usage = `scree: semantic search over the markdown in a folder
 
 Usage:
-  scree watch              index changed notes, then keep the index current
+  scree watch              index changed files, then keep the index current
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
                            -http is loopback only unless -allow-remote)

@@ -332,7 +332,7 @@ func runSync(ctx context.Context, ix *index.Indexer, what string) (deferred bool
 		}
 		return errors.Is(err, embed.ErrUnavailable)
 	}
-	ix.Log.Printf("%s: %d notes, %d indexed, %d removed, %d failed, %d deferred",
+	ix.Log.Printf("%s: %d files, %d indexed, %d removed, %d failed, %d deferred",
 		what, st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
 	return st.Deferred > 0
 }

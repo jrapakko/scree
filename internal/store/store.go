@@ -4,8 +4,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -40,7 +42,8 @@ CREATE TABLE IF NOT EXISTS chunks(
 	heading TEXT NOT NULL,
 	line INTEGER NOT NULL,
 	text TEXT NOT NULL,
-	end_line INTEGER
+	end_line INTEGER,
+	text_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 `
@@ -69,6 +72,19 @@ type Chunk struct {
 	Text          string
 }
 
+// Copy is another chunk with the same text as a hit, at its stored range.
+type Copy struct {
+	Path          string
+	Line, EndLine int
+}
+
+// TextHash is the stored hash of a chunk's text: the first 16 bytes of its
+// SHA-256, in hex. Identical chunks in several files share it.
+func TextHash(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:16])
+}
+
 // LineRange is a chunk's source line range, by its order in the file.
 type LineRange struct {
 	Line, EndLine int
@@ -83,6 +99,15 @@ type FileStat struct {
 // Hit is a search result.
 type Hit struct {
 	Chunk
+	ID       int64  // the chunk's row id
+	TextHash string // "" for rows from before it was recorded
+	// Stale is set by search when the file changed since it was indexed and
+	// the chunk's text is no longer in it; Line and EndLine are then 0.
+	Stale bool
+	// Also lists other files holding the same chunk, and AlsoMore how many
+	// more there are, when search folded duplicates into this hit.
+	Also     []Copy
+	AlsoMore int
 	// Stat is the file as it was indexed; nil for rows from before it was
 	// recorded.
 	Stat *FileStat
@@ -234,19 +259,70 @@ func migrate(ctx context.Context, conn *sql.Conn) error {
 	for _, add := range []struct{ table, col string }{
 		{"files", "mtime"}, {"files", "size"}, {"chunks", "end_line"},
 	} {
-		ok, err := hasColumn(ctx, conn, add.table, add.col)
-		if err != nil {
+		if err := addColumn(ctx, conn, add.table, add.col, "INTEGER"); err != nil {
 			return err
 		}
-		if !ok {
-			if _, err := conn.ExecContext(ctx, `ALTER TABLE `+add.table+` ADD COLUMN `+add.col+` INTEGER`); err != nil {
-				return err
-			}
-		}
+	}
+	if err := addColumn(ctx, conn, "chunks", "text_hash", "TEXT"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS chunks_text_hash ON chunks(text_hash)`); err != nil {
+		return err
+	}
+	if err := backfillTextHash(ctx, conn); err != nil {
+		return err
 	}
 	_, err := conn.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES('schema', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value`, SchemaVersion)
 	return err
+}
+
+func addColumn(ctx context.Context, conn *sql.Conn, table, col, typ string) error {
+	ok, err := hasColumn(ctx, conn, table, col)
+	if err != nil || ok {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+col+` `+typ)
+	return err
+}
+
+// backfillTextHash hashes the stored text of chunks from before text_hash
+// was recorded, 1000 rows at a time. It runs once, inside init's
+// transaction; nothing is re-embedded.
+func backfillTextHash(ctx context.Context, conn *sql.Conn) error {
+	for {
+		rows, err := conn.QueryContext(ctx, `SELECT id, text FROM chunks WHERE text_hash IS NULL LIMIT 1000`)
+		if err != nil {
+			return err
+		}
+		type row struct {
+			id   int64
+			hash string
+		}
+		var batch []row
+		for rows.Next() {
+			var r row
+			var text string
+			if err := rows.Scan(&r.id, &text); err != nil {
+				rows.Close()
+				return err
+			}
+			r.hash = TextHash(text)
+			batch = append(batch, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		for _, r := range batch {
+			if _, err := conn.ExecContext(ctx, `UPDATE chunks SET text_hash = ? WHERE id = ?`, r.hash, r.id); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func hasColumn(ctx context.Context, conn *sql.Conn, table, col string) (bool, error) {
@@ -410,8 +486,8 @@ func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, 
 	}
 	for i, c := range chunks {
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO chunks(path, ord, heading, line, end_line, text) VALUES(?, ?, ?, ?, ?, ?)`,
-			path, i, c.Heading, c.Line, nullInt(c.EndLine), c.Text)
+			`INSERT INTO chunks(path, ord, heading, line, end_line, text, text_hash) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			path, i, c.Heading, c.Line, nullInt(c.EndLine), c.Text, TextHash(c.Text))
 		if err != nil {
 			return err
 		}
@@ -479,6 +555,28 @@ func (s *Store) SetLines(ctx context.Context, path string, ranges []LineRange) e
 	return tx.Commit()
 }
 
+// Copies returns up to limit other chunks whose text hash is hash, skipping
+// the chunk excludeID, ordered by path and line.
+func (s *Store) Copies(ctx context.Context, hash string, excludeID int64, limit int) ([]Copy, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path, line, end_line FROM chunks
+		WHERE text_hash = ? AND id <> ? ORDER BY path, line LIMIT ?`, hash, excludeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Copy
+	for rows.Next() {
+		var c Copy
+		var end sql.NullInt64
+		if err := rows.Scan(&c.Path, &c.Line, &end); err != nil {
+			return nil, err
+		}
+		c.EndLine = int(end.Int64)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // RemoveFile deletes a file's rows. Removing an unknown path is not an error.
 func (s *Store) RemoveFile(ctx context.Context, path string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -516,7 +614,7 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.path, c.heading, c.line, c.end_line, c.text, v.distance, f.mtime, f.size
+		SELECT c.id, c.text_hash, c.path, c.heading, c.line, c.end_line, c.text, v.distance, f.mtime, f.size
 		FROM (SELECT rowid, distance FROM vecs WHERE cmd = ? LIMIT ?) AS v
 		JOIN chunks c ON c.id = v.rowid
 		LEFT JOIN files f ON f.path = c.path
@@ -529,10 +627,11 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 	for rows.Next() {
 		var h Hit
 		var mtime, size, end sql.NullInt64
-		if err := rows.Scan(&h.Path, &h.Heading, &h.Line, &end, &h.Text, &h.Distance, &mtime, &size); err != nil {
+		var th sql.NullString
+		if err := rows.Scan(&h.ID, &th, &h.Path, &h.Heading, &h.Line, &end, &h.Text, &h.Distance, &mtime, &size); err != nil {
 			return nil, err
 		}
-		h.EndLine = int(end.Int64)
+		h.EndLine, h.TextHash = int(end.Int64), th.String
 		h.Stat = statOf(mtime, size)
 		hits = append(hits, h)
 	}

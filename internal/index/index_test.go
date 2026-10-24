@@ -630,3 +630,168 @@ func TestBackfillSkipsWhenChunkingDiffers(t *testing.T) {
 		t.Errorf("rows changed: %q", texts)
 	}
 }
+
+// searchOne runs Search and returns the hit from path, failing if none.
+func searchOne(t *testing.T, ix *Indexer, q, path string) store.Hit {
+	t.Helper()
+	hits, err := ix.Search(context.Background(), q, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hits {
+		if h.Path == path {
+			return h
+		}
+	}
+	t.Fatalf("no hit from %s in %+v", path, hits)
+	return store.Hit{}
+}
+
+func TestSearchCurrentLinesExact(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple pie\n"})
+	if h := searchOne(t, ix, "apple", "a.md"); h.Line != 1 || h.EndLine != 2 {
+		t.Fatalf("before: %d-%d", h.Line, h.EndLine)
+	}
+	write(t, ix.Root(), "a.md", strings.Repeat("filler\n", 10)+"# A\napple pie\n") // no sync
+	h := searchOne(t, ix, "apple", "a.md")
+	if h.Line != 11 || h.EndLine != 12 || h.Stale {
+		t.Errorf("after inserting 10 lines: %d-%d stale=%v", h.Line, h.EndLine, h.Stale)
+	}
+}
+
+func TestSearchCurrentLinesWhitespace(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple pie and more\nsecond line\n"})
+	write(t, ix.Root(), "a.md", "# A\n\n  apple   pie and\nmore second\n\tline\n")
+	h := searchOne(t, ix, "apple", "a.md")
+	if h.Line != 1 || h.EndLine != 5 || h.Stale {
+		t.Errorf("re-wrapped: %d-%d stale=%v", h.Line, h.EndLine, h.Stale)
+	}
+}
+
+func TestSearchStaleWhenRewritten(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple pie\n"})
+	write(t, ix.Root(), "a.md", "# A\nsomething else entirely, apple\n")
+	h := searchOne(t, ix, "apple", "a.md")
+	if !h.Stale || h.Line != 0 || h.EndLine != 0 || h.Text != "# A\napple pie" {
+		t.Errorf("rewritten: %+v", h)
+	}
+}
+
+func TestSearchReadsChangedFileOnce(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple one\n# B\napple two\n# C\napple three\n"})
+	write(t, ix.Root(), "a.md", "intro\n\n# A\napple one\n# B\napple two\n# C\napple three\n")
+	reads := 0
+	TestHooks.SearchRead = func(string) { reads++ }
+	defer func() { TestHooks.SearchRead = nil }()
+	hits, err := ix.Search(context.Background(), "apple", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, h := range hits {
+		if h.Path == "a.md" {
+			n++
+			if h.Stale || h.Line < 3 {
+				t.Errorf("hit %+v not relocated", h)
+			}
+		}
+	}
+	if n != 3 || reads != 1 {
+		t.Errorf("%d hits from a.md, %d reads; want 3 and 1", n, reads)
+	}
+}
+
+func TestSearchNearestOccurrence(t *testing.T) {
+	filler := strings.Repeat("filler\n", 20)
+	ix := indexed(t, map[string]string{"a.md": filler + "# A\napple x\n"})
+	if h := searchOne(t, ix, "apple", "a.md"); h.Line != 21 {
+		t.Fatalf("before: %d", h.Line)
+	}
+	write(t, ix.Root(), "a.md", "# A\napple x\n"+filler+"# A\napple x\n")
+	if h := searchOne(t, ix, "apple", "a.md"); h.Line != 23 || h.EndLine != 24 {
+		t.Errorf("nearest copy: %d-%d, want 23-24", h.Line, h.EndLine)
+	}
+}
+
+func TestSearchQueuesChangedForWriter(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\napple\n", "b.md": "# B\napple\n"})
+	var queued []string
+	ix.OnStale = func(p []string) { queued = append(queued, p...) }
+	searchPaths(t, ix, "apple", 8)
+	if len(queued) != 0 {
+		t.Fatalf("unchanged files queued: %v", queued)
+	}
+	write(t, ix.Root(), "a.md", "# A\napple\nmore\n")
+	searchPaths(t, ix, "apple", 8)
+	if !slices.Equal(queued, []string{"a.md"}) {
+		t.Errorf("queued %v, want [a.md]", queued)
+	}
+}
+
+func dupFiles(paths ...string) map[string]string {
+	files := map[string]string{}
+	for _, p := range paths {
+		files[p] = "# Setup\napple setup steps\n"
+	}
+	return files
+}
+
+func TestCollapseDuplicates(t *testing.T) {
+	ix := indexed(t, dupFiles("docs/print/x.md", "docs/wiki-build/x.md", "docs/x.md"))
+	hits, err := ix.Search(context.Background(), "apple", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Path != "docs/x.md" {
+		t.Fatalf("hits = %+v", hits)
+	}
+	want := []store.Copy{{Path: "docs/print/x.md", Line: 1, EndLine: 2}, {Path: "docs/wiki-build/x.md", Line: 1, EndLine: 2}}
+	if !slices.Equal(hits[0].Also, want) || hits[0].AlsoMore != 0 {
+		t.Errorf("also = %+v (+%d)", hits[0].Also, hits[0].AlsoMore)
+	}
+}
+
+func TestCollapseCapsAlso(t *testing.T) {
+	ix := indexed(t, dupFiles("a.md", "b/a.md", "c/a.md", "d/a.md", "e/a.md", "f/a.md"))
+	hits, err := ix.Search(context.Background(), "apple", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Path != "a.md" || len(hits[0].Also) != 3 || hits[0].AlsoMore != 2 {
+		t.Fatalf("hits = %+v", hits)
+	}
+}
+
+func TestCollapseSkipsRefusedCopy(t *testing.T) {
+	ix := indexed(t, dupFiles("docs/print/x.md", "docs/wiki-build/x.md", "docs/x.md"))
+	write(t, ix.Root(), ".screeignore", "docs/print/\n") // no sync
+	hits, err := ix.Search(context.Background(), "apple", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || len(hits[0].Also) != 1 || hits[0].Also[0].Path != "docs/wiki-build/x.md" {
+		t.Errorf("hits = %+v", hits)
+	}
+}
+
+func TestCollapseKeepsK(t *testing.T) {
+	files := dupFiles("d1/x.md", "d2/x.md", "d3/x.md", "d4/x.md", "d5/x.md")
+	for i := range 10 {
+		files[fmt.Sprintf("n%d.md", i)] = fmt.Sprintf("# N%d\n%s\n", i, strings.Repeat("apple ", i+1))
+	}
+	ix := indexed(t, files)
+	hits, err := ix.Search(context.Background(), "apple", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 8 {
+		t.Errorf("got %d hits, want 8", len(hits))
+	}
+	seen := map[string]bool{}
+	for _, h := range hits {
+		if seen[h.TextHash] {
+			t.Errorf("duplicate text in two hits: %s", h.Path)
+		}
+		seen[h.TextHash] = true
+	}
+}

@@ -165,7 +165,9 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 // terminal. Attribute values are quoted, control characters are stripped,
 // and tags inside file text are neutralized so a file cannot forge a hit.
 // lines is the chunk's source range, "a-b", or just "a" for a row indexed
-// before end lines were recorded.
+// before end lines were recorded; a hit whose text is no longer in its
+// changed file has stale="true" and no lines. also lists other files with
+// the same chunk, with also_more counting the rest.
 // Each hit's text is capped at MaxHitChars and the output at MaxOutputBytes.
 //
 // note, if not empty, is appended as a final line, such as a writer's
@@ -184,12 +186,19 @@ func FormatHits(hits []store.Hit, note string) string {
 		if len(text) > MaxHitChars {
 			text = text[:cutRune(text, MaxHitChars)] + "\n[cut]"
 		}
-		lines := strconv.Itoa(h.Line)
-		if h.EndLine > 0 {
-			lines += "-" + strconv.Itoa(h.EndLine)
+		where := ` lines="` + lineSpan(h.Line, h.EndLine) + `"`
+		if h.Stale {
+			where = ` stale="true"`
 		}
-		one := fmt.Sprintf("<hit n=\"%d\" path=%s lines=\"%s\" heading=%s score=\"%.3f\">\n%s\n</hit>",
-			i+1, quoteAttr(h.Path, "hit"), lines, quoteAttr(h.Heading, "hit"), 1-h.Distance, text)
+		also := ""
+		if len(h.Also) > 0 {
+			also = " also=" + quoteAttr(alsoList(h.Also), "hit")
+			if h.AlsoMore > 0 {
+				also += fmt.Sprintf(` also_more="%d"`, h.AlsoMore)
+			}
+		}
+		one := fmt.Sprintf("<hit n=\"%d\" path=%s%s heading=%s score=\"%.3f\"%s>\n%s\n</hit>",
+			i+1, quoteAttr(h.Path, "hit"), where, quoteAttr(h.Heading, "hit"), 1-h.Distance, also, text)
 		if i > 0 {
 			one = "\n" + one
 		}
@@ -201,6 +210,28 @@ func FormatHits(hits []store.Hit, note string) string {
 	}
 	b.WriteString(note)
 	return b.String()
+}
+
+// lineSpan is "a-b", or "a" when the end is unknown (0).
+func lineSpan(line, end int) string {
+	if end > 0 {
+		return strconv.Itoa(line) + "-" + strconv.Itoa(end)
+	}
+	return strconv.Itoa(line)
+}
+
+// alsoList renders copies as "path:a-b, path:a-b". A path holding ",", ":"
+// or a quote is written Go-quoted, so the list stays unambiguous.
+func alsoList(copies []store.Copy) string {
+	parts := make([]string, len(copies))
+	for i, c := range copies {
+		p := c.Path
+		if strings.ContainsAny(p, ",:\"'") {
+			p = strconv.Quote(p)
+		}
+		parts[i] = p + ":" + lineSpan(c.Line, c.EndLine)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // quoteAttr strips, neutralizes and quotes an attribute value.

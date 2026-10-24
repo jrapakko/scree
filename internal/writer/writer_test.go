@@ -3,6 +3,7 @@ package writer
 import (
 	"context"
 	"github.com/jrapakko/scree/internal/lock"
+	"github.com/jrapakko/scree/internal/watch"
 	"io"
 	"log"
 	"os"
@@ -177,7 +178,7 @@ func TestNoteDuringFirstSync(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	ctx := context.Background()
-	if n := a.Note(ctx); n != "[index incomplete: first sync in progress, 2 notes indexed so far]" {
+	if n := a.Note(ctx); n != "[index incomplete: first sync in progress, 2 files indexed so far]" {
 		t.Errorf("holder note = %q", n)
 	}
 	b, _, _ := e.writer(t, constEmbedder{})
@@ -288,5 +289,44 @@ func TestCapOnlyFirstSync(t *testing.T) {
 func writeBig(root string) {
 	for _, n := range []string{"big1.md", "big2.md", "big3.md"} {
 		os.WriteFile(filepath.Join(root, n), []byte(strings.Repeat("word ", 120<<10)), 0o644)
+	}
+}
+
+// A search that finds a changed file queues it for the holder's worker,
+// ahead of the watcher's debounce; a waiting reader queues nothing.
+func TestSearchQueuesChangedForWriter(t *testing.T) {
+	e := newEnv(t, "a.md")
+	a, _, _ := e.writer(t, constEmbedder{})
+	waitPhase(t, a, Watching, 5*time.Second)
+	b, _, _ := e.writer(t, constEmbedder{})
+	waitPhase(t, b, Waiting, 5*time.Second)
+	ctx := context.Background()
+	before, _ := a.Indexer.Store.FileHash(ctx, "a.md")
+
+	os.WriteFile(filepath.Join(e.root, "a.md"), []byte("# a.md\ntext, changed\n"), 0o644)
+	if _, err := b.Indexer.Search(ctx, "text", 4); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	queued := b.stale
+	b.mu.Unlock()
+	if queued != nil {
+		t.Error("a reader created a queue")
+	}
+	start := time.Now()
+	if _, err := a.Indexer.Search(ctx, "text", 4); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if h, _ := a.Indexer.Store.FileHash(ctx, "a.md"); h != before {
+			if d := time.Since(start); d > watch.Debounce {
+				t.Errorf("re-indexed after %s, no sooner than the debounce", d)
+			}
+			return
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("changed file never re-indexed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

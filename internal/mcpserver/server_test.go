@@ -335,7 +335,7 @@ func TestSearchAppendsNote(t *testing.T) {
 	if isErr || text != want {
 		t.Errorf("search = %q, want %q", text, want)
 	}
-	note := "[index incomplete: first sync in progress, 3 notes indexed so far]"
+	note := "[index incomplete: first sync in progress, 3 files indexed so far]"
 	out := FormatHits([]store.Hit{hit("a.md", 1, "A", "text")}, note)
 	if !strings.HasSuffix(out, "</hit>\n"+note) {
 		t.Errorf("FormatHits with note = %q", out)
@@ -370,7 +370,7 @@ func TestServeHandshakeNotBlocked(t *testing.T) {
 	start := time.Now()
 	cs, _, _, w := connectWith(t, slowEmbedder{delay: 200 * time.Millisecond}, func(ix *index.Indexer, dir string) *writer.Writer {
 		for i := range 10 {
-			os.WriteFile(filepath.Join(ix.Root(), fmt.Sprintf("n%d.md", i)), []byte("# N\nzebra\n"), 0o644)
+			os.WriteFile(filepath.Join(ix.Root(), fmt.Sprintf("n%d.md", i)), []byte(fmt.Sprintf("# N\nzebra %d\n", i)), 0o644)
 		}
 		return &writer.Writer{Indexer: ix, LockPath: filepath.Join(dir, "writer.lock"), Log: log.New(io.Discard, "", 0)}
 	})
@@ -412,7 +412,7 @@ func TestSearchDuringFirstSync(t *testing.T) {
 	cs, _, _, w := connectWith(t, g, func(ix *index.Indexer, dir string) *writer.Writer {
 		ix.QueryEmbedder = lenEmbedder{}
 		for i := range 6 {
-			os.WriteFile(filepath.Join(ix.Root(), fmt.Sprintf("n%d.md", i)), []byte("# N\nzebra\n"), 0o644)
+			os.WriteFile(filepath.Join(ix.Root(), fmt.Sprintf("n%d.md", i)), []byte(fmt.Sprintf("# N\nzebra %d\n", i)), 0o644)
 		}
 		return &writer.Writer{Indexer: ix, LockPath: filepath.Join(dir, "writer.lock"), Log: log.New(io.Discard, "", 0)}
 	})
@@ -425,7 +425,7 @@ func TestSearchDuringFirstSync(t *testing.T) {
 	}
 	text, isErr := call(t, cs, "search_docs", map[string]any{"query": "zebra", "k": 20})
 	if isErr || strings.Count(text, "<hit ") != 3 ||
-		!strings.HasSuffix(text, "\n[index incomplete: first sync in progress, 3 notes indexed so far]") {
+		!strings.HasSuffix(text, "\n[index incomplete: first sync in progress, 3 files indexed so far]") {
 		t.Errorf("search during the first sync = %q", text)
 	}
 }
@@ -531,5 +531,28 @@ func TestOldToolNamesGone(t *testing.T) {
 		if err == nil && !res.IsError {
 			t.Errorf("%s still answers", old)
 		}
+	}
+}
+
+func TestAlsoQuoting(t *testing.T) {
+	out := FormatHits([]store.Hit{{
+		Chunk: store.Chunk{Path: "a.md", Line: 1, EndLine: 2, Heading: "H", Text: "x"},
+		Also: []store.Copy{
+			{Path: "print/a.md", Line: 3, EndLine: 4},
+			{Path: "odd, name.md", Line: 5, EndLine: 6},
+			{Path: `q"x.md`, Line: 7},
+		},
+		AlsoMore: 2,
+	}}, "")
+	want := `also="print/a.md:3-4, \"odd, name.md\":5-6, \"q\\\"x.md\":7" also_more="2"`
+	if !strings.Contains(out, want) {
+		t.Errorf("FormatHits = %s\nwant %s", out, want)
+	}
+}
+
+func TestStaleHitHasNoLines(t *testing.T) {
+	out := FormatHits([]store.Hit{{Chunk: store.Chunk{Path: "a.md", Heading: "H", Text: "x"}, Stale: true}}, "")
+	if !strings.HasPrefix(out, `<hit n="1" path="a.md" stale="true" heading="H"`) || strings.Contains(out, "lines=") {
+		t.Errorf("FormatHits = %s", out)
 	}
 }
