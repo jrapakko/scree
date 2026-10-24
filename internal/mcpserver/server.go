@@ -85,11 +85,15 @@ func New(ix *index.Indexer, version string) *mcp.Server {
 		Description: "Read a whole note by the path search_notes returned. The content comes back inside a <note> element.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, a readArgs) (*mcp.CallToolResult, any, error) {
-		text, err := readNote(ix, a.Path)
+		rel, err := ix.Policy.Canonical(a.Path)
+		if err != nil {
+			return errResult(refusal(err).Error()), nil, nil
+		}
+		text, err := readNote(ix, rel)
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
-		return textResult(wrapNote(a.Path, text)), nil, nil
+		return textResult(wrapNote(rel, text)), nil, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -97,14 +101,18 @@ func New(ix *index.Indexer, version string) *mcp.Server {
 		Description: "Re-index one note, or with no path, every note that changed since it was last indexed.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, a reindexArgs) (*mcp.CallToolResult, any, error) {
 		if a.Path != "" {
-			changed, err := ix.IndexFile(ctx, a.Path)
+			rel, err := ix.Policy.Canonical(a.Path)
+			if err != nil {
+				return errResult(refusal(err).Error()), nil, nil
+			}
+			changed, err := ix.IndexFile(ctx, rel)
 			if err != nil {
 				return errResult(refusal(err).Error()), nil, nil
 			}
 			if !changed {
-				return textResult(fmt.Sprintf("%q is already up to date.", a.Path)), nil, nil
+				return textResult(fmt.Sprintf("%q is already up to date.", rel)), nil, nil
 			}
-			return textResult(fmt.Sprintf("Re-indexed %q.", a.Path)), nil, nil
+			return textResult(fmt.Sprintf("Re-indexed %q.", rel)), nil, nil
 		}
 		st, err := ix.Sync(ctx)
 		if err != nil {

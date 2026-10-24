@@ -220,3 +220,34 @@ func TestToolErrorsQuotePaths(t *testing.T) {
 		}
 	}
 }
+
+func TestToolsCanonicalCase(t *testing.T) {
+	cs, root, s := connect(t)
+	probe := filepath.Join(root, "case-probe")
+	os.WriteFile(probe, nil, 0o644)
+	a, _ := os.Lstat(probe)
+	b, err := os.Lstat(filepath.Join(root, "CASE-PROBE"))
+	os.Remove(probe)
+	if err != nil || !os.SameFile(a, b) {
+		t.Skip("the temp dir is case-sensitive")
+	}
+	os.WriteFile(filepath.Join(root, ".screeignore"), []byte("private/\n"), 0o644)
+	os.MkdirAll(filepath.Join(root, "private"), 0o755)
+	os.WriteFile(filepath.Join(root, "private", "tax.md"), []byte("# Tax\nzebra secret\n"), 0o644)
+	for _, tool := range []string{"read_note", "reindex"} {
+		text, isErr := call(t, cs, tool, map[string]any{"path": "PRIVATE/tax.md"})
+		if !isErr || !strings.Contains(text, `"private/tax.md" is ignored by scree (.screeignore)`) || strings.Contains(text, "secret") {
+			t.Errorf("%s(PRIVATE/tax.md) = %q, %v", tool, text, isErr)
+		}
+	}
+	got, _ := s.Paths(context.Background())
+	for _, p := range got {
+		if strings.EqualFold(p, "private/tax.md") {
+			t.Errorf("indexed %q", p)
+		}
+	}
+	// The <note> path is the on-disk name.
+	if text, isErr := call(t, cs, "read_note", map[string]any{"path": "Z.MD"}); isErr || !strings.Contains(text, `<note path="z.md">`) {
+		t.Errorf("read_note(Z.MD) = %q", text)
+	}
+}

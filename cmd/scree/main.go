@@ -353,6 +353,10 @@ func reindexOne(ctx context.Context, ix *index.Indexer, arg string) error {
 			return err
 		}
 	}
+	rel, err := ix.Policy.Canonical(rel)
+	if err != nil {
+		return err
+	}
 	changed, err := ix.IndexFile(ctx, rel)
 	if err != nil {
 		return err

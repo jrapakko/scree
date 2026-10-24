@@ -456,9 +456,9 @@ func TestMdcIsMarkdown(t *testing.T) {
 	root := filepath.Join(dir, "notes")
 	write(t, filepath.Join(root, ".cursor", "rules", "style.mdc"), "---\ndescription: x\n---\nrule")
 	write(t, filepath.Join(root, "x.mdc"), "x")
-	write(t, filepath.Join(root, "X.MDC"), "x")
+	write(t, filepath.Join(root, "Y.MDC"), "x")
 	p := open(t, root, 0)
-	for _, rel := range []string{".cursor/rules/style.mdc", "x.mdc", "X.MDC"} {
+	for _, rel := range []string{".cursor/rules/style.mdc", "x.mdc", "Y.MDC"} {
 		if r := p.CheckName(rel); r != Allowed {
 			t.Errorf("CheckName(%q) = %s", rel, r)
 		}

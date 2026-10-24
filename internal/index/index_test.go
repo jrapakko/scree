@@ -386,3 +386,68 @@ func TestSearchUsesQueryEmbedder(t *testing.T) {
 		t.Fatalf("err %v, query calls %d, index calls %d -> %d", err, q.calls, calls, fe.calls)
 	}
 }
+
+// caseInsensitive reports whether names under dir are compared without case.
+func caseInsensitive(t *testing.T, dir string) bool {
+	t.Helper()
+	write(t, dir, "case-probe", "x")
+	defer os.Remove(filepath.Join(dir, "case-probe"))
+	a, _ := os.Lstat(filepath.Join(dir, "case-probe"))
+	b, err := os.Lstat(filepath.Join(dir, "CASE-PROBE"))
+	return err == nil && os.SameFile(a, b)
+}
+
+func TestIndexFileCanonicalCase(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	if !caseInsensitive(t, ix.Root()) {
+		t.Skip("the temp dir is case-sensitive")
+	}
+	write(t, ix.Root(), ".screeignore", "private/\n")
+	write(t, ix.Root(), "private/tax.md", "# Tax\napple\n")
+	write(t, ix.Root(), "Notes/A.md", "# A\napple\n")
+	for _, rel := range []string{"Private/tax.md", "PRIVATE/TAX.md"} {
+		_, err := ix.IndexFile(ctx, rel)
+		var ie *policy.IgnoredError
+		if !errors.As(err, &ie) || ie.Reason != policy.IgnoreFile {
+			t.Errorf("IndexFile(%q) = %v, want a .screeignore refusal", rel, err)
+		}
+	}
+	if changed, err := ix.IndexFile(ctx, "notes/a.MD"); err != nil || !changed {
+		t.Fatalf("IndexFile(notes/a.MD) = %v, %v", changed, err)
+	}
+	if got := paths(t, ix); !slices.Equal(got, []string{"Notes/A.md"}) {
+		t.Errorf("paths = %v, want only the on-disk name", got)
+	}
+}
+
+// TestSyncRaceKeepsOldRows: a file swapped for a symlink while Sync reads it
+// counts as failed, and its rows stay.
+func TestSyncRaceKeepsOldRows(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	write(t, ix.Root(), "a.md", "# A\napple\n")
+	write(t, ix.Root(), ".env", "secret")
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write(t, ix.Root(), "a.md", "# A\nbanana\n") // changed, so Sync reads it
+	before, _ := ix.Store.FileHash(ctx, "a.md")
+	policy.TestHooks.BeforeOpen = func(rel string) {
+		if rel == "a.md" {
+			os.Remove(filepath.Join(ix.Root(), "a.md"))
+			os.Symlink(".env", filepath.Join(ix.Root(), "a.md"))
+		}
+	}
+	defer func() { policy.TestHooks.BeforeOpen = nil }()
+	st, err := ix.Sync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Failed != 1 || st.Removed != 0 || st.Indexed != 0 {
+		t.Errorf("Sync = %+v", st)
+	}
+	if after, _ := ix.Store.FileHash(ctx, "a.md"); after != before || after == "" {
+		t.Errorf("rows changed: hash %q -> %q", before, after)
+	}
+}

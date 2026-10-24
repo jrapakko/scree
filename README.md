@@ -167,6 +167,8 @@ The unit indexes `~/notes`. Edit `-notes` in `ExecStart` for another folder.
 
 The image is about 18 MB. It contains only the static binary and runs as an unprivileged user. Notes mount read-only at `/notes`, and the index lives in a volume at `/data`. On Linux, file-change events reach the container through the bind mount. On macOS, Docker Desktop doesn't pass them through, so `watch` misses edits there. Use the native binary or a systemd unit day to day.
 
+**SELinux hosts (Fedora, RHEL, CentOS Stream) need `:z` on every bind mount.** Without it, the container can't read the mounted folder and scree fails with `open /notes: permission denied`. The examples below include `:z`, and the Claude Code wrapper needs `SCREE_MOUNT_OPTS=ro,z` in the settings file. `:z` **permanently relabels every file in the folder on the host** (to `container_file_t`), even when the mount is read-only. Mount a notes folder or a repo, never your home directory. On systems without SELinux, drop `:z`. If you'd rather not relabel anything, use the native binary instead.
+
 ```sh
 docker build -t scree .            # or: podman build -t scree .
 ```
@@ -185,7 +187,7 @@ docker run --rm -e OPENROUTER_API_KEY -v "$HOME/notes:/notes:ro,z" -v scree-data
 docker run --rm -e OPENROUTER_API_KEY -v "$HOME/notes:/notes:ro,z" -v scree-data:/data scree search -notes /notes "backup password"
 ```
 
-`:z` relabels the folder for SELinux (Fedora, RHEL); drop it elsewhere if your engine complains. `-e OPENROUTER_API_KEY` with no value passes the variable through from your shell, so the key never appears in the command line.
+`-e OPENROUTER_API_KEY` with no value passes the variable through from your shell, so the key never appears in the command line.
 
 With compose, which reads `OPENROUTER_API_KEY` from your shell or from `.env` next to `compose.yaml`:
 
@@ -202,7 +204,7 @@ For Claude Code, the MCP server runs one container per session over stdio. `cont
 install -m 755 contrib/scree-mcp-docker ~/.local/bin/scree-mcp
 ```
 
-`SCREE_DOCKER=podman`, `SCREE_IMAGE` and `SCREE_DATA_VOLUME` in the settings file change the engine, image and volume. `SCREE_MOUNT_OPTS` (default `ro`) sets the mount options. On SELinux hosts (Fedora, RHEL), `ro,z` makes the folder readable in the container, but `z` **permanently relabels every file in it on the host**. Use it only on a folder you're happy to relabel, never your home directory.
+`SCREE_DOCKER=podman`, `SCREE_IMAGE` and `SCREE_DATA_VOLUME` in the settings file change the engine, image and volume. `SCREE_MOUNT_OPTS` (default `ro`) sets the mount options; on SELinux hosts set it to `ro,z`, as explained below.
 
 Inside a container, `serve -http` has to bind a non-loopback address to be reachable through a published port, so it needs `-allow-remote` and `SCREE_HTTP_TOKEN`. Publish the port on the host's loopback only, for example `-p 127.0.0.1:7077:7077`.
 

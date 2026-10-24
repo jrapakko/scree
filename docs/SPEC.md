@@ -45,6 +45,8 @@ The watcher re-adds its watches after a folder is renamed, so edits under the ne
 
 One process writes to the index. Files are indexed one at a time, so a large re-index cannot spike memory.
 
+A file is opened only after checking that what was opened is the regular file the policy checked; a file swapped for a symlink during a sync is skipped and retried.
+
 ## What gets indexed
 
 Markdown files (`.md`, `.markdown`) anywhere in the indexed folder, including the root forge, CI and agent folders listed under Ignoring files (pull-request templates, `.claude/agents`, Cursor and Codex rules written in markdown), minus whatever the ignore layers exclude. Nothing else: no code, no YAML, no JSON.
@@ -87,6 +89,8 @@ Four layers, checked in this order:
    ```
 
    The file has to be read to see this, but nothing is chunked or embedded. If the note is already indexed, it is removed.
+
+Every rule is checked against the file's name as stored on disk, never the spelling a caller passed. `read_note`, `reindex` and the watcher first map a path to its on-disk name. Names and patterns are compared in Unicode NFC, and case-insensitively when the filesystem is (macOS and Windows by default). Root hidden folders in the allowlist must match exactly, so `.GITHUB/` stays hidden.
 
 When the rules change, the index follows:
 

@@ -108,6 +108,16 @@ func (r Reason) Layer() string {
 // file. Such files are never opened.
 var ErrNotRegular = errors.New("not a regular file")
 
+// ErrChanged means a file was replaced, for example by a symlink, between
+// the policy's checks and the read. It counts as a read failure, so the
+// file's existing rows are kept and the next event or sync retries it.
+var ErrChanged = errors.New("file changed while reading")
+
+// TestHooks lets tests act between read's steps. They are nil outside tests.
+var TestHooks struct {
+	BeforeLstat, BeforeOpen func(rel string)
+}
+
 // readErr wraps a read failure with the quoted store key. It drops the
 // absolute path a *fs.PathError carries, so messages show only rel.
 func readErr(rel string, err error) error {
@@ -150,7 +160,8 @@ type Policy struct {
 	root  string // the root with symlinks resolved
 	r     *os.Root
 	max   int64
-	git   *gitRepo // nil when the git layer is off or the root is not in a work tree
+	git   *gitRepo       // nil when the git layer is off or the root is not in a work tree
+	opts  ignore.Options // how patterns match: NFC always, case folded on case-insensitive filesystems
 
 	mu      sync.Mutex
 	m       *ignore.Matcher
@@ -193,10 +204,14 @@ func OpenOptions(root string, o Options) (*Policy, error) {
 		maxBytes = DefaultMaxBytes
 	}
 	p := &Policy{given: given, root: resolved, r: r, max: maxBytes, allow: DefaultHiddenAllow}
+	p.opts.FoldCase = probeFold(r)
 	if o.GitIgnore {
 		if p.git, err = findRepo(resolved); err != nil {
 			r.Close()
 			return nil, err
+		}
+		if p.git != nil {
+			p.git.opts = p.opts
 		}
 	}
 	return p, nil
@@ -281,11 +296,13 @@ func relUnder(root, abs string) (string, bool) {
 // none of them refuse rel. A file that passes may still be refused by Read,
 // which also fails when the git rules cannot be loaded.
 func (p *Policy) CheckName(rel string) Reason {
-	clean, err := p.Clean(rel)
+	clean, err := p.Canonical(rel)
 	if err != nil {
 		var ie *IgnoredError
-		errors.As(err, &ie)
-		return ie.Reason
+		if errors.As(err, &ie) {
+			return ie.Reason
+		}
+		return Invalid
 	}
 	if r := p.nameReason(clean); r != Allowed {
 		return r
@@ -308,7 +325,7 @@ func (p *Policy) CheckName(rel string) Reason {
 // are *IgnoredError; a missing file gives an error wrapping fs.ErrNotExist.
 // Ignored files are never opened.
 func (p *Policy) Read(rel string) ([]byte, error) {
-	clean, err := p.Clean(rel)
+	clean, err := p.Canonical(rel)
 	if err != nil {
 		return nil, err
 	}
@@ -348,13 +365,9 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
 	m := rs.m
 	realRel := rel
 	if resolve {
-		real, err := filepath.EvalSymlinks(filepath.Join(p.root, filepath.FromSlash(rel)))
+		r, err := p.resolve(rel)
 		if err != nil {
-			return nil, readErr(rel, err)
-		}
-		r, ok := relUnder(p.root, real)
-		if !ok {
-			return nil, ignored(rel, OutsideRoot)
+			return nil, err
 		}
 		if realRel = r; realRel != rel {
 			if unsafeName(realRel) {
@@ -365,14 +378,24 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
 			}
 		}
 	}
-	fi, err := p.r.Stat(realRel)
+	if TestHooks.BeforeLstat != nil {
+		TestHooks.BeforeLstat(realRel)
+	}
+	lfi, err := p.r.Lstat(realRel)
 	if err != nil {
 		return nil, readErr(rel, err)
 	}
-	if !fi.Mode().IsRegular() {
+	if lfi.Mode()&fs.ModeSymlink != 0 {
+		if !resolve {
+			// It became a symlink after Walk listed it.
+			return p.read(rel, true, rs)
+		}
+		return nil, readErr(rel, ErrChanged)
+	}
+	if !lfi.Mode().IsRegular() {
 		return nil, readErr(rel, ErrNotRegular)
 	}
-	if fi.Size() > p.max {
+	if lfi.Size() > p.max {
 		return nil, ignored(rel, TooLarge)
 	}
 	if rs.g != nil {
@@ -386,16 +409,31 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
 		return nil, ignored(rel, IgnoreFile)
 	}
 
+	if TestHooks.BeforeOpen != nil {
+		TestHooks.BeforeOpen(realRel)
+	}
 	f, err := p.r.Open(realRel)
 	if err != nil {
 		return nil, readErr(rel, err)
 	}
 	defer f.Close()
-	if fi, err = f.Stat(); err != nil {
+	ffi, err := f.Stat()
+	if err != nil {
 		return nil, readErr(rel, err)
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, readErr(rel, ErrNotRegular)
+	// What was opened must be the file the rules were checked on, reached
+	// through the same folders: os.Root follows in-root symlinks in folder
+	// names, so a folder swapped for a link to a hidden one would otherwise
+	// pass. A swap and swap back between these checks remains possible; it
+	// needs a local process that can already read the files.
+	if !os.SameFile(lfi, ffi) {
+		return nil, readErr(rel, ErrChanged)
+	}
+	if again, err := p.resolve(realRel); err != nil || again != realRel {
+		return nil, readErr(rel, ErrChanged)
+	}
+	if now, err := p.r.Lstat(realRel); err != nil || !os.SameFile(now, ffi) {
+		return nil, readErr(rel, ErrChanged)
 	}
 	src, err := io.ReadAll(io.LimitReader(f, p.max+1))
 	if err != nil {
@@ -408,6 +446,20 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, error) {
 		return nil, ignored(rel, FrontMatter)
 	}
 	return src, nil
+}
+
+// resolve follows every symlink in rel and returns the result relative to
+// the root. A target outside the root is refused with OutsideRoot.
+func (p *Policy) resolve(rel string) (string, error) {
+	real, err := filepath.EvalSymlinks(filepath.Join(p.root, filepath.FromSlash(rel)))
+	if err != nil {
+		return "", readErr(rel, err)
+	}
+	r, ok := relUnder(p.root, real)
+	if !ok {
+		return "", ignored(rel, OutsideRoot)
+	}
+	return r, nil
 }
 
 // Walk calls fn for every file under the root. src is set for files the
@@ -587,14 +639,14 @@ func (p *Policy) matcher() (*ignore.Matcher, error) {
 	p.m, p.loadErr = nil, nil
 	p.allow, p.dirErrs = DefaultHiddenAllow, nil
 	if st.missing {
-		p.m = ignore.Parse(nil)
+		p.m = ignore.ParseWith(nil, p.opts)
 	} else {
 		data, err := p.readIgnore()
 		if err != nil {
 			p.loadErr = err
 		} else {
 			allow, rest, errs := parseDirectives(data)
-			p.m = ignore.Parse(rest)
+			p.m = ignore.ParseWith(rest, p.opts)
 			p.allow = append(slices.Clone(DefaultHiddenAllow), allow...)
 			p.dirErrs = errs
 		}

@@ -199,6 +199,11 @@ func handle(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, abs str
 	if err != nil {
 		return false
 	}
+	// Match and store the on-disk name only. A missing path keeps its
+	// spelling, which is how it was stored.
+	if canon, err := ix.Policy.Canonical(rel); err == nil {
+		rel = canon
+	}
 	if isIgnoreFile(rel) {
 		// The rules changed: watch newly included folders and drop newly
 		// ignored ones, then sync, which also picks up anything created

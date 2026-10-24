@@ -5,12 +5,18 @@
 // inside an excluded folder, because each rule is checked against the file and
 // every ancestor folder and the last matching rule wins. GitRules applies the
 // same patterns the way git does.
+//
+// Patterns and paths are compared in Unicode NFC, so a pattern typed in one
+// normalization matches a name stored in another. With Options.FoldCase they
+// are also compared case-insensitively, for case-insensitive filesystems.
 package ignore
 
 import (
 	"fmt"
 	"path"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 type rule struct {
@@ -24,16 +30,27 @@ type Matcher struct {
 	rules  []rule
 	errs   []string
 	hasNeg bool
+	fold   bool
 }
 
-// Parse reads ignore patterns, one per line. Bad patterns are recorded in
-// Errors and never match. A nil or empty input gives a matcher that ignores
-// nothing.
-func Parse(data []byte) *Matcher {
-	m := &Matcher{}
+// Options configures ParseWith.
+type Options struct {
+	// FoldCase compares patterns and paths case-insensitively, as on a
+	// case-insensitive filesystem.
+	FoldCase bool
+}
+
+// Parse reads ignore patterns, one per line, comparing case exactly. Bad
+// patterns are recorded in Errors and never match. A nil or empty input
+// gives a matcher that ignores nothing.
+func Parse(data []byte) *Matcher { return ParseWith(data, Options{}) }
+
+// ParseWith is Parse with options.
+func ParseWith(data []byte, o Options) *Matcher {
+	m := &Matcher{fold: o.FoldCase}
 	for i, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSuffix(line, "\r")
-		r, ok, err := parseLine(line)
+		r, ok, err := parseLine(m.key(line))
 		if err != nil {
 			m.errs = append(m.errs, fmt.Sprintf("line %d: bad pattern %q", i+1, line))
 			continue
@@ -135,7 +152,7 @@ func (m *Matcher) Match(rel string, isDir bool) bool {
 	if m == nil || len(m.rules) == 0 {
 		return false
 	}
-	segs := strings.Split(rel, "/")
+	segs := strings.Split(m.key(rel), "/")
 	for i := len(m.rules) - 1; i >= 0; i-- {
 		r := m.rules[i]
 		if r.applies(segs, isDir) {
@@ -194,9 +211,10 @@ func (m *Matcher) MatchSelf(rel string, isDir bool) (matched, negated bool) {
 }
 
 func (m *Matcher) matchSelf(segs []string, isDir bool) (matched, negated bool) {
-	if m == nil {
+	if m == nil || len(m.rules) == 0 {
 		return false, false
 	}
+	segs = m.keySegs(segs)
 	for i := len(m.rules) - 1; i >= 0; i-- {
 		r := m.rules[i]
 		if r.dirOnly && !isDir {
@@ -207,6 +225,34 @@ func (m *Matcher) matchSelf(segs []string, isDir bool) (matched, negated bool) {
 		}
 	}
 	return false, false
+}
+
+// key puts s in the form rules are compared in: NFC, and lower case when
+// folding. It returns s itself when nothing changes.
+func (m *Matcher) key(s string) string {
+	s = norm.NFC.String(s)
+	if m.fold {
+		s = strings.ToLower(s)
+	}
+	return s
+}
+
+// keySegs applies key to each segment, copying segs only if one changes.
+func (m *Matcher) keySegs(segs []string) []string {
+	var out []string
+	for i, s := range segs {
+		k := m.key(s)
+		if k != s && out == nil {
+			out = append(make([]string, 0, len(segs)), segs[:i]...)
+		}
+		if out != nil {
+			out = append(out, k)
+		}
+	}
+	if out == nil {
+		return segs
+	}
+	return out
 }
 
 // Prunable reports whether everything under the folder dirRel is ignored, so

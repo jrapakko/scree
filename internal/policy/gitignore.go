@@ -35,6 +35,7 @@ type gitRepo struct {
 	configs []string // git config files, lowest precedence first
 	home    string   // for "~/" in core.excludesFile; "" if unknown
 	xdgIgn  string   // the default global excludes file; "" if unknown
+	opts    ignore.Options
 
 	cfgStamps []fileStamp
 	excludes  string // the global excludes file in effect
@@ -289,11 +290,11 @@ func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
 		}
 		g.excludes, g.cfgStamps = excludes, stamps
 	}
-	global, err := g.global.load(g.excludes)
+	global, err := g.global.load(g.excludes, g.opts)
 	if err != nil {
 		return nil, err
 	}
-	exclude, err := g.exclude.load(filepath.Join(g.common, "info", "exclude"))
+	exclude, err := g.exclude.load(filepath.Join(g.common, "info", "exclude"), g.opts)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +303,7 @@ func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
 
 // load returns the rules in the file at name, re-reading it when its stamp
 // changed. An empty name or a missing file means no rules.
-func (f *extFile) load(name string) (*ignore.Matcher, error) {
+func (f *extFile) load(name string, o ignore.Options) (*ignore.Matcher, error) {
 	if name == "" {
 		return nil, nil
 	}
@@ -324,7 +325,7 @@ func (f *extFile) load(name string) (*ignore.Matcher, error) {
 			f.stamp = fileStamp{}
 			return nil, fmt.Errorf("read %s: %w", name, stripPath(err))
 		}
-		f.m = ignore.Parse(data)
+		f.m = ignore.ParseWith(data, o)
 	}
 	f.stamp = st
 	return f.m, nil
@@ -394,7 +395,7 @@ func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 		if err != nil {
 			return fail(err)
 		}
-		dr.m = ignore.Parse(data)
+		dr.m = ignore.ParseWith(data, g.opts)
 	}
 	dr.stamp = st
 	return dr.m, nil

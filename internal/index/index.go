@@ -92,9 +92,10 @@ func (ix *Indexer) Rel(abs string) (string, error) { return ix.Policy.Rel(abs) }
 // IndexFile embeds rel if its content changed since it was last indexed. It
 // removes rel from the index if the file no longer exists. If the policy
 // refuses rel, any rows for it are removed and the *policy.IgnoredError is
-// returned, with changed reporting whether rows were removed.
+// returned, with changed reporting whether rows were removed. rel is first
+// mapped to its on-disk name (Policy.Canonical), which is the store key.
 func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err error) {
-	clean, err := ix.Policy.Clean(rel)
+	clean, err := ix.Policy.Canonical(rel)
 	if err == nil {
 		var src []byte
 		src, err = ix.Policy.Read(clean)

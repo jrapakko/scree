@@ -339,3 +339,35 @@ func exitCode(err error) int {
 	}
 	return -1
 }
+
+func TestFoldCaseGit(t *testing.T) {
+	build := func(o Options) *GitRules {
+		top := ParseWith([]byte("Private/\n"), o)
+		docs := ParseWith([]byte("/X.md\n"), o)
+		return &GitRules{
+			Base: []*Matcher{ParseWith([]byte("*.TMP.md\n"), o)},
+			Dir: func(d string) *Matcher {
+				switch d {
+				case "":
+					return top
+				case "docs":
+					return docs
+				}
+				return nil
+			},
+		}
+	}
+	paths := []string{"private/a.md", "PRIVATE/a.md", "docs/x.md", "a.tmp.md"}
+	folded, exact := build(Options{FoldCase: true}), build(Options{})
+	for _, p := range paths {
+		if !folded.Ignored(p, false) {
+			t.Errorf("FoldCase: %q not ignored", p)
+		}
+		if exact.Ignored(p, false) {
+			t.Errorf("exact: %q ignored", p)
+		}
+	}
+	if !exact.Ignored("Private/a.md", false) {
+		t.Error("exact: Private/a.md not ignored")
+	}
+}

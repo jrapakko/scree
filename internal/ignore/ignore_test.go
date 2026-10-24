@@ -204,3 +204,42 @@ func TestPrunable(t *testing.T) {
 		t.Error("journal no longer matched")
 	}
 }
+
+func TestFoldCaseMatching(t *testing.T) {
+	for _, c := range []struct {
+		pattern, path string
+	}{
+		{"Private/", "private/x.md"},
+		{"private/", "Private/x.md"},
+		{"*.MD", "a/b.md"},
+		{"[A-C]x.md", "bx.md"},
+	} {
+		folded := ParseWith([]byte(c.pattern), Options{FoldCase: true})
+		if !folded.Match(c.path, false) {
+			t.Errorf("FoldCase: %q does not match %q", c.pattern, c.path)
+		}
+		if matched, _ := folded.MatchSelf(strings.TrimSuffix(c.path, "/x.md"), true); !matched && strings.HasSuffix(c.pattern, "/") {
+			t.Errorf("FoldCase MatchSelf: %q does not match the folder of %q", c.pattern, c.path)
+		}
+		if Parse([]byte(c.pattern)).Match(c.path, false) {
+			t.Errorf("exact: %q matches %q", c.pattern, c.path)
+		}
+	}
+}
+
+func TestNFCMatching(t *testing.T) {
+	nfc, nfd := "café", "café"
+	for _, c := range []struct{ pattern, path string }{
+		{nfc + "/", nfd + "/x.md"},
+		{nfd + "/", nfc + "/x.md"},
+		{"*" + nfc + ".md", "a/" + nfd + ".md"},
+	} {
+		if !Parse([]byte(c.pattern)).Match(c.path, false) {
+			t.Errorf("%q does not match %q", c.pattern, c.path)
+		}
+	}
+	// Errors quote the line as written.
+	if errs := Parse([]byte("[" + nfd)).Errors(); len(errs) != 1 || !strings.Contains(errs[0], nfd) {
+		t.Errorf("Errors() = %q", errs)
+	}
+}
