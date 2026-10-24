@@ -54,6 +54,22 @@ func FindGitTop(dir string) (string, error) {
 	}
 }
 
+// CommonDir returns the git common dir of the work tree whose top is top:
+// its .git folder, or for a worktree the repository's, as named by the .git
+// file and commondir under the same trust rules as the git layer. Two work
+// trees of one repository have the same common dir.
+func CommonDir(top string) (string, error) {
+	g, err := newRepo(top, top, filepath.Join(top, ".git"))
+	if err != nil {
+		return "", err
+	}
+	c := filepath.Clean(g.common)
+	if r, err := filepath.EvalSymlinks(c); err == nil {
+		c = r
+	}
+	return c, nil
+}
+
 func untrustedTop(top string) error {
 	return fmt.Errorf("git work tree at %s is %w; not indexing it. "+
 		"To index a folder below it anyway, pass -notes <folder> -gitignore=false on the command line", top, ErrUntrustedGit)
@@ -84,10 +100,10 @@ func trusted(fi fs.FileInfo, fileOK bool) bool {
 func checkGitDir(dir, namedBy string) error {
 	fi, err := os.Lstat(dir)
 	if err != nil {
-		return fmt.Errorf("git dir %s named by %s: %w", dir, namedBy, stripPath(err))
+		return fmt.Errorf("the git dir named by %s: %w", namedBy, stripPath(err))
 	}
 	if !trusted(fi, false) {
-		return fmt.Errorf("git dir %s named by %s is not a folder, is a symlink, or is owned by another user", dir, namedBy)
+		return fmt.Errorf("the git dir named by %s is not a folder, is a symlink, or is owned by another user", namedBy)
 	}
 	return nil
 }

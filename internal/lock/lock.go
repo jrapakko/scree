@@ -10,6 +10,7 @@ package lock
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -27,7 +28,10 @@ type Lock struct{ f *os.File }
 // the pid recorded in the file (0 if unknown). The lock is per open file, so
 // a second TryLock in the same process also gets ErrHeld.
 func TryLock(path string) (*Lock, int, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err := notSymlink(path); err != nil {
+		return nil, 0, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|noFollow, 0o600)
 	if err != nil {
 		return nil, 0, fmt.Errorf("lock: %w", err)
 	}
@@ -63,7 +67,10 @@ func writePID(f *os.File) error {
 // Probe reports whether another process holds the lock at path, and its pid,
 // without creating or writing the file. A missing file means not held.
 func Probe(path string) (held bool, pid int, err error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err := notSymlink(path); err != nil {
+		return false, 0, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|noFollow, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, 0, nil
 	}
@@ -82,9 +89,35 @@ func Probe(path string) (held bool, pid int, err error) {
 	return false, 0, nil
 }
 
+// ErrSymlink means the lock file is a symlink or not a regular file. It is
+// never opened through one, or locking would create or truncate the target.
+var ErrSymlink = errors.New("lock file is a symlink or not a regular file")
+
+// notSymlink refuses a lock path that exists as anything but a regular
+// file. Opens also use O_NOFOLLOW where the OS has it, so a symlink swapped
+// in after this check fails the open.
+func notSymlink(path string) error {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("lock %s: %w", path, ErrSymlink)
+	}
+	return nil
+}
+
 // HolderPID returns the pid recorded in the lock file at path, or 0.
 func HolderPID(path string) int {
-	b, err := os.ReadFile(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|noFollow, 0)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 64))
 	if err != nil {
 		return 0
 	}

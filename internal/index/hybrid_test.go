@@ -18,6 +18,7 @@ import (
 	"github.com/ncruces/go-sqlite3/ext/fts5"
 
 	"github.com/jrapakko/scree/internal/embed"
+	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
 )
 
@@ -532,5 +533,49 @@ func TestAutoKeepsKeywordHint(t *testing.T) {
 		if !errors.Is(err, embed.ErrUnavailable) || !strings.Contains(err.Error(), `mode="keyword" still works`) {
 			t.Errorf("auto %q with the API down: %v", q, err)
 		}
+	}
+}
+
+// TestCollapseRelocatesCopies: a listed copy whose file changed gets its
+// current range, or Stale when its text is gone, and is queued.
+func TestCollapseRelocatesCopies(t *testing.T) {
+	ix := indexed(t, dupFiles("docs/x.md", "docs/a/x.md", "docs/b/x.md"))
+	write(t, ix.Root(), "docs/a/x.md", strings.Repeat("filler\n", 5)+"# Setup\napple setup steps\n")
+	write(t, ix.Root(), "docs/b/x.md", "# Setup\nrewritten\n")
+	var queued []string
+	ix.OnStale = func(p []string) { queued = append(queued, p...) }
+	hits, err := ix.Search(context.Background(), "apple", 8, Semantic)
+	if err != nil || len(hits) != 1 || hits[0].Path != "docs/x.md" {
+		t.Fatalf("hits = %+v, %v", hits, err)
+	}
+	want := []store.Copy{{Path: "docs/a/x.md", Line: 6, EndLine: 7}, {Path: "docs/b/x.md", Stale: true}}
+	if !slices.Equal(hits[0].Also, want) {
+		t.Errorf("also = %+v, want %+v", hits[0].Also, want)
+	}
+	slices.Sort(queued)
+	if !slices.Equal(queued, []string{"docs/a/x.md", "docs/b/x.md"}) {
+		t.Errorf("queued %v", queued)
+	}
+}
+
+// TestBadIgnoreLineFailsClosed: a .screeignore line scree cannot parse
+// stops indexing (Sync and IndexFile), so a broken rule never lets a
+// private file be embedded; fixing it resumes.
+func TestBadIgnoreLineFailsClosed(t *testing.T) {
+	ix, fe := setup(t)
+	write(t, ix.Root(), ".screeignore", "ok\n[secret\n")
+	write(t, ix.Root(), "a.md", "# A\napple\n")
+	if _, err := ix.Sync(context.Background()); !errors.Is(err, policy.ErrBadIgnoreFile) || !strings.Contains(err.Error(), "line 2: bad pattern") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("Sync = %v", err)
+	}
+	if _, err := ix.IndexFile(context.Background(), "a.md"); !errors.Is(err, policy.ErrBadIgnoreFile) {
+		t.Errorf("IndexFile = %v", err)
+	}
+	if fe.calls != 0 {
+		t.Errorf("embedded %d times", fe.calls)
+	}
+	write(t, ix.Root(), ".screeignore", "ok\n")
+	if st, err := ix.Sync(context.Background()); err != nil || st.Indexed != 1 {
+		t.Errorf("after fix: %+v, %v", st, err)
 	}
 }

@@ -54,9 +54,11 @@ Usage:
                            is gone
 
 Every command but indexes takes -notes, -db and -gitignore. The folder is
--notes if given; for serve, else $CLAUDE_PROJECT_DIR; otherwise the git root
-of the current directory, or the current directory outside git. Under Claude Code
-(CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB. Environment:
+-notes if given, otherwise the git root of the current directory, or the
+current directory outside git. serve needs -notes outside Claude Code. Under
+Claude Code (CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB,
+requires CLAUDE_PROJECT_DIR to be in the same repo as its working directory,
+and indexes only a repo whose .mcp.json names scree-mcp. Environment:
   SCREE_DB            index file (default $XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
@@ -263,6 +265,11 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 		return nil, err
 	}
 	cfg.source = src
+	if cfg.serve && src == claudeCode {
+		if err := checkOptIn(root); err != nil {
+			return nil, err
+		}
+	}
 	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
 		return nil, fmt.Errorf("folder %s is not a directory", root)
 	}
@@ -273,6 +280,10 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	cfg.dbExplicit = cfg.db != ""
 	if !cfg.dbExplicit {
 		cfg.db = filepath.Join(indexDir(p.Root()), "index.db")
+		if err := checkIndexDirs(filepath.Dir(cfg.db)); err != nil {
+			p.Close()
+			return nil, err
+		}
 	}
 	e := embed.New(cfg.url, cfg.apiKey, cfg.model, cfg.dims)
 	e.ZDR = cfg.zdr

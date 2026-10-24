@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jrapakko/scree/internal/lock"
 	"github.com/jrapakko/scree/internal/policy"
 )
 
@@ -46,7 +47,7 @@ func repoTree(t *testing.T) string {
 
 func TestResolveExplicit(t *testing.T) {
 	home := tempDir(t)
-	t.Setenv("HOME", home)
+	fakeHome(t, home)
 	t.Setenv("CLAUDE_PROJECT_DIR", repoTree(t))
 	for _, serve := range []bool{false, true} {
 		root, src, err := resolveFolder(home, serve)
@@ -63,17 +64,17 @@ func TestResolveExplicit(t *testing.T) {
 }
 
 func TestResolveProjectDirLifted(t *testing.T) {
-	t.Setenv("HOME", tempDir(t))
+	fakeHome(t, tempDir(t))
 	repo := repoTree(t)
-	t.Setenv("CLAUDE_PROJECT_DIR", filepath.Join(repo, "sub"))
+	serveIn(t, filepath.Join(repo, "sub"))
 	root, src, err := resolveFolder("", true)
-	if err != nil || root != repo || src != projectDir {
+	if err != nil || root != repo || src != claudeCode {
 		t.Fatalf("resolveFolder = %q, %s, %v; want %q", root, src, err, repo)
 	}
 	// Without git, the project dir itself.
 	plain := filepath.Join(tempDir(t), "plain")
 	mkdir(t, plain)
-	t.Setenv("CLAUDE_PROJECT_DIR", plain)
+	serveIn(t, plain)
 	if top := gitRoot(plain); top != "" {
 		t.Skipf("the temp dir is inside a git work tree at %s", top)
 	}
@@ -91,7 +92,7 @@ func TestResolveServeWithoutProjectDir(t *testing.T) {
 }
 
 func TestResolveCwdGitRoot(t *testing.T) {
-	t.Setenv("HOME", tempDir(t))
+	fakeHome(t, tempDir(t))
 	t.Setenv("CLAUDE_PROJECT_DIR", "/nonexistent")
 	repo := repoTree(t)
 	deep := filepath.Join(repo, "sub", "deeper")
@@ -104,7 +105,7 @@ func TestResolveCwdGitRoot(t *testing.T) {
 }
 
 func TestResolveCwdNoGit(t *testing.T) {
-	t.Setenv("HOME", tempDir(t))
+	fakeHome(t, tempDir(t))
 	dir := filepath.Join(tempDir(t), "notes")
 	mkdir(t, dir)
 	if top := gitRoot(dir); top != "" {
@@ -119,7 +120,7 @@ func TestResolveCwdNoGit(t *testing.T) {
 
 func TestResolveHomeGuard(t *testing.T) {
 	home := tempDir(t)
-	t.Setenv("HOME", home)
+	fakeHome(t, home)
 	mkdir(t, filepath.Join(home, ".git")) // a dotfiles repo
 	notes := filepath.Join(home, "notes")
 	mkdir(t, notes)
@@ -128,7 +129,7 @@ func TestResolveHomeGuard(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "home directory") || !strings.Contains(err.Error(), "pass -notes "+home) {
 		t.Fatalf("CLI: err = %v", err)
 	}
-	t.Setenv("CLAUDE_PROJECT_DIR", notes)
+	serveIn(t, notes)
 	if _, _, err := resolveFolder("", true); err == nil {
 		t.Fatal("serve: no home-guard error")
 	}
@@ -141,8 +142,8 @@ func TestResolveHomeGuard(t *testing.T) {
 }
 
 func TestResolveFilesystemRoot(t *testing.T) {
-	t.Setenv("HOME", tempDir(t))
-	t.Setenv("CLAUDE_PROJECT_DIR", "/")
+	fakeHome(t, tempDir(t))
+	serveIn(t, "/")
 	if gitRoot("/") != "" {
 		t.Skip("/ is a git work tree")
 	}
@@ -207,12 +208,12 @@ func TestResolveHomeAncestors(t *testing.T) {
 	home := filepath.Join(tmp, "home", "u")
 	repo := filepath.Join(home, "code", "r")
 	mkdir(t, repo)
-	t.Setenv("HOME", home)
+	fakeHome(t, home)
 	for _, dir := range []string{home, filepath.Join(tmp, "home"), tmp, "/"} {
 		if dir == "/" && gitRoot("/") != "" {
 			continue
 		}
-		t.Setenv("CLAUDE_PROJECT_DIR", dir)
+		serveIn(t, dir)
 		if _, _, err := resolveFolder("", true); err == nil || !strings.Contains(err.Error(), "a folder above it") {
 			t.Errorf("%s: err = %v", dir, err)
 		}
@@ -221,7 +222,7 @@ func TestResolveHomeAncestors(t *testing.T) {
 			t.Errorf("-notes %s: %q, %v", dir, root, err)
 		}
 	}
-	t.Setenv("CLAUDE_PROJECT_DIR", repo)
+	serveIn(t, repo)
 	if root, _, err := resolveFolder("", true); err != nil || root != repo {
 		t.Errorf("repo: %q, %v", root, err)
 	}
@@ -231,19 +232,19 @@ func TestResolveHomeAncestors(t *testing.T) {
 	if err := os.Symlink(home, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	t.Setenv("HOME", link)
-	t.Setenv("CLAUDE_PROJECT_DIR", filepath.Join(tmp, "home"))
+	fakeHome(t, link)
+	serveIn(t, filepath.Join(tmp, "home"))
 	if _, _, err := resolveFolder("", true); err == nil {
 		t.Error("symlinked HOME: the folder above it was not refused")
 	}
-	t.Setenv("CLAUDE_PROJECT_DIR", repo)
+	serveIn(t, repo)
 	if root, _, err := resolveFolder("", true); err != nil || root != repo {
 		t.Errorf("symlinked HOME, repo: %q, %v", root, err)
 	}
 }
 
 func TestResolveNoLiftAcrossSticky(t *testing.T) {
-	t.Setenv("HOME", tempDir(t))
+	fakeHome(t, tempDir(t))
 	s := filepath.Join(tempDir(t), "s")
 	p := filepath.Join(s, "p")
 	mkdir(t, filepath.Join(s, ".git"))
@@ -254,14 +255,14 @@ func TestResolveNoLiftAcrossSticky(t *testing.T) {
 	if fi, err := os.Stat(s); err != nil || fi.Mode()&os.ModeSticky == 0 {
 		t.Skip("no sticky bit on this filesystem")
 	}
-	t.Setenv("CLAUDE_PROJECT_DIR", p)
+	serveIn(t, p)
 	if root, _, err := resolveFolder("", true); err != nil || root != p {
 		t.Errorf("resolveFolder = %q, %v; want %q", root, err, p)
 	}
 }
 
 func TestResolveRefusesSymlinkGit(t *testing.T) {
-	t.Setenv("HOME", tempDir(t))
+	fakeHome(t, tempDir(t))
 	base := tempDir(t)
 	mkdir(t, filepath.Join(base, "real.git"))
 	repo := filepath.Join(base, "repo")
@@ -269,8 +270,186 @@ func TestResolveRefusesSymlinkGit(t *testing.T) {
 	if err := os.Symlink(filepath.Join(base, "real.git"), filepath.Join(repo, ".git")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	t.Setenv("CLAUDE_PROJECT_DIR", filepath.Join(repo, "sub"))
+	serveIn(t, filepath.Join(repo, "sub"))
 	if _, _, err := resolveFolder("", true); !errors.Is(err, policy.ErrUntrustedGit) {
 		t.Errorf("resolveFolder = %v", err)
 	}
+}
+
+// fakeHome makes dir the home directory for the home guard (instead of the
+// password database) and for $HOME.
+func fakeHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	old := lookupHome
+	lookupHome = func() string { return dir }
+	t.Cleanup(func() { lookupHome = old })
+}
+
+// serveIn sets CLAUDE_PROJECT_DIR to dir and runs in it, as Claude Code
+// starts serve.
+func serveIn(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("CLAUDE_PROJECT_DIR", dir)
+	t.Chdir(dir)
+}
+
+// TestServeFolderFromWorkingDirectory: under Claude Code the folder is the
+// working directory's git root; a CLAUDE_PROJECT_DIR forged by a project's
+// .mcp.json to another repo or to home is refused, not followed.
+func TestServeFolderFromWorkingDirectory(t *testing.T) {
+	home := tempDir(t)
+	fakeHome(t, home)
+	repo := repoTree(t)
+	other := repoTree(t)
+	t.Chdir(filepath.Join(repo, "sub"))
+	t.Setenv("CLAUDE_PROJECT_DIR", repo)
+	if root, src, err := resolveFolder("", true); err != nil || root != repo || src != claudeCode {
+		t.Fatalf("resolveFolder = %q, %s, %v", root, src, err)
+	}
+	for _, forged := range []string{other, filepath.Join(other, "sub"), home, "/"} {
+		t.Setenv("CLAUDE_PROJECT_DIR", forged)
+		if root, _, err := resolveFolder("", true); err == nil || !strings.Contains(err.Error(), "not in the repo of the working directory") {
+			t.Errorf("CLAUDE_PROJECT_DIR=%s: %q, %v", forged, root, err)
+		}
+	}
+}
+
+// TestServeFolderWorktree: in a worktree of the project's repo, serve
+// indexes the worktree.
+func TestServeFolderWorktree(t *testing.T) {
+	fakeHome(t, tempDir(t))
+	repo := repoTree(t)
+	mkdir(t, filepath.Join(repo, ".git", "worktrees", "wt"))
+	if err := os.WriteFile(filepath.Join(repo, ".git", "worktrees", "wt", "commondir"), []byte("../..\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(repo, ".claude", "worktrees", "wt")
+	mkdir(t, wt)
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+filepath.Join(repo, ".git", "worktrees", "wt")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(wt)
+	t.Setenv("CLAUDE_PROJECT_DIR", repo)
+	if root, _, err := resolveFolder("", true); err != nil || root != wt {
+		t.Fatalf("worktree: %q, %v; want %q", root, err, wt)
+	}
+	// A worktree of another repository is not the project.
+	other := repoTree(t)
+	t.Setenv("CLAUDE_PROJECT_DIR", other)
+	if _, _, err := resolveFolder("", true); err == nil {
+		t.Error("worktree of another repo accepted")
+	}
+}
+
+// TestHomeGuardIgnoresHOME: the guard takes home from the password
+// database, so a bogus HOME does not let serve index the real home.
+func TestHomeGuardIgnoresHOME(t *testing.T) {
+	real := lookupHome()
+	if real == "" {
+		t.Skip("no home directory")
+	}
+	if h, err := filepath.EvalSymlinks(real); err == nil {
+		real = h
+	}
+	t.Setenv("HOME", tempDir(t))
+	if !isHomeOrAbove(real) || !isHomeOrAbove(filepath.Dir(real)) {
+		t.Errorf("home %s not guarded with a bogus HOME", real)
+	}
+}
+
+func TestHomeGuardAdviceUnderClaude(t *testing.T) {
+	home := tempDir(t)
+	fakeHome(t, home)
+	serveIn(t, home)
+	_, _, err := resolveFolder("", true)
+	if err == nil || strings.Contains(err.Error(), "-notes") || !strings.Contains(err.Error(), "does not index it from Claude Code") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// TestServeRequiresOptIn: serve under Claude Code refuses a repo whose
+// .mcp.json does not name scree-mcp; the CLI is unaffected.
+func TestServeRequiresOptIn(t *testing.T) {
+	serveEnv(t)
+	repo := repoTree(t)
+	serveIn(t, repo)
+	cfg := config{serve: true}
+	if _, err := open(&cfg, true); !errors.Is(err, errNotOptedIn) {
+		t.Fatalf("serve without opt-in: %v", err)
+	}
+	optIn(t, repo)
+	cfg = config{serve: true}
+	ix, err := open(&cfg, true)
+	if err != nil {
+		t.Fatalf("serve after opt-in: %v", err)
+	}
+	closeIndexer(ix)
+	os.Remove(filepath.Join(repo, ".mcp.json"))
+	cfg = config{}
+	ix, err = open(&cfg, true)
+	if err != nil {
+		t.Fatalf("CLI: %v", err)
+	}
+	closeIndexer(ix)
+}
+
+// TestIndexNeverThroughSymlink: a symlinked index directory, indexes
+// folder, index.db or writer.lock is refused, and nothing is written where
+// the link points.
+func TestIndexNeverThroughSymlink(t *testing.T) {
+	notes := filepath.Join(tempDir(t), "notes")
+	mkdir(t, notes)
+	target := tempDir(t)
+	cases := map[string]func(data, dir string){
+		"index dir": func(data, dir string) {
+			mkdir(t, filepath.Dir(dir))
+			os.Symlink(target, dir)
+		},
+		"indexes folder": func(data, dir string) {
+			mkdir(t, filepath.Join(data, "scree"))
+			os.Symlink(target, filepath.Join(data, "scree", "indexes"))
+		},
+		"index.db": func(data, dir string) {
+			mkdir(t, dir)
+			os.Symlink(filepath.Join(target, "x.db"), filepath.Join(dir, "index.db"))
+		},
+		"index.db-wal": func(data, dir string) {
+			mkdir(t, dir)
+			os.Symlink(filepath.Join(target, "x.db-wal"), filepath.Join(dir, "index.db-wal"))
+		},
+	}
+	for name, plant := range cases {
+		t.Run(name, func(t *testing.T) {
+			data := serveEnv(t)
+			root, _ := filepath.EvalSymlinks(notes)
+			plant(data, indexDir(root))
+			cfg := config{notes: notes}
+			if ix, err := open(&cfg, true); err == nil {
+				closeIndexer(ix)
+				t.Fatal("opened an index through a symlink")
+			}
+			if ents, _ := os.ReadDir(target); len(ents) != 0 {
+				t.Errorf("wrote into the link target: %v", ents)
+			}
+		})
+	}
+	t.Run("writer.lock", func(t *testing.T) {
+		serveEnv(t)
+		root, _ := filepath.EvalSymlinks(notes)
+		dir := indexDir(root)
+		mkdir(t, dir)
+		victim := filepath.Join(target, "victim")
+		os.WriteFile(victim, []byte("keep"), 0o600)
+		os.Symlink(victim, filepath.Join(dir, "writer.lock"))
+		if _, _, err := lock.TryLock(filepath.Join(dir, "writer.lock")); !errors.Is(err, lock.ErrSymlink) {
+			t.Errorf("TryLock = %v", err)
+		}
+		if _, _, err := lock.Probe(filepath.Join(dir, "writer.lock")); !errors.Is(err, lock.ErrSymlink) {
+			t.Errorf("Probe = %v", err)
+		}
+		if b, _ := os.ReadFile(victim); string(b) != "keep" {
+			t.Errorf("victim changed: %q", b)
+		}
+	})
 }

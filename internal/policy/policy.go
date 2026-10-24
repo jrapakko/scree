@@ -648,6 +648,29 @@ func (p *Policy) SkipDir(rel string) Reason {
 	return r
 }
 
+// ErrBadIgnoreFile means .screeignore has a line scree cannot parse. Nothing
+// is indexed until it is fixed, since the line may have been meant to keep
+// files private.
+var ErrBadIgnoreFile = errors.New("bad line in " + IgnoreFileName)
+
+// CheckIgnoreFile reloads .screeignore if it changed and returns an error
+// wrapping ErrBadIgnoreFile that names each bad line by number (never its
+// text). A missing file is fine; an unreadable one is reported by the
+// read path, which refuses everything.
+func (p *Policy) CheckIgnoreFile() error {
+	if _, err := p.matcher(); err != nil {
+		return nil
+	}
+	p.mu.Lock()
+	errs := append(slices.Clone(p.dirErrs), p.m.Errors()...)
+	p.mu.Unlock()
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s; nothing is indexed until it is fixed (scree doctor lists the lines)",
+		ErrBadIgnoreFile, strings.Join(errs, ", "))
+}
+
 // Summary counts what a Scan found.
 type Summary struct {
 	Allowed      int

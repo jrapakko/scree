@@ -22,3 +22,6 @@ func tryLock(f *os.File) (held bool, err error) {
 }
 
 func unlock(f *os.File) { syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }
+
+// noFollow makes an open fail on a symlink.
+const noFollow = syscall.O_NOFOLLOW

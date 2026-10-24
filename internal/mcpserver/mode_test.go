@@ -94,3 +94,17 @@ func TestSearchDefaultsToAuto(t *testing.T) {
 		}
 	}
 }
+
+func TestAlsoStale(t *testing.T) {
+	h := hit("a.md", 1, "A", "x")
+	h.EndLine = 2
+	h.Also = []store.Copy{{Path: "b.md", Line: 3, EndLine: 4}, {Path: "c.md", Stale: true}}
+	if got := FormatHits([]store.Hit{h}, ""); !strings.Contains(got, `also="b.md:3-4, c.md:stale"`) {
+		t.Errorf("got %s", got)
+	}
+	var b strings.Builder
+	WriteJSON(&b, []store.Hit{h}, index.Semantic)
+	if !strings.Contains(b.String(), `{"path":"c.md","start":null,"end":null,"stale":true}`) {
+		t.Errorf("json %s", b.String())
+	}
+}

@@ -1,8 +1,9 @@
 #!/bin/sh
 # scree-mcp: run `scree serve` for Claude Code with settings from the scree
 # env file, so the API key never has to be stored in Claude Code's config.
-# serve indexes the git root above CLAUDE_PROJECT_DIR, which Claude Code sets
-# and which passes through exec unchanged. From a repo's root:
+# serve indexes the git root of the working directory Claude Code starts it
+# in, checked against CLAUDE_PROJECT_DIR, and only if the repo's .mcp.json
+# names scree-mcp. From a repo's root:
 #
 #   claude mcp add scree --scope project -- scree-mcp
 #
@@ -12,15 +13,38 @@
 set -eu
 prog=scree-mcp
 
+# Before anything else runs: a project's .mcp.json sets this process's
+# environment, PATH included, so no program may be found through the
+# inherited PATH, and CDPATH must not steer cd. PATH is reset and every
+# SCREE_*, key and proxy variable is cleared before the env file is read, so
+# nothing inherited chooses the binary, the endpoint or the key.
+PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin
+export PATH
+unset CDPATH
+for v in $(env | sed -n 's/^\(SCREE_[A-Za-z0-9_]*\)=.*/\1/p') OPENROUTER_API_KEY HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+	unset "$v" 2>/dev/null || true
+done
+
 # The env file is always ~/.config/scree/env, with ~ taken from the password
 # database (the shell's ~user expansion, which calls getpwnam), never from
 # $HOME or $XDG_CONFIG_HOME: a project's .mcp.json can set those, and the
 # repo must not choose which settings file is loaded.
 # BEGIN passwd home (contrib_test.go runs this block alone and replaces it)
-user=$(id -un 2>/dev/null) || user=
+# id by absolute path, never through PATH.
+idcmd=
+for c in /usr/bin/id /bin/id; do
+	if [ -x "$c" ]; then
+		idcmd=$c
+		break
+	fi
+done
+user=
+if [ -n "$idcmd" ]; then
+	user=$("$idcmd" -un 2>/dev/null) || user=
+fi
 case $user in
 '' | [!A-Za-z0-9_]* | *[!A-Za-z0-9._@-]*)
-	echo "$prog: cannot look up your user name" >&2
+	echo "$prog: cannot look up your user name (id -un)" >&2
 	exit 1
 	;;
 esac
@@ -34,15 +58,6 @@ case $pwhome in
 esac
 # END passwd home
 env_file=$pwhome/.config/scree/env
-# Settings come only from the env file. A project's .mcp.json can launch this
-# wrapper with its own environment and arguments, so nothing inherited may
-# choose the binary, the endpoint or the key: PATH is reset and every SCREE_*,
-# key and proxy variable is cleared before the file is read.
-PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin
-export PATH
-for v in $(env | sed -n 's/^\(SCREE_[A-Za-z0-9_]*\)=.*/\1/p') OPENROUTER_API_KEY HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
-	unset "$v" 2>/dev/null || true
-done
 here=$(cd "$(dirname "$0")" && pwd -P)
 
 if [ ! -f "$env_file" ]; then
@@ -112,4 +127,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 	export "$name=$value"
 done <"$env_file"
 
+# The child gets the passwd home and no XDG overrides, so a .mcp.json
+# cannot move the index or the git config scree reads.
+HOME=$pwhome
+export HOME
+unset XDG_DATA_HOME XDG_CONFIG_HOME
 exec "$here/scree" serve "$@"

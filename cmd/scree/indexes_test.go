@@ -273,3 +273,20 @@ func TestPruneRefusesOutsideBase(t *testing.T) {
 		t.Errorf("base removed: %v", err)
 	}
 }
+
+func TestIndexesCapsMeta(t *testing.T) {
+	indexesEnv(t)
+	_, dir := makeIndex(t, "long", false)
+	s, err := store.Open(filepath.Join(dir, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetMeta("model", strings.Repeat("m", 500))
+	s.SetMeta("synced_at", strings.Repeat("é", 500))
+	s.Close()
+	out, _ := runIndexesOut(t, false)
+	if strings.Contains(out, strings.Repeat("m", 81)) || strings.Contains(out, strings.Repeat("é", 81)) ||
+		!strings.Contains(out, strings.Repeat("m", 79)+"…") {
+		t.Errorf("meta not capped:\n%s", out)
+	}
+}

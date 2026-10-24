@@ -258,7 +258,8 @@ func lineSpan(line, end int) string {
 	return strconv.Itoa(line)
 }
 
-// alsoList renders copies as "path:a-b, path:a-b". A path holding ",", ":"
+// alsoList renders copies as "path:a-b, path:a-b", or "path:stale" for a
+// copy whose changed file no longer holds the text. A path holding ",", ":"
 // or a quote is written Go-quoted, so the list stays unambiguous.
 func alsoList(copies []store.Copy) string {
 	parts := make([]string, len(copies))
@@ -266,6 +267,10 @@ func alsoList(copies []store.Copy) string {
 		p := c.Path
 		if strings.ContainsAny(p, ",:\"'") {
 			p = strconv.Quote(p)
+		}
+		if c.Stale {
+			parts[i] = p + ":stale"
+			continue
 		}
 		parts[i] = p + ":" + lineSpan(c.Line, c.EndLine)
 	}
@@ -425,6 +430,7 @@ type jsonCopy struct {
 	Path  string `json:"path"`
 	Start *int   `json:"start"`
 	End   *int   `json:"end"`
+	Stale bool   `json:"stale,omitempty"`
 }
 
 // WriteJSON writes one JSON object per hit, one per line:
@@ -458,7 +464,7 @@ func WriteJSON(w io.Writer, hits []store.Hit, used index.Mode) error {
 			j.Score = &sc
 		}
 		for _, c := range h.Also {
-			j.Also = append(j.Also, jsonCopy{Path: textsafe.Strip(c.Path), Start: lineNum(c.Line), End: lineNum(c.EndLine)})
+			j.Also = append(j.Also, jsonCopy{Path: textsafe.Strip(c.Path), Start: lineNum(c.Line), End: lineNum(c.EndLine), Stale: c.Stale})
 		}
 		if err := enc.Encode(j); err != nil {
 			return err

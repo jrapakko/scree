@@ -146,12 +146,12 @@ func inspect(base, name string) indexInfo {
 func (in indexInfo) line() string {
 	var b strings.Builder
 	if in.root != "" {
-		b.WriteString(quote(in.root))
+		b.WriteString(quote(capRunes(in.root)))
 	} else {
 		b.WriteString("(folder unknown)")
 	}
 	if in.peekErr != nil {
-		fmt.Fprintf(&b, "  unreadable: %s", textsafe.Strip(in.peekErr.Error()))
+		fmt.Fprintf(&b, "  unreadable: %s", capRunes(textsafe.Strip(in.peekErr.Error())))
 	} else {
 		fmt.Fprintf(&b, "  %d files, %d chunks", in.sum.Files, in.sum.Chunks)
 	}
@@ -160,9 +160,9 @@ func (in indexInfo) line() string {
 	if synced == "" {
 		synced = "never"
 	}
-	fmt.Fprintf(&b, "  last sync %s", textsafe.Strip(synced))
+	fmt.Fprintf(&b, "  last sync %s", capRunes(textsafe.Strip(synced)))
 	if in.sum.Model != "" {
-		fmt.Fprintf(&b, "  model %s", textsafe.Strip(in.sum.Model))
+		fmt.Fprintf(&b, "  model %s", capRunes(textsafe.Strip(in.sum.Model)))
 	}
 	if in.missing {
 		b.WriteString("  [missing]")
@@ -273,6 +273,19 @@ func fileExists(p string) bool {
 
 // quote quotes a path for terminal output, with control characters removed.
 func quote(s string) string { return strconv.Quote(textsafe.Strip(s)) }
+
+// maxMetaRunes caps each value `scree indexes` prints from an index's root
+// file or meta table, which anything that wrote the index could fill.
+const maxMetaRunes = 80
+
+// capRunes cuts s to maxMetaRunes runes, marking a cut with "…".
+func capRunes(s string) string {
+	r := []rune(s)
+	if len(r) <= maxMetaRunes {
+		return s
+	}
+	return string(r[:maxMetaRunes-1]) + "…"
+}
 
 // humanBytes formats n as B, KB or MB.
 func humanBytes(n int64) string {

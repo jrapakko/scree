@@ -52,7 +52,9 @@ func TestServeExitsOnSIGTERMWithFIFO(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(repo, "a.md"), []byte("# a\nhello\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
+			optIn(t, repo)
 			cmd := exec.Command(bin, "serve")
+			cmd.Dir = repo
 			cmd.Env = []string{
 				"PATH=/usr/bin:/bin", "HOME=" + home,
 				"XDG_CONFIG_HOME=" + filepath.Join(home, ".config"),

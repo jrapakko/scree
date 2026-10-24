@@ -72,7 +72,8 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 		if err != nil {
 			t.Fatalf("%s: %v", s, err)
 		}
-		b = []byte(strings.Replace(string(b), block, "pwhome=$TEST_PW_HOME\n", 1))
+		_ = block
+		b = []byte(strings.Replace(string(b), "eval \"pwhome=~$user\"\n", "pwhome=$TEST_PW_HOME\n", 1))
 		if err := os.WriteFile(filepath.Join(e.bin, s), b, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -86,19 +87,42 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 }
 
 // run executes a wrapper with a minimal environment plus extra, and returns
-// its combined output, the lines the fake recorded, and the exit error.
+// its combined output, the lines the fake recorded, and the exit error. It
+// runs in the CLAUDE_PROJECT_DIR it passes, as Claude Code does, when that
+// is an existing folder, else in the temp dir; a "CWD=dir" entry in extra
+// sets the working directory instead and is not passed on.
 func (e env) run(t *testing.T, script string, extra []string, args ...string) (string, []string, error) {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(e.bin, script), args...)
-	// Run from the temp dir, which tests may fill with planted commands.
-	cmd.Dir = e.dir
-	cmd.Env = append([]string{
+	env := []string{
 		"PATH=/usr/bin:/bin",
 		"HOME=" + e.dir,
 		"TEST_PW_HOME=" + e.dir,
 		"FAKE_OUT=" + e.out,
 		"CLAUDE_PROJECT_DIR=" + e.project,
-	}, extra...)
+	}
+	cwd := ""
+	for _, x := range extra {
+		if d, ok := strings.CutPrefix(x, "CWD="); ok {
+			cwd = d
+			continue
+		}
+		env = append(env, x)
+	}
+	if cwd == "" {
+		cwd = e.dir
+		for _, x := range env {
+			if d, ok := strings.CutPrefix(x, "CLAUDE_PROJECT_DIR="); ok {
+				if fi, err := os.Stat(d); err == nil && fi.IsDir() && filepath.IsAbs(d) {
+					cwd = d
+				} else {
+					cwd = e.dir
+				}
+			}
+		}
+	}
+	cmd.Dir = cwd
+	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	if strings.Contains(string(out), secret) {
 		t.Errorf("%s printed the key: %q", script, out)
@@ -194,7 +218,8 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 		"run", "-i", "--rm", "--pull=never",
 		"-e", "OPENROUTER_API_KEY", "-e", "SCREE_MODEL", "-e", "SCREE_ZDR", "-e", "SCREE_FIRST_SYNC_MB",
 		"-v", repo + ":" + repo + ":ro", "-v", "scree-data:/data",
-		"scree:latest", "serve", "-notes", repo,
+		"-w", repo, "-e", "CLAUDE_PROJECT_DIR=" + filepath.Join(repo, "sub"),
+		"scree:latest", "serve",
 	}
 	if !slices.Equal(args, want) {
 		t.Errorf("docker args\n%q\nwant\n%q", args, want)
@@ -213,8 +238,8 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 func TestScreeMCPDockerNoGit(t *testing.T) {
 	e := setup(t, envFile, 0o600)
 	args, _ := dockerArgs(t, e, e.project)
-	if !slices.Contains(args, e.project+":"+e.project+":ro") || !slices.Contains(args, "-notes") ||
-		args[slices.Index(args, "-notes")+1] != e.project {
+	if !slices.Contains(args, e.project+":"+e.project+":ro") || !slices.Contains(args, "-w") ||
+		args[slices.Index(args, "-w")+1] != e.project || slices.Contains(args, "-notes") {
 		t.Errorf("docker args %q", args)
 	}
 }
@@ -282,8 +307,10 @@ func TestEnvFileIsData(t *testing.T) {
 			t.Fatalf("%s: err %v, output %q", s, err, out)
 		}
 		for _, f := range []string{"pwned-subst", "pwned-tick", "pwned-planted"} {
-			if _, err := os.Stat(filepath.Join(e.dir, f)); err == nil {
-				t.Errorf("%s: %s ran", s, f)
+			for _, d := range []string{e.dir, e.project} {
+				if _, err := os.Stat(filepath.Join(d, f)); err == nil {
+					t.Errorf("%s: %s ran", s, f)
+				}
 			}
 		}
 		if !slices.Contains(lines, "env=SCREE_DB="+notes) ||
@@ -463,8 +490,80 @@ func TestDockerResolvesProjectDir(t *testing.T) {
 	if got := mountOf(t, args); got != want {
 		t.Errorf("mounted %q, want %q", got, want)
 	}
-	if args[len(args)-1] != want {
-		t.Errorf("serve -notes %q, want %q", args[len(args)-1], want)
+	if i := slices.Index(args, "-w"); i < 0 || args[i+1] != want || !slices.Contains(args, "CLAUDE_PROJECT_DIR="+want) {
+		t.Errorf("workdir or project dir not resolved: %q", args)
+	}
+}
+
+// TestDockerFollowsWorkingDirectory: the mount is the git root of the
+// working directory; a CLAUDE_PROJECT_DIR in another repo, or at home, is
+// refused rather than followed.
+func TestDockerFollowsWorkingDirectory(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	repo := filepath.Join(e.dir, "repo")
+	other := filepath.Join(e.dir, "other")
+	for _, d := range []string{filepath.Join(repo, ".git"), filepath.Join(repo, "sub"), filepath.Join(other, ".git")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args, _ := dockerArgs(t, e, repo, "CWD="+filepath.Join(repo, "sub"))
+	if got := mountOf(t, args); got != repo {
+		t.Errorf("mounted %q, want %q", got, repo)
+	}
+	for _, pd := range []string{other, e.dir, "/"} {
+		os.Remove(e.out)
+		out, lines, err := e.run(t, "scree-mcp-docker", []string{"CLAUDE_PROJECT_DIR=" + pd, "CWD=" + repo})
+		if err == nil || lines != nil || !strings.Contains(out, "is not in the repo of the working directory") {
+			t.Errorf("forged CLAUDE_PROJECT_DIR %s: err %v, child ran %v, output %q", pd, err, lines != nil, out)
+		}
+	}
+}
+
+// TestNoProgramFromInheritedPath: a planted id (or any program) earlier in
+// an inherited PATH, absolute or relative, never runs.
+func TestNoProgramFromInheritedPath(t *testing.T) {
+	for _, s := range scripts {
+		e := setup(t, envFile, 0o600)
+		marker := filepath.Join(e.dir, "pwned-id")
+		evil := "#!/bin/sh\ntouch " + marker + "\necho root\n"
+		for _, d := range []string{filepath.Join(e.dir, "planted"), filepath.Join(e.project, ".bin")} {
+			os.MkdirAll(d, 0o755)
+			for _, name := range []string{"id", "env", "sed", "stat", "dirname", "ls", "pwd", "scree", "docker"} {
+				os.WriteFile(filepath.Join(d, name), []byte(evil), 0o755)
+			}
+		}
+		args := []string{"search", "x"}
+		if s != "scree-run" {
+			args = nil
+		}
+		out, lines, err := e.run(t, s, []string{"PATH=.bin:" + filepath.Join(e.dir, "planted") + ":/usr/bin:/bin"}, args...)
+		if _, serr := os.Stat(marker); serr == nil {
+			t.Errorf("%s ran a program from the inherited PATH (output %q)", s, out)
+		}
+		if err != nil || !slices.Contains(lines, "env=OPENROUTER_API_KEY="+secret) {
+			t.Errorf("%s: err %v, output %q, lines %q", s, err, out, lines)
+		}
+	}
+}
+
+// TestWrappersHandOffPasswdHome: the child gets HOME from the password
+// database and no XDG_DATA_HOME or XDG_CONFIG_HOME from the environment.
+func TestWrappersHandOffPasswdHome(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	fake := "#!/bin/sh\nprintf 'HOME=%s\\nXDG_DATA_HOME=%s\\nXDG_CONFIG_HOME=%s\\n' \"$HOME\" \"${XDG_DATA_HOME-unset}\" \"${XDG_CONFIG_HOME-unset}\" > \"$FAKE_OUT\"\n"
+	for _, name := range []string{"scree", "docker"} {
+		if err := os.WriteFile(filepath.Join(e.bin, name), []byte(fake), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, s := range scripts {
+		os.Remove(e.out)
+		_, lines, err := e.run(t, s, []string{"HOME=/nonexistent", "XDG_DATA_HOME=/tmp/evil", "XDG_CONFIG_HOME=/tmp/evil"})
+		want := []string{"HOME=" + e.dir, "XDG_DATA_HOME=unset", "XDG_CONFIG_HOME=unset"}
+		if err != nil || !slices.Equal(lines, want) {
+			t.Errorf("%s: err %v, child saw %q, want %q", s, err, lines, want)
+		}
 	}
 }
 

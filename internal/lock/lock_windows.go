@@ -27,3 +27,6 @@ func unlock(f *os.File) {
 	ol := windows.Overlapped{OffsetHigh: lockOffsetHigh}
 	windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &ol)
 }
+
+// noFollow is 0: Windows has no O_NOFOLLOW; notSymlink checks first.
+const noFollow = 0

@@ -105,10 +105,20 @@ type Chunk struct {
 	Text          string
 }
 
-// Copy is another chunk with the same text as a hit, at its stored range.
+// Copy is another chunk with the same text as a hit. Search reports it at
+// its current range when its file changed, or with Stale set (and no range)
+// when the text is no longer there.
 type Copy struct {
 	Path          string
 	Line, EndLine int
+	Stale         bool
+}
+
+// CopyRow is a Copy as stored, with its file's stat as indexed (nil if not
+// recorded).
+type CopyRow struct {
+	Copy
+	Stat *FileStat
 }
 
 // TextHash is the stored hash of a chunk's text: the first 16 bytes of its
@@ -170,6 +180,9 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("store: %w", err)
 		}
 	}
+	if err := checkNoSymlink(path); err != nil {
+		return nil, err
+	}
 	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() +
 		"?_pragma=busy_timeout(10000)&_pragma=synchronous(normal)"
 	// driver.Open's second callback runs before close, so both extensions
@@ -208,6 +221,29 @@ func registerExtensions(c *sqlite3.Conn) error {
 		return err
 	}
 	return fts5.Register(c)
+}
+
+// ErrSymlink means the index file, or its -wal or -shm file, is a symlink
+// or not a regular file. SQLite would follow a symlink and write wherever
+// it points.
+var ErrSymlink = errors.New("is a symlink or not a regular file")
+
+// checkNoSymlink refuses an index whose file, -wal or -shm is anything but
+// a regular file. Missing files are fine; SQLite creates them.
+func checkNoSymlink(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		fi, err := os.Lstat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("store: %w", err)
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("store: %s %w; not opening it", p, ErrSymlink)
+		}
+	}
+	return nil
 }
 
 // CheckFile returns ErrIndexGone if the file at the index path is no longer
@@ -636,21 +672,23 @@ func (s *Store) SetLines(ctx context.Context, path string, ranges []LineRange) e
 
 // Copies returns up to limit other chunks whose text hash is hash, skipping
 // the chunk excludeID, ordered by path and line.
-func (s *Store) Copies(ctx context.Context, hash string, excludeID int64, limit int) ([]Copy, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path, line, end_line FROM chunks
-		WHERE text_hash = ? AND id <> ? ORDER BY path, line LIMIT ?`, hash, excludeID, limit)
+func (s *Store) Copies(ctx context.Context, hash string, excludeID int64, limit int) ([]CopyRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT c.path, c.line, c.end_line, f.mtime, f.size FROM chunks c
+		LEFT JOIN files f ON f.path = c.path
+		WHERE c.text_hash = ? AND c.id <> ? ORDER BY c.path, c.line LIMIT ?`, hash, excludeID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Copy
+	var out []CopyRow
 	for rows.Next() {
-		var c Copy
-		var end sql.NullInt64
-		if err := rows.Scan(&c.Path, &c.Line, &end); err != nil {
+		var c CopyRow
+		var end, mtime, size sql.NullInt64
+		if err := rows.Scan(&c.Path, &c.Line, &end, &mtime, &size); err != nil {
 			return nil, err
 		}
 		c.EndLine = int(end.Int64)
+		c.Stat = statOf(mtime, size)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -825,8 +863,11 @@ type Summary struct {
 // which uses the existing WAL.
 func Peek(path string) (Summary, error) {
 	var sum Summary
-	if _, err := os.Stat(path); err != nil {
+	if _, err := os.Lstat(path); err != nil {
 		return sum, fmt.Errorf("store: %w", err)
+	}
+	if err := checkNoSymlink(path); err != nil {
+		return sum, err
 	}
 	q := "?mode=ro&immutable=1"
 	if _, err := os.Lstat(path + "-wal"); err == nil {

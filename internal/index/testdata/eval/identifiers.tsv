@@ -8,6 +8,6 @@ scree-mcp-docker	README.md	Docker
 include-hidden	docs/SPEC.md	Ignoring files
 core.excludesFile	docs/SPEC.md	Ignoring files
 writer.lock	docs/SPEC.md	How indexing works
--allow-remote	docs/SPEC.md	Tools and commands
+-allow-remote	README.md	Claude Code
 fsnotify	docs/SPEC.md	Go stack
 SCREE_ZDR	README.md	Privacy

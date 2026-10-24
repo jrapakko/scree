@@ -119,6 +119,9 @@ func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err
 func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel string) (changed bool, err error) {
 	ix.writeMu.Lock()
 	defer ix.writeMu.Unlock()
+	if err := ix.Policy.CheckIgnoreFile(); err != nil {
+		return false, err
+	}
 	clean, err := c.Canonical(rel)
 	if err == nil {
 		var src []byte
@@ -252,10 +255,14 @@ type SyncStats struct {
 // Sync indexes every new or changed note the policy allows and drops notes
 // that no longer exist or are now ignored. Files are processed one at a
 // time. A failure on one file is logged and does not stop the rest, and its
-// existing rows are kept. Sync fails if .screeignore cannot be read.
+// existing rows are kept. Sync fails, indexing nothing, if .screeignore
+// cannot be read or has a bad line.
 func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	ix.writeMu.Lock()
 	defer ix.writeMu.Unlock()
+	if err := ix.Policy.CheckIgnoreFile(); err != nil {
+		return SyncStats{}, err
+	}
 	var (
 		st   SyncStats
 		seen = map[string]bool{}
@@ -464,7 +471,7 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) (
 		}
 		out = append(out, h)
 	}
-	out, err := ix.foldDuplicates(ctx, out)
+	out, err := ix.foldDuplicates(ctx, out, files, &requeue)
 	if err != nil {
 		return nil, err
 	}
@@ -699,9 +706,13 @@ const (
 // group's best rank. The hit shown is the copy with the fewest path
 // segments, then the shortest path, then the first in byte order. The other
 // copies are looked up in the store, not only among the fetched hits, and
-// each must pass Policy.Check; up to maxAlso go in Also, the count of the
-// rest in AlsoMore. A hit with no text hash is its own group.
-func (ix *Indexer) foldDuplicates(ctx context.Context, hits []store.Hit) ([]store.Hit, error) {
+// each must pass the current rules; up to maxAlso go in Also, the count of
+// the rest in AlsoMore. A listed copy whose file changed since it was
+// indexed is located in the current file like a hit (files caches what
+// Search learned, so each file is still read at most once) and gets its
+// current range, or Stale; its path is added to requeue. A hit with no text
+// hash is its own group.
+func (ix *Indexer) foldDuplicates(ctx context.Context, hits []store.Hit, files map[string]*fileView, requeue *[]string) ([]store.Hit, error) {
 	var order []string
 	groups := map[string][]int{}
 	for i, h := range hits {
@@ -732,19 +743,42 @@ func (ix *Indexer) foldDuplicates(ctx context.Context, hits []store.Hit) ([]stor
 			allowed := map[string]bool{}
 			var also []store.Copy
 			for _, c := range copies {
+				if len(also) < maxAlso {
+					// Listed: full check, and the current range.
+					fv, seen := files[c.Path]
+					if !seen {
+						fv = ix.check(store.Hit{Chunk: store.Chunk{Path: c.Path}, Stat: c.Stat})
+						files[c.Path] = fv
+						if !fv.ok || fv.changed {
+							*requeue = append(*requeue, c.Path)
+						}
+					}
+					if !fv.ok {
+						continue
+					}
+					cp := c.Copy
+					if fv.changed {
+						tmp := store.Hit{Chunk: store.Chunk{Text: h.Text, Line: c.Line}}
+						fv.locate(&tmp)
+						cp.Line, cp.EndLine, cp.Stale = tmp.Line, tmp.EndLine, tmp.Stale
+					}
+					also = append(also, cp)
+					continue
+				}
+				// Only counted: a stat-only check is enough.
 				ok, seen := allowed[c.Path]
 				if !seen {
-					_, err := ix.Policy.Check(c.Path)
-					ok = err == nil
+					if fv, inFiles := files[c.Path]; inFiles {
+						ok = fv.ok
+					} else {
+						_, err := ix.Policy.Check(c.Path)
+						ok = err == nil
+					}
 					allowed[c.Path] = ok
 				}
 				if ok {
-					also = append(also, c)
+					h.AlsoMore++
 				}
-			}
-			if len(also) > maxAlso {
-				h.AlsoMore = len(also) - maxAlso
-				also = also[:maxAlso]
 			}
 			h.Also = also
 		}

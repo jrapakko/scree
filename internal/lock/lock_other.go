@@ -16,3 +16,6 @@ func tryLock(*os.File) (held bool, err error) {
 }
 
 func unlock(*os.File) {}
+
+// noFollow is 0 here; notSymlink checks first.
+const noFollow = 0
