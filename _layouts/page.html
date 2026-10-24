@@ -1,0 +1,26 @@
+---
+layout: default
+---
+<p class="scree-banner">Documents the per-repo version in development on the <code>per-repo</code> branch; the current release on <code>main</code> indexes a single notes folder.</p>
+
+<article class="post">
+
+  <header class="post-header">
+    <h1 class="post-title">{{ page.title | escape }}</h1>
+  </header>
+
+  <div class="post-content">
+    {{ content }}
+  </div>
+
+</article>
+
+<nav class="scree-docnav" aria-label="All pages">
+  <h2>All pages</h2>
+  <ol>
+    {%- for p in site.data.nav -%}
+    {%- assign doc = site.pages | where: "path", p.path | first -%}
+    <li>{% if doc.url == page.url %}<strong>{{ doc.title | escape }}</strong>{% else %}<a href="{{ doc.url | relative_url }}">{{ doc.title | escape }}</a>{% endif %}</li>
+    {%- endfor -%}
+  </ol>
+</nav>

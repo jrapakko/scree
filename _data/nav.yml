@@ -1,0 +1,11 @@
+- path: index.md
+- path: getting-started.md
+- path: using-with-claude-code.md
+- path: cli.md
+- path: configuration.md
+- path: ignoring-files.md
+- path: how-it-works.md
+- path: security.md
+- path: docker.md
+- path: troubleshooting.md
+- path: roadmap.md

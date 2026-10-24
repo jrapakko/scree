@@ -1,0 +1,40 @@
+title: scree
+description: >-
+  Local semantic search over the markdown in a repo, served to Claude Code
+  over MCP.
+url: https://scree.jrpko.dev
+baseurl: ""
+repository: jrapakko/scree
+github_username: jrapakko
+
+# minima is a theme GitHub Pages builds without a Gemfile. Its layouts use
+# jekyll-seo-tag and jekyll-feed; jekyll-relative-links turns links to .md
+# files into page links. All three are on the Pages plugin allowlist.
+theme: minima
+plugins:
+  - jekyll-seo-tag
+  - jekyll-feed
+  - jekyll-relative-links
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+# Pages in the top navigation bar. Every page also lists all pages at the
+# bottom (see _layouts/page.html).
+header_pages:
+  - getting-started.md
+  - using-with-claude-code.md
+  - cli.md
+  - configuration.md
+  - ignoring-files.md
+  - security.md
+  - troubleshooting.md
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: page
+

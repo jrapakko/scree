@@ -1,0 +1,19 @@
+---
+---
+@import "minima";
+
+.scree-banner {
+  border-left: 4px solid #b08800;
+  background: #fff8e1;
+  padding: 8px 12px;
+  margin-bottom: 24px;
+  font-size: 15px;
+}
+.scree-docnav {
+  border-top: 1px solid #e8e8e8;
+  margin-top: 40px;
+  padding-top: 16px;
+  font-size: 15px;
+  h2 { font-size: 18px; }
+}
+table { display: block; overflow-x: auto; }
