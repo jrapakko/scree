@@ -355,3 +355,77 @@ func TestVendoredAndLimits(t *testing.T) {
 	// A huge line (minified code) is skipped, not parsed.
 	check(t, "b.js", "const "+strings.Repeat("x", maxLine)+"Yy = 1\nconst fineName = 2\n", []string{"finename"}, nil)
 }
+
+// exact checks that src, read as rel, gives exactly want.
+func exact(t *testing.T, rel, src string, want ...string) {
+	t.Helper()
+	got := Extract(rel, []byte(src))
+	if want == nil {
+		want = []string{}
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("%s: got %q, want %q", rel, got, want)
+	}
+}
+
+// TestNoValues: only names in name positions are kept, never a literal, a
+// statement after an import, or text inside comments and strings.
+func TestNoValues(t *testing.T) {
+	// A statement after ; on an import line.
+	exact(t, "a.py", "import os; API_TOKEN = 'ghp_SecretTokenValue9'\n")
+	exact(t, "a2.py", "import alphaMod, betaMod as aliasName  # also gammaMod\nimport x = 'zetaSecretVal'\n",
+		"aliasname", "alphamod", "betamod")
+	// An unclosed list ends at the first line that is not a list line.
+	exact(t, "b.py", "from x import (\n    yThing,\nPASSWORD = 'hunter2IsMyPassword'\nclass LaterClass: pass\n",
+		"laterclass", "ything")
+	exact(t, "b2.py", "from x import (\n    firstName,\n    otherSecretWord junk\n    thirdName,\n)\n",
+		"firstname")
+	exact(t, "b3.py", "from pkgThing import aName, bName as cName, \\\n    dName\nfrom m import (oneName, twoName) junkValue\n",
+		"aname", "bname", "cname", "pkgthing")
+	// Docstrings and other triple-quoted strings.
+	exact(t, "c.py", `def realFunc():
+    """Example:
+
+    import creds as dbPassHunter2
+    class FakeClass: pass
+    """
+    return 1
+x = '''one line '''
+class AfterDoc: pass
+y = '''
+from z import leakedName
+'''
+`, "afterdoc", "realfunc")
+	// A list cut at maxListLines.
+	var b strings.Builder
+	b.WriteString("from m import (\n")
+	for i := range maxListLines + 5 {
+		fmt.Fprintf(&b, "    itemName%03d,\n", i)
+	}
+	if got := Extract("long.py", []byte(b.String())); len(got) != maxListLines {
+		t.Errorf("long list: %d names", len(got))
+	}
+
+	exact(t, "a.js", "import x from 'y'; const tok = 'abcDefGhi'\nconst aKey = 'abcDefGhi', bKey = otherVal\n", "akey")
+	exact(t, "b.ts", "import {\n  alphaThing,\nexport const holder = { tokenValue: 'qwSecretKey' }\nsecretWordX\n",
+		"alphathing")
+	exact(t, "b2.ts", "import {\n  alphaThing,\n  zSecretWord: 'x',\n  betaThing,\n} from 'm'\n", "alphathing")
+	exact(t, "c.js", `/* import { secretValueX } from 'y'
+const hiddenName = 1
+*/
+const realName = 1 /* const inlineName = 2 */
+const tpl = `+"`"+`
+export const tplName = 1
+`+"`"+`
+const url = "http://example.com/const fakeName"
+const { someKey: boundName, otherKey = defaultVal } = obj
+import 'sideEffectMod'
+export default 'stringDefault'
+export { aaName as bbName } from 'zz'
+`, "aaname", "bbname", "boundname", "otherkey", "realname")
+
+	exact(t, "a.go", "package a\n\nvar apiKey = \"zzzTopSecret\"\nconst (\n\tlongSecret = `\nfunc hiddenFunc() {}\nvar rawName = 1\n`\n\tnextName = 2\n)\n/*\nfunc commentFunc() {}\n*/\nfunc realFunc() {}\n",
+		"apikey", "longsecret", "nextname", "realfunc")
+	exact(t, "b.go", "package b\n\nimport (\n\t\"github.com/acme/fooBar\"\n\tsecretName = \"zzzTopSecret\"\n\t\"github.com/acme/afterEnd\"\n)\n",
+		"foobar")
+}

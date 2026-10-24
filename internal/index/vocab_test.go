@@ -351,6 +351,75 @@ func TestSyncNameCap(t *testing.T) {
 	}
 }
 
+// TestSyncNameCapSteady: a file cut short is not read again, and the
+// vocabulary not rebuilt, while it and the room it gets stay the same; it
+// is read again when the room shrinks or the file changes.
+func TestSyncNameCapSteady(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	defer func(n int) { nameCap = n }(nameCap)
+	nameCap = 3
+	write(t, ix.Root(), "a.py", "class OneThing: pass\nclass TwoThing: pass\n")
+	write(t, ix.Root(), "b.py", "class RedThing: pass\nclass BlueThing: pass\n")
+	write(t, ix.Root(), "c.py", "class GreenThing: pass\n")
+	if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 3 {
+		t.Fatalf("first sync = %+v, %v", st, err)
+	}
+	for range 2 {
+		if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 0 {
+			t.Fatalf("steady sync = %+v, %v", st, err)
+		}
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"bluething", "onething", "twothing"}) {
+		t.Errorf("capped vocab = %q", got)
+	}
+	// Less room for b.py: cut further.
+	write(t, ix.Root(), "a.py", "class OneThing: pass\nclass TwoThing: pass\nclass SixThing: pass\n")
+	if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 2 {
+		t.Fatalf("shrunk sync = %+v, %v", st, err)
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"onething", "sixthing", "twothing"}) {
+		t.Errorf("shrunk vocab = %q", got)
+	}
+	if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 0 {
+		t.Fatalf("steady sync = %+v, %v", st, err)
+	}
+	// A changed file that is cut is read again.
+	write(t, ix.Root(), "b.py", "class RedThing: pass\n")
+	if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 1 {
+		t.Fatalf("changed sync = %+v, %v", st, err)
+	}
+}
+
+// TestSyncSourceCapFailed: a file that fails to read does not count
+// against the source cap.
+func TestSyncSourceCapFailed(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	defer func(n int) { sourceCap = n }(sourceCap)
+	sourceCap = 2
+	for _, n := range []string{"a", "b", "c"} {
+		write(t, ix.Root(), "src/"+n+".py", "class "+n+"Thing: pass\n")
+	}
+	if err := os.Chmod(filepath.Join(ix.Root(), "src", "a.py"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(filepath.Join(ix.Root(), "src", "a.py")); err == nil {
+		f.Close()
+		t.Skip("running with permission to read any file")
+	}
+	st, err := ix.Sync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Sources != 2 {
+		t.Errorf("stats: %+v", st)
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"bthing", "cthing"}) {
+		t.Errorf("vocab = %q", got)
+	}
+}
+
 // TestSyncVocabVersion: names read by another extractor version are all
 // read again.
 func TestSyncVocabVersion(t *testing.T) {

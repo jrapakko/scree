@@ -260,10 +260,16 @@ type SyncStats struct {
 	Sources, SourcesChanged                     int
 }
 
-// MaxSourceFiles caps the manifests and source files one Sync opens for the
+// MaxSourceFiles caps the manifests and source files one Sync reads for the
 // code vocabulary, in walk order; files past it are not opened and
-// contribute nothing.
+// contribute nothing. A file that fails to read does not count.
 const MaxSourceFiles = 20000
+
+// cutMark prefixes the stored hash of a file whose names were cut short
+// for vocab.MaxNames. Sync keeps its names while the file is unchanged and
+// the room left for it is the same as when it was cut, and reads it again
+// when either changes, so a capped vocabulary is not rebuilt every sync.
+const cutMark = "cut:"
 
 // sourceCap and nameCap are MaxSourceFiles and vocab.MaxNames; tests lower
 // them.
@@ -293,7 +299,7 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 
 		codeSeen = map[string]bool{}
 		put      []store.VocabFile
-		opened   int  // source files opened, at most sourceCap
+		opened   int  // source files read, at most sourceCap
 		capped   bool // a source file was refused for the cap
 		names    int  // names kept so far, at most nameCap
 		full     bool // a file's names were cut for nameCap
@@ -303,6 +309,12 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	} else if v != vocab.Version {
 		if err := ix.Store.ClearVocab(ctx, vocab.Version); err != nil {
 			return st, err
+		}
+	}
+	logFull := func() {
+		if !full {
+			full = true
+			ix.logf("vocabulary: over %d names; keeping the first", nameCap)
 		}
 	}
 	codeHave, err := ix.Store.VocabFiles(ctx)
@@ -332,7 +344,6 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 			return nil
 		}
 		if vocab.IsSource(rel) {
-			opened++
 			if err != nil {
 				// A transient failure keeps the stored names; a file that is
 				// gone, unreadable or not a regular file loses them.
@@ -342,28 +353,31 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 				}
 				return nil
 			}
+			opened++
 			codeSeen[rel] = true
 			st.Sources++
 			sum := sha256.Sum256(src)
 			hash := hex.EncodeToString(sum[:])
 			have, ok := codeHave[rel]
-			if ok && have.Hash == hash && names+have.Names <= nameCap {
+			room := max(nameCap-names, 0)
+			switch {
+			case ok && have.Hash == hash && have.Names <= room:
+				names += have.Names
+				return nil
+			case ok && have.Hash == cutMark+hash && have.Names == room:
+				// Cut short before, and the room is the same: the same names.
+				logFull()
 				names += have.Names
 				return nil
 			}
 			found := vocab.Extract(rel, src)
-			if room := max(nameCap-names, 0); len(found) > room {
-				// Cut, with no hash, so the file is read again next sync.
-				found, hash = found[:room], ""
-				if !full {
-					full = true
-					ix.logf("vocabulary: over %d names; keeping the first", nameCap)
-				}
+			if len(found) > room {
+				// Cut short: marked, so it is read again only once the room
+				// it gets changes.
+				found, hash = found[:room], cutMark+hash
+				logFull()
 			}
 			names += len(found)
-			if ok && have.Hash == "" && hash == "" && have.Names == 0 && len(found) == 0 {
-				return nil // still no room
-			}
 			put = append(put, store.VocabFile{Path: rel, Hash: hash, Names: found})
 			st.SourcesChanged++
 			return nil

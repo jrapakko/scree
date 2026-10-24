@@ -19,7 +19,7 @@ import (
 // Version names the extraction rules. An index whose names were read under
 // another version reads every file again; bump it whenever a change to this
 // package would give different names for the same file.
-const Version = "2"
+const Version = "3"
 
 // MaxNameBytes is the longest name kept; longer ones are dropped.
 const MaxNameBytes = 128
@@ -549,44 +549,109 @@ func goNames(mod string) []string {
 	return out
 }
 
+// maxListLines caps the lines of one parenthesized or braced import list;
+// past it the list is taken as ended.
+const maxListLines = 200
+
+// pyItem is one dotted name with an optional alias, as in an import list.
+const pyItem = `[\w.]+(?:\s+as\s+\w+)?`
+
 var (
 	pyDef    = regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)`)
 	pyClass  = regexp.MustCompile(`^\s*class\s+([A-Za-z_]\w*)`)
-	pyImport = regexp.MustCompile(`^\s*import\s+(.+)`)
-	pyFrom   = regexp.MustCompile(`^\s*from\s+([\w.]+)\s+import\s+(.+)`)
-	word     = regexp.MustCompile(`[A-Za-z_$][\w$]*`)
+	pyImport = regexp.MustCompile(`^\s*import\s+(` + pyItem + `(?:\s*,\s*` + pyItem + `)*)\s*\\?\s*$`)
+	pyFrom   = regexp.MustCompile(`^\s*from\s+([\w.]+)\s+import\s+(.*)$`)
+	// pyNames is an import list, or a line of one: names with optional
+	// aliases, comma-separated, maybe with a trailing comma or backslash.
+	pyNames = regexp.MustCompile(`^\s*(?:` + pyItem + `(?:\s*,\s*` + pyItem + `)*)?\s*,?\s*\\?\s*$`)
+	word    = regexp.MustCompile(`[A-Za-z_$][\w$]*`)
 )
 
 // python reads names from def, class, import and from ... import lines,
-// including a parenthesized import list over several lines.
+// including a parenthesized import list over several lines. Only names in
+// name positions count: an import line is cut at the first ;, #, = or
+// quote and must then be an import list, a list line that is not one ends
+// the list, and lines inside a """ or ”' string are skipped.
 func python(src []byte) []string {
 	var out []string
-	inParen := false
+	paren := 0   // lines left in a parenthesized import list, 0 outside one
+	triple := "" // delimiter of the """ or ''' string the line is in
 	lines(src, func(l string) {
-		if inParen {
-			body, _, closed := strings.Cut(stripHash(l), ")")
-			out = append(out, word.FindAllString(body, -1)...)
-			inParen = !closed
+		if triple != "" {
+			if strings.Contains(l, triple) {
+				triple = ""
+			}
 			return
+		}
+		triple = pyTriple(l)
+		if paren > 0 {
+			paren--
+			body, after, closed := strings.Cut(stripHash(l), ")")
+			if pyNames.MatchString(body) && strings.TrimSpace(after) == "" {
+				out = append(out, word.FindAllString(body, -1)...)
+				if closed {
+					paren = 0
+				}
+				return
+			}
+			paren = 0 // not a list line: the list has ended
 		}
 		if m := pyDef.FindStringSubmatch(l); m != nil {
 			out = append(out, m[1])
-		} else if m := pyClass.FindStringSubmatch(l); m != nil {
+			return
+		}
+		if m := pyClass.FindStringSubmatch(l); m != nil {
 			out = append(out, m[1])
-		} else if m := pyFrom.FindStringSubmatch(l); m != nil {
-			out = append(out, strings.Split(m[1], ".")...)
-			rest := stripHash(m[2])
-			if strings.HasPrefix(strings.TrimSpace(rest), "(") {
-				body, _, closed := strings.Cut(rest, ")")
-				inParen = !closed
+			return
+		}
+		code := pyCut(l)
+		if m := pyFrom.FindStringSubmatch(code); m != nil {
+			rest := strings.TrimSpace(m[2])
+			if r, ok := strings.CutPrefix(rest, "("); ok {
+				body, after, closed := strings.Cut(r, ")")
+				if !pyNames.MatchString(body) || strings.TrimSpace(after) != "" {
+					return
+				}
+				if !closed {
+					paren = maxListLines
+				}
 				rest = body
+			} else if rest != "*" && !pyNames.MatchString(rest) {
+				return
 			}
+			out = append(out, strings.Split(m[1], ".")...)
 			out = append(out, word.FindAllString(rest, -1)...)
-		} else if m := pyImport.FindStringSubmatch(l); m != nil {
-			out = append(out, word.FindAllString(stripHash(m[1]), -1)...)
+		} else if m := pyImport.FindStringSubmatch(code); m != nil {
+			out = append(out, word.FindAllString(m[1], -1)...)
 		}
 	})
 	return out
+}
+
+// pyTriple returns the delimiter of a """ or ”' string that l opens and
+// leaves open, or "". A comment line opens none, and a line that opens and
+// closes one (an odd count is open) leaves none.
+func pyTriple(l string) string {
+	if strings.HasPrefix(strings.TrimSpace(l), "#") {
+		return ""
+	}
+	d, i := `"""`, strings.Index(l, `"""`)
+	if j := strings.Index(l, "'''"); j >= 0 && (i < 0 || j < i) {
+		d, i = "'''", j
+	}
+	if i < 0 || strings.Count(l[i:], d)%2 == 0 {
+		return ""
+	}
+	return d
+}
+
+// pyCut cuts l at the first ;, #, = or quote: where an import statement
+// ends, or where something that is not one starts.
+func pyCut(l string) string {
+	if i := strings.IndexAny(l, `;#='"`); i >= 0 {
+		return l[:i]
+	}
+	return l
 }
 
 func stripHash(s string) string {
@@ -596,48 +661,127 @@ func stripHash(s string) string {
 	return s
 }
 
+// cState is where a C-like scanner (see strip) is at the end of a line:
+// inside a /* */ comment or a backtick string.
+type cState struct{ comment, tick bool }
+
+// strip returns l without comments and with the contents of strings
+// dropped, quotes kept, so "a" reads as "". Block comments and backtick
+// strings may span lines; quoted strings end at the line's end. Backslash
+// escapes apply inside quotes, and inside backticks unless raw (Go).
+func (s *cState) strip(l string, raw bool) string {
+	var b strings.Builder
+	quote := byte(0)
+	if s.tick {
+		quote = '`'
+	}
+	for i := 0; i < len(l); i++ {
+		c := l[i]
+		switch {
+		case s.comment:
+			if c == '*' && i+1 < len(l) && l[i+1] == '/' {
+				s.comment = false
+				i++
+				b.WriteByte(' ')
+			}
+		case quote != 0:
+			if c == '\\' && !(raw && quote == '`') {
+				i++
+			} else if c == quote {
+				quote = 0
+				b.WriteByte(c)
+			}
+		case c == '/' && i+1 < len(l) && l[i+1] == '/':
+			s.tick = false
+			return b.String()
+		case c == '/' && i+1 < len(l) && l[i+1] == '*':
+			s.comment = true
+			i++
+		case c == '"' || c == '\'' || c == '`':
+			quote = c
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	s.tick = quote == '`'
+	return b.String()
+}
+
+// jsSpec is one name of an import or export list, as in "type A as B".
+const jsSpec = `(?:type\s+)?[\w$]+(?:\s+as\s+[\w$]+)?`
+
 var (
 	jsDecl = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?` +
 		`(?:function\s*\*?|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)`)
 	jsDestructure = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s*[{\[]([^}\]]*)[}\]]`)
 	jsImport      = regexp.MustCompile(`^\s*(?:import|export)\b(.*)`)
-	jsString      = regexp.MustCompile("\"[^\"]*\"|'[^']*'|`[^`]*`")
+	jsFrom        = regexp.MustCompile(`\s+from\s*$`)
+	// jsSpecs is a list of jsSpec, or a line of one.
+	jsSpecs = regexp.MustCompile(`^\s*(?:` + jsSpec + `(?:\s*,\s*` + jsSpec + `)*)?\s*,?\s*$`)
+	// jsClause is what may follow import or export before the module
+	// specifier: a default name, * as name, and a braced list, opened or
+	// closed on the line.
+	jsClause = regexp.MustCompile(`^\s*(?:type\s+)?(?:[\w$]+\s*(?:,\s*)?)?(?:\*(?:\s+as\s+[\w$]+)?\s*)?` +
+		`(?:\{([^{}]*)(\})?\s*)?$`)
 )
 
 // javascript reads names from JavaScript and TypeScript declarations
 // (function, class, interface, type, enum, const, let, var, with or without
 // export) and from import and export statements, including a braced list
-// over several lines. Module specifiers (the quoted paths) are skipped.
+// over several lines. Comments and the contents of strings are dropped
+// first, and a line is cut at its first ;. Only declared names count, not
+// initializers; an import or export must have the shape of one, and a list
+// line that is not a list of names ends the list.
 func javascript(src []byte) []string {
 	var out []string
-	inBrace := false
+	var cs cState
+	brace := 0 // lines left in a braced import or export list, 0 outside one
 	lines(src, func(l string) {
-		if c := strings.Index(l, "//"); c >= 0 {
-			l = l[:c]
+		l = cs.strip(l, false)
+		if i := strings.IndexByte(l, ';'); i >= 0 {
+			l = l[:i]
 		}
-		if inBrace {
+		if brace > 0 {
+			brace--
 			body, _, closed := strings.Cut(l, "}")
-			out = append(out, word.FindAllString(jsString.ReplaceAllString(body, ""), -1)...)
-			inBrace = !closed
-			return
+			if jsSpecs.MatchString(body) {
+				out = append(out, word.FindAllString(body, -1)...)
+				if closed {
+					brace = 0
+				}
+				return
+			}
+			brace = 0 // not a list line: the list has ended
 		}
 		if m := jsDecl.FindStringSubmatch(l); m != nil {
 			out = append(out, m[1])
 			return
 		}
 		if m := jsDestructure.FindStringSubmatch(l); m != nil {
-			out = append(out, word.FindAllString(m[1], -1)...)
+			// The bound names only: a default value after = and a property
+			// name before : are not declared.
+			for _, el := range strings.Split(m[1], ",") {
+				el, _, _ = strings.Cut(el, "=")
+				if _, after, ok := strings.Cut(el, ":"); ok {
+					el = after
+				}
+				out = append(out, word.FindAllString(el, -1)...)
+			}
 			return
 		}
 		if m := jsImport.FindStringSubmatch(l); m != nil {
 			rest := m[1]
-			if i := strings.Index(rest, " from "); i >= 0 {
-				rest = rest[:i]
-			} else if i := strings.IndexAny(rest, `="'`+"`("); i >= 0 {
+			if i := strings.IndexAny(rest, `="'`+"`("); i >= 0 {
 				rest = rest[:i]
 			}
-			if strings.Contains(rest, "{") && !strings.Contains(rest, "}") {
-				inBrace = true
+			rest = jsFrom.ReplaceAllString(rest, "")
+			c := jsClause.FindStringSubmatch(rest)
+			if c == nil || !jsSpecs.MatchString(c[1]) {
+				return
+			}
+			if strings.Contains(rest, "{") && c[2] == "" {
+				brace = maxListLines
 			}
 			out = append(out, word.FindAllString(rest, -1)...)
 		}
@@ -650,25 +794,35 @@ var (
 	goDecl  = regexp.MustCompile(`^(type|const|var)\s+([A-Za-z_]\w*)`)
 	goGroup = regexp.MustCompile(`^(type|const|var|import)\s*\(\s*$`)
 	goSpec  = regexp.MustCompile(`^\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)`)
-	goImp   = regexp.MustCompile(`^\s*(?:import\s+)?([A-Za-z_.]\w*\s+)?"([^"]+)"`)
+	goImp   = regexp.MustCompile(`^\s*(?:import\s+)?(?:([A-Za-z_.]\w*)\s+)?"([\w./~+-]+)"\s*(?://.*)?$`)
 )
 
 // golang reads names from top-level Go declarations: func (methods too),
 // type, const and var, single or grouped, and import paths and aliases.
+// Comments, the contents of strings and raw strings over several lines are
+// dropped first, so only declared names count, never values; an import
+// group line that is not an import spec ends the group.
 func golang(src []byte) []string {
 	var out []string
+	var cs cState
 	group := ""
-	lines(src, func(l string) {
+	lines(src, func(raw string) {
+		code := !cs.comment && !cs.tick // the line starts in code
+		l := cs.strip(raw, true)
 		if group != "" {
 			if strings.HasPrefix(l, ")") {
 				group = ""
 				return
 			}
-			if c := strings.Index(l, "//"); c >= 0 {
-				l = l[:c]
-			}
 			if group == "import" {
-				out = append(out, goImport(l)...)
+				if !code || strings.TrimSpace(l) == "" {
+					return
+				}
+				if names := goImport(raw); names != nil {
+					out = append(out, names...)
+				} else {
+					group = "" // not an import spec: the group has ended
+				}
 				return
 			}
 			// One spec per line at the group's indent: names before the type
@@ -689,22 +843,23 @@ func golang(src []byte) []string {
 			out = append(out, m[1])
 		} else if m := goDecl.FindStringSubmatch(l); m != nil {
 			out = append(out, m[2])
-		} else if strings.HasPrefix(l, "import ") {
-			out = append(out, goImport(l)...)
+		} else if code && strings.HasPrefix(l, "import ") {
+			out = append(out, goImport(raw)...)
 		}
 	})
 	return out
 }
 
-// goImport returns an import spec's alias and the segments of its path.
+// goImport returns an import spec's alias and the segments of its path,
+// or nil if l is not exactly one spec.
 func goImport(l string) []string {
 	m := goImp.FindStringSubmatch(l)
 	if m == nil {
 		return nil
 	}
 	out := strings.Split(m[2], "/")
-	if a := strings.TrimSpace(m[1]); a != "" {
-		out = append(out, a)
+	if m[1] != "" {
+		out = append(out, m[1])
 	}
 	return out
 }
