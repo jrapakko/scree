@@ -36,6 +36,13 @@ type Indexer struct {
 	// writes the index can drop their rows. Nil means leave them; the
 	// writer's watcher or next sync removes them.
 	OnStale func(paths []string)
+	// Progress, when set, is called after each file Sync handles, with the
+	// counts so far.
+	Progress func(SyncStats)
+
+	// writeMu serializes IndexFile, Sync and RemovePrefix, which can be
+	// called from the watcher and from the MCP reindex tool.
+	writeMu sync.Mutex
 
 	mu         sync.Mutex
 	pauseUntil time.Time
@@ -100,6 +107,8 @@ func (ix *Indexer) Rel(abs string) (string, error) { return ix.Policy.Rel(abs) }
 // returned, with changed reporting whether rows were removed. rel is first
 // mapped to its on-disk name (Policy.Canonical), which is the store key.
 func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err error) {
+	ix.writeMu.Lock()
+	defer ix.writeMu.Unlock()
 	clean, err := ix.Policy.Canonical(rel)
 	if err == nil {
 		var src []byte
@@ -177,6 +186,8 @@ func (ix *Indexer) remove(ctx context.Context, rel string) (bool, error) {
 // RemovePrefix drops every indexed file under the directory rel, for when a
 // folder is deleted or moved away.
 func (ix *Indexer) RemovePrefix(ctx context.Context, rel string) error {
+	ix.writeMu.Lock()
+	defer ix.writeMu.Unlock()
 	paths, err := ix.Store.Paths(ctx)
 	if err != nil {
 		return err
@@ -202,6 +213,8 @@ type SyncStats struct {
 // time. A failure on one file is logged and does not stop the rest, and its
 // existing rows are kept. Sync fails if .screeignore cannot be read.
 func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
+	ix.writeMu.Lock()
+	defer ix.writeMu.Unlock()
 	var (
 		st   SyncStats
 		seen = map[string]bool{}
@@ -236,6 +249,9 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 			ix.logf("error: %v", err)
 		case changed:
 			st.Indexed++
+		}
+		if ix.Progress != nil {
+			ix.Progress(st)
 		}
 		return nil
 	})

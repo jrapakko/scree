@@ -258,3 +258,87 @@ func TestStoreMigratesFileColumns(t *testing.T) {
 		t.Errorf("after SetFileStat: %v", st)
 	}
 }
+
+func TestConcurrentOpenFresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "new", "index.db")
+	const n = 8
+	errs := make(chan error, n)
+	stores := make(chan *Store, n)
+	for range n {
+		go func() {
+			s, err := Open(path)
+			if err == nil {
+				err = s.CheckModel("m")
+			}
+			if err == nil {
+				err = s.CheckRoot("/r")
+			}
+			errs <- err
+			stores <- s
+		}()
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+		if s := <-stores; s != nil {
+			defer s.Close()
+		}
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var tables int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'vecs'`).Scan(&tables); err != nil || tables != 1 {
+		t.Errorf("vecs tables = %d, %v", tables, err)
+	}
+	if m, _ := s.Model(); m != "m" {
+		t.Errorf("model = %q", m)
+	}
+}
+
+func TestCreateVecsWhenPresent(t *testing.T) {
+	s := open(t)
+	// Opening an existing index runs init again: the table is found, not
+	// created twice, in either order of two openers.
+	for range 2 {
+		if err := s.init(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := createVecs(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMatchModelAndRootNeverWrite(t *testing.T) {
+	s := open(t)
+	if err := s.MatchModel("m"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MatchRoot("/r"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := s.Model(); m != "" {
+		t.Errorf("MatchModel recorded %q", m)
+	}
+	if r, _ := s.Meta("root"); r != "" {
+		t.Errorf("MatchRoot recorded %q", r)
+	}
+	s.CheckModel("m")
+	s.CheckRoot("/r")
+	if err := s.MatchModel("other"); !errors.Is(err, ErrModelMismatch) {
+		t.Errorf("MatchModel = %v", err)
+	}
+	if err := s.MatchRoot("/other"); !errors.Is(err, ErrRootMismatch) {
+		t.Errorf("MatchRoot = %v", err)
+	}
+}

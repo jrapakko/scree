@@ -16,6 +16,7 @@ import (
 	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
 	"github.com/jrapakko/scree/internal/textsafe"
+	"github.com/jrapakko/scree/internal/writer"
 )
 
 const (
@@ -54,8 +55,9 @@ type reindexArgs struct {
 	Path string `json:"path,omitempty" jsonschema:"one note to re-index; omit to sync every changed note"`
 }
 
-// New returns an MCP server backed by ix.
-func New(ix *index.Indexer, version string) *mcp.Server {
+// New returns an MCP server backed by ix. w is the process's writer role; nil
+// means this process always writes (tests, single-process use).
+func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "scree", Version: version}, &mcp.ServerOptions{
 		Instructions: Instructions,
 	})
@@ -77,7 +79,11 @@ func New(ix *index.Indexer, version string) *mcp.Server {
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
-		return textResult(FormatHits(hits)), nil, nil
+		note := ""
+		if w != nil {
+			note = w.Note(ctx)
+		}
+		return textResult(FormatHits(hits, note)), nil, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -100,6 +106,21 @@ func New(ix *index.Indexer, version string) *mcp.Server {
 		Name:        "reindex",
 		Description: "Re-index one note, or with no path, every note that changed since it was last indexed.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, a reindexArgs) (*mcp.CallToolResult, any, error) {
+		if w != nil && !w.Holding() {
+			// Another process writes this index. A path still gets the
+			// policy's verdict, so an ignored file is refused as usual.
+			if a.Path != "" {
+				if _, err := ix.Policy.Read(a.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return errResult(refusal(err).Error()), nil, nil
+				}
+			}
+			return textResult(fmt.Sprintf("Another scree process (pid %d) keeps this index current; edits are picked up within a few seconds.",
+				w.Status().HolderPID)), nil, nil
+		}
+		if w != nil && w.Status().Phase == writer.Syncing {
+			return textResult(fmt.Sprintf("The first sync is still running (%d notes indexed so far); new and changed files are included.",
+				w.Status().Indexed)), nil, nil
+		}
 		if a.Path != "" {
 			rel, err := ix.Policy.Canonical(a.Path)
 			if err != nil {
@@ -129,11 +150,17 @@ func New(ix *index.Indexer, version string) *mcp.Server {
 // terminal. Attribute values are quoted, control characters are stripped,
 // and tags inside note text are neutralized so a note cannot forge a hit.
 // Each hit's text is capped at MaxHitChars and the output at MaxOutputBytes.
-func FormatHits(hits []store.Hit) string {
-	if len(hits) == 0 {
-		return "No matching notes."
+//
+// note, if not empty, is appended as a final line, such as a writer's
+// "[index incomplete: …]" status. It counts toward MaxOutputBytes.
+func FormatHits(hits []store.Hit, note string) string {
+	if note != "" {
+		note = "\n" + textsafe.Strip(note)
 	}
-	const reserve = 64 // room for the omitted-hits note
+	if len(hits) == 0 {
+		return "No matching notes." + note
+	}
+	reserve := 64 + len(note) // room for the omitted-hits line and the note
 	var b strings.Builder
 	for i, h := range hits {
 		text := neutralize(textsafe.Strip(h.Text), "hit")
@@ -151,6 +178,7 @@ func FormatHits(hits []store.Hit) string {
 		}
 		b.WriteString(one)
 	}
+	b.WriteString(note)
 	return b.String()
 }
 

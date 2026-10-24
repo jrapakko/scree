@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/ncruces/go-sqlite3/driver"
 	"github.com/ncruces/go-sqlite3/ext/vec1"
@@ -87,7 +89,7 @@ func Open(path string) (*Store, error) {
 		}
 	}
 	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() +
-		"?_pragma=journal_mode(wal)&_pragma=busy_timeout(10000)&_pragma=synchronous(normal)"
+		"?_pragma=busy_timeout(10000)&_pragma=synchronous(normal)"
 	db, err := driver.Open(dsn, vec1.Register)
 	if err != nil {
 		return nil, err
@@ -95,6 +97,10 @@ func Open(path string) (*Store, error) {
 	// Each connection is a separate SQLite instance; one keeps memory flat.
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, path: path}
+	if err := setWAL(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := s.init(); err != nil {
 		db.Close()
 		return nil, err
@@ -122,25 +128,86 @@ func (s *Store) CheckFile() error {
 	return nil
 }
 
+// setWAL switches the database to WAL mode, which is recorded in the file.
+// Switching does not wait on busy_timeout, so when two processes open a fresh
+// index at once the loser retries for up to 10 s.
+func setWAL(db *sql.DB) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var mode string
+		err := db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&mode)
+		if err == nil && strings.EqualFold(mode, "wal") {
+			return nil
+		}
+		if err == nil {
+			err = fmt.Errorf("journal mode is %s", mode)
+		}
+		if (!strings.Contains(err.Error(), "locked") && !strings.Contains(err.Error(), "busy")) || time.Now().After(deadline) {
+			return fmt.Errorf("store: setting WAL mode: %w", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// init creates the schema and the vector table if missing. It runs in one
+// BEGIN IMMEDIATE transaction on one connection, so a second process opening
+// a fresh index waits on busy_timeout and then sees the finished tables
+// instead of racing to create them.
 func (s *Store) init() error {
-	if _, err := s.db.Exec(schema); err != nil {
-		return fmt.Errorf("store: schema: %w", err)
-	}
-	if err := s.migrate(); err != nil {
-		return fmt.Errorf("store: migrate: %w", err)
-	}
-	var n int
-	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name = 'vecs'`).Scan(&n); err != nil {
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
 		return err
 	}
-	if n > 0 {
-		return nil
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			conn.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+	if _, err := conn.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("store: schema: %w", err)
+	}
+	if err := migrate(ctx, conn); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	if err := createVecs(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// createVecs creates the vector table unless it exists. If another process
+// created it first (possible only if creation could not run inside the
+// transaction), the "already exists" error is checked against sqlite_master
+// and ignored.
+func createVecs(ctx context.Context, conn *sql.Conn) error {
+	exists := func() (bool, error) {
+		var n int
+		err := conn.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE name = 'vecs'`).Scan(&n)
+		return n > 0, err
+	}
+	if ok, err := exists(); err != nil || ok {
+		return err
 	}
 	// A flat index gives exact search, which is fast enough at notes scale and
 	// needs no training step.
-	_, err := s.db.Exec(`
+	_, err := conn.ExecContext(ctx, `
 		CREATE VIRTUAL TABLE vecs USING vec1(vector);
 		INSERT INTO vecs(cmd, vector) VALUES('rebuild', '{index:"flat", distance:"cos"}');`)
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		if ok, xerr := exists(); xerr == nil && ok {
+			return nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("store: creating vector table: %w", err)
 	}
@@ -149,8 +216,8 @@ func (s *Store) init() error {
 
 // migrate adds the files columns that indexes from older versions lack.
 // Their rows get NULL, which search treats as unknown.
-func (s *Store) migrate() error {
-	rows, err := s.db.Query(`SELECT name FROM pragma_table_info('files')`)
+func migrate(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM pragma_table_info('files')`)
 	if err != nil {
 		return err
 	}
@@ -169,7 +236,7 @@ func (s *Store) migrate() error {
 	}
 	for _, col := range []string{"mtime", "size"} {
 		if !have[col] {
-			if _, err := s.db.Exec(`ALTER TABLE files ADD COLUMN ` + col + ` INTEGER`); err != nil {
+			if _, err := conn.ExecContext(ctx, `ALTER TABLE files ADD COLUMN `+col+` INTEGER`); err != nil {
 				return err
 			}
 		}
@@ -180,17 +247,25 @@ func (s *Store) migrate() error {
 func (s *Store) Close() error { return s.db.Close() }
 
 // CheckModel records model on first use and returns ErrModelMismatch if the
-// index already holds vectors from a different one.
+// index already holds vectors from a different one. Only the writer calls it;
+// readers use MatchModel.
 func (s *Store) CheckModel(model string) error {
-	var have string
-	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'model'`).Scan(&have)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		_, err = s.db.Exec(`INSERT INTO meta(key, value) VALUES('model', ?)`, model)
+	// INSERT OR IGNORE, then compare: two processes recording at once both
+	// see the one value that won.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO meta(key, value) VALUES('model', ?)`, model); err != nil {
 		return err
-	case err != nil:
+	}
+	return s.MatchModel(model)
+}
+
+// MatchModel returns ErrModelMismatch if the index records a model other
+// than model. It never writes.
+func (s *Store) MatchModel(model string) error {
+	have, err := s.Model()
+	if err != nil {
 		return err
-	case have != model:
+	}
+	if have != "" && have != model {
 		return fmt.Errorf("%w (index: %s, configured: %s)", ErrModelMismatch, have, model)
 	}
 	return nil
@@ -222,13 +297,20 @@ func (s *Store) SetMeta(key, value string) error {
 // folder. An index with files but no recorded root (from the single-folder
 // version) is adopted for root; the next sync reconciles it.
 func (s *Store) CheckRoot(root string) error {
-	have, err := s.Meta("root")
-	switch {
-	case err != nil:
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO meta(key, value) VALUES('root', ?)`, root); err != nil {
 		return err
-	case have == "":
-		return s.SetMeta("root", root)
-	case have != root:
+	}
+	return s.MatchRoot(root)
+}
+
+// MatchRoot returns ErrRootMismatch if the index records a folder other than
+// root. An index with no recorded folder matches. It never writes.
+func (s *Store) MatchRoot(root string) error {
+	have, err := s.Meta("root")
+	if err != nil {
+		return err
+	}
+	if have != "" && have != root {
 		return fmt.Errorf("%w: index %s was built for %s, not %s; pass a different -db or delete it",
 			ErrRootMismatch, s.path, have, root)
 	}

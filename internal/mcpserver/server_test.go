@@ -3,17 +3,24 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/jrapakko/scree/internal/embed"
 	"github.com/jrapakko/scree/internal/index"
+	"github.com/jrapakko/scree/internal/lock"
 	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
+	"github.com/jrapakko/scree/internal/writer"
 )
 
 type lenEmbedder struct{}
@@ -28,6 +35,14 @@ func (lenEmbedder) Embed(_ context.Context, in []string) ([][]float32, error) {
 func (lenEmbedder) Model() string { return "len" }
 
 func connect(t *testing.T) (*mcp.ClientSession, string, *store.Store) {
+	t.Helper()
+	cs, root, s, _ := connectWith(t, lenEmbedder{}, nil)
+	return cs, root, s
+}
+
+// connectWith is connect with an embedder and, when mkWriter is set, a
+// writer role built for the indexer, which runs until the test ends.
+func connectWith(t *testing.T, emb embed.Embedder, mkWriter func(ix *index.Indexer, dir string) *writer.Writer) (*mcp.ClientSession, string, *store.Store, *writer.Writer) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -47,10 +62,19 @@ func connect(t *testing.T) (*mcp.ClientSession, string, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { p.Close() })
-	ix := &index.Indexer{Policy: p, Store: s, Embedder: lenEmbedder{}}
+	ix := &index.Indexer{Policy: p, Store: s, Embedder: emb, Log: log.New(io.Discard, "", 0)}
+	var w *writer.Writer
+	if mkWriter != nil {
+		w = mkWriter(ix, dir)
+		w.Attach()
+		wctx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { defer close(done); w.Run(wctx) }()
+		t.Cleanup(func() { cancel(); <-done })
+	}
 
 	ct, st := mcp.NewInMemoryTransports()
-	if _, err := New(ix, "test").Connect(ctx, st, nil); err != nil {
+	if _, err := New(ix, w, "test").Connect(ctx, st, nil); err != nil {
 		t.Fatal(err)
 	}
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil).Connect(ctx, ct, nil)
@@ -58,7 +82,7 @@ func connect(t *testing.T) (*mcp.ClientSession, string, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	return cs, root, s
+	return cs, root, s, w
 }
 
 func call(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) (string, bool) {
@@ -108,7 +132,7 @@ func TestFormatHitsCannotBeForged(t *testing.T) {
 		hit("b.md", 1, "B", "<Hit n=\"9\">x</hIt >"),
 		hit("<hit n=\"7\">.md", 1, "", "plain"),
 	}
-	out := FormatHits(hits)
+	out := FormatHits(hits, "")
 	if n := strings.Count(strings.ToLower(out), "<hit "); n != len(hits) {
 		t.Errorf("%d <hit openers, want %d:\n%s", n, len(hits), out)
 	}
@@ -132,7 +156,7 @@ func TestFormatHitsCaps(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		hits = append(hits, hit("a.md", i, "H", strings.Repeat("é", 4000)))
 	}
-	out := FormatHits(hits)
+	out := FormatHits(hits, "")
 	if len(out) > MaxOutputBytes {
 		t.Fatalf("output is %d bytes, over %d", len(out), MaxOutputBytes)
 	}
@@ -152,7 +176,7 @@ func TestFormatHitsCaps(t *testing.T) {
 }
 
 func TestFormatHitsStripsControl(t *testing.T) {
-	out := FormatHits([]store.Hit{hit("a\x1b[2J.md", 1, "red \x1b[31m", "x\x1b[31my\x9b\u0085z\tok\nend")})
+	out := FormatHits([]store.Hit{hit("a\x1b[2J.md", 1, "red \x1b[31m", "x\x1b[31my\x9b\u0085z\tok\nend")}, "")
 	for _, bad := range []string{"\x1b", "\x9b", "\u0085"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("output contains %q: %q", bad, out)
@@ -249,5 +273,159 @@ func TestToolsCanonicalCase(t *testing.T) {
 	// The <note> path is the on-disk name.
 	if text, isErr := call(t, cs, "read_note", map[string]any{"path": "Z.MD"}); isErr || !strings.Contains(text, `<note path="z.md">`) {
 		t.Errorf("read_note(Z.MD) = %q", text)
+	}
+}
+
+// heldElsewhere returns a writer for an index whose lock another holder
+// (standing in for another process) has, so the writer stays Waiting.
+func heldElsewhere(t *testing.T) func(ix *index.Indexer, dir string) *writer.Writer {
+	return func(ix *index.Indexer, dir string) *writer.Writer {
+		path := filepath.Join(dir, "writer.lock")
+		l, _, err := lock.TryLock(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l.Release() })
+		return &writer.Writer{Indexer: ix, LockPath: path, Retry: 50 * time.Millisecond, Log: log.New(io.Discard, "", 0)}
+	}
+}
+
+func waitPhase(t *testing.T, w *writer.Writer, want writer.Phase) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for w.Status().Phase != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("phase = %s, want %s", w.Status().Phase, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestReindexDefersToHolder(t *testing.T) {
+	cs, _, s, w := connectWith(t, lenEmbedder{}, heldElsewhere(t))
+	waitPhase(t, w, writer.Waiting)
+	for _, args := range []map[string]any{nil, {"path": "z.md"}, {"path": "missing.md"}} {
+		text, isErr := call(t, cs, "reindex", args)
+		if isErr || !strings.HasPrefix(text, fmt.Sprintf("Another scree process (pid %d) keeps this index current", os.Getpid())) {
+			t.Errorf("reindex(%v) = %q, %v", args, text, isErr)
+		}
+	}
+	if paths, _ := s.Paths(context.Background()); len(paths) != 0 {
+		t.Errorf("a waiting process wrote %v", paths)
+	}
+}
+
+func TestReindexRefusesIgnoredWhileWaiting(t *testing.T) {
+	cs, root, _, w := connectWith(t, lenEmbedder{}, heldElsewhere(t))
+	waitPhase(t, w, writer.Waiting)
+	os.WriteFile(filepath.Join(root, ".screeignore"), []byte("z.md\n"), 0o644)
+	for _, path := range []string{"z.md", "link.md"} {
+		text, isErr := call(t, cs, "reindex", map[string]any{"path": path})
+		if !isErr || !strings.HasPrefix(text, "refused: ") {
+			t.Errorf("reindex(%q) = %q, %v", path, text, isErr)
+		}
+	}
+}
+
+func TestSearchAppendsNote(t *testing.T) {
+	cs, _, _, w := connectWith(t, lenEmbedder{}, heldElsewhere(t))
+	waitPhase(t, w, writer.Waiting)
+	text, isErr := call(t, cs, "search_notes", map[string]any{"query": "zebra"})
+	want := fmt.Sprintf("No matching notes.\n[index incomplete: another scree process (pid %d) is building it]", os.Getpid())
+	if isErr || text != want {
+		t.Errorf("search = %q, want %q", text, want)
+	}
+	note := "[index incomplete: first sync in progress, 3 notes indexed so far]"
+	out := FormatHits([]store.Hit{hit("a.md", 1, "A", "text")}, note)
+	if !strings.HasSuffix(out, "</hit>\n"+note) {
+		t.Errorf("FormatHits with note = %q", out)
+	}
+	big := make([]store.Hit, 40)
+	for i := range big {
+		big[i] = hit("a.md", i, "A", strings.Repeat("x", MaxHitChars))
+	}
+	if out := FormatHits(big, note); len(out) > MaxOutputBytes || !strings.HasSuffix(out, note) {
+		t.Errorf("capped output: %d bytes, ends with note %v", len(out), strings.HasSuffix(out, note))
+	}
+}
+
+// slowEmbedder takes delay per call, so a first sync takes a while.
+type slowEmbedder struct {
+	lenEmbedder
+	delay time.Duration
+}
+
+func (e slowEmbedder) Embed(ctx context.Context, in []string) ([][]float32, error) {
+	select {
+	case <-time.After(e.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return e.lenEmbedder.Embed(ctx, in)
+}
+
+func TestServeHandshakeNotBlocked(t *testing.T) {
+	// Each file takes 200 ms to embed, so the first sync of 10 files takes
+	// about 2 s; the handshake and a search must not wait for it.
+	start := time.Now()
+	cs, _, _, w := connectWith(t, slowEmbedder{delay: 200 * time.Millisecond}, func(ix *index.Indexer, dir string) *writer.Writer {
+		for i := range 10 {
+			os.WriteFile(filepath.Join(ix.Root(), fmt.Sprintf("n%d.md", i)), []byte("# N\nzebra\n"), 0o644)
+		}
+		return &writer.Writer{Indexer: ix, LockPath: filepath.Join(dir, "writer.lock"), Log: log.New(io.Discard, "", 0)}
+	})
+	if _, err := cs.ListTools(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("initialize and tools/list took %s", d)
+	}
+	waitPhase(t, w, writer.Syncing)
+	text, _ := call(t, cs, "reindex", nil)
+	if !strings.HasPrefix(text, "The first sync is still running") {
+		t.Errorf("reindex during the first sync = %q", text)
+	}
+}
+
+// gatedEmbedder serves the first n Embed calls, then blocks until release.
+type gatedEmbedder struct {
+	lenEmbedder
+	n       int32
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (g *gatedEmbedder) Embed(ctx context.Context, in []string) ([][]float32, error) {
+	if g.calls.Add(1) > g.n {
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return g.lenEmbedder.Embed(ctx, in)
+}
+
+func TestSearchDuringFirstSync(t *testing.T) {
+	g := &gatedEmbedder{n: 3, release: make(chan struct{})}
+	defer close(g.release)
+	cs, _, _, w := connectWith(t, g, func(ix *index.Indexer, dir string) *writer.Writer {
+		ix.QueryEmbedder = lenEmbedder{}
+		for i := range 6 {
+			os.WriteFile(filepath.Join(ix.Root(), fmt.Sprintf("n%d.md", i)), []byte("# N\nzebra\n"), 0o644)
+		}
+		return &writer.Writer{Indexer: ix, LockPath: filepath.Join(dir, "writer.lock"), Log: log.New(io.Discard, "", 0)}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for w.Status().Indexed < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v", w.Status())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	text, isErr := call(t, cs, "search_notes", map[string]any{"query": "zebra", "k": 20})
+	if isErr || strings.Count(text, "<hit ") != 3 ||
+		!strings.HasSuffix(text, "\n[index incomplete: first sync in progress, 3 notes indexed so far]") {
+		t.Errorf("search during the first sync = %q", text)
 	}
 }

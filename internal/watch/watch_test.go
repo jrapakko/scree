@@ -451,3 +451,108 @@ func TestWatchIncludeHiddenEdit(t *testing.T) {
 	writeFile(t, filepath.Join(root, ".foo", "b.md"), "# B\nx\n")
 	waitFor(t, ".foo/b.md indexed", func() bool { return slices.Equal(paths(), []string{".foo/a.md", ".foo/b.md"}) })
 }
+
+// gateEmbedder blocks every Embed while hold is set, until release.
+type gateEmbedder struct {
+	constEmbedder
+	hold    atomic.Bool
+	waiting atomic.Int32
+	open    chan struct{}
+}
+
+func newGate() *gateEmbedder { return &gateEmbedder{open: make(chan struct{})} }
+
+func (g *gateEmbedder) Embed(ctx context.Context, in []string) ([][]float32, error) {
+	if g.hold.Load() {
+		g.waiting.Add(1)
+		select {
+		case <-g.open:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return g.constEmbedder.Embed(ctx, in)
+}
+
+func (g *gateEmbedder) release() {
+	g.hold.Store(false)
+	close(g.open)
+}
+
+func TestOverflowTriggersSync(t *testing.T) {
+	errInject = make(chan error, 1)
+	var suppress atomic.Bool
+	suppressEvents = suppress.Load
+	t.Cleanup(func() { errInject, suppressEvents = nil, nil })
+	_, root, paths := start(t, func(_, root string) {
+		os.WriteFile(filepath.Join(root, "a.md"), []byte("# A\nx\n"), 0o644)
+		os.WriteFile(filepath.Join(root, "b.md"), []byte("# B\nx\n"), 0o644)
+	})
+	if got := paths(); len(got) != 2 {
+		t.Fatalf("initial paths = %v", got)
+	}
+	// The kernel "loses" these events.
+	suppress.Store(true)
+	os.Remove(filepath.Join(root, "a.md"))
+	os.WriteFile(filepath.Join(root, "c.md"), []byte("# C\nx\n"), 0o644)
+	time.Sleep(Debounce + 500*time.Millisecond)
+	if got := paths(); len(got) != 2 || got[0] != "a.md" {
+		t.Fatalf("events were not suppressed: %v", got)
+	}
+	suppress.Store(false)
+	errInject <- fsnotify.ErrEventOverflow
+	waitFor(t, "resync after overflow", func() bool { return slices.Equal(paths(), []string{"b.md", "c.md"}) })
+}
+
+func TestEventsReadWhileEmbedding(t *testing.T) {
+	var events atomic.Int64
+	onEvent = func() { events.Add(1) }
+	t.Cleanup(func() { onEvent = nil })
+	g := newGate()
+	_, root, paths := startWith(t, nil, func(ix *index.Indexer) { ix.Embedder = g })
+	g.hold.Store(true)
+	os.WriteFile(filepath.Join(root, "first.md"), []byte("# F\nx\n"), 0o644)
+	waitFor(t, "worker blocked in Embed", func() bool { return g.waiting.Load() > 0 })
+	before := events.Load()
+	for i := range 500 {
+		p := filepath.Join(root, fmt.Sprintf("n%03d.md", i))
+		os.WriteFile(p, []byte("# N\nx\n"), 0o644)
+		if i%2 == 1 {
+			os.Remove(p)
+		}
+	}
+	// The event goroutine keeps reading while the worker is stuck.
+	waitFor(t, "events read during the embed", func() bool { return events.Load() >= before+500 })
+	g.release()
+	var want []string
+	want = append(want, "first.md")
+	for i := 0; i < 500; i += 2 {
+		want = append(want, fmt.Sprintf("n%03d.md", i))
+	}
+	slices.Sort(want)
+	deadline := time.Now().Add(30 * time.Second)
+	for !slices.Equal(paths(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("index has %d paths, want %d", len(paths()), len(want))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func TestIgnoreEditDuringSlowEmbed(t *testing.T) {
+	g := newGate()
+	_, root, paths := startWith(t, func(_, root string) {
+		os.MkdirAll(filepath.Join(root, "journal"), 0o755)
+		os.WriteFile(filepath.Join(root, "journal", "day.md"), []byte("# D\nx\n"), 0o644)
+	}, func(ix *index.Indexer) { ix.Embedder = g })
+	if got := paths(); !slices.Equal(got, []string{"journal/day.md"}) {
+		t.Fatalf("initial paths = %v", got)
+	}
+	g.hold.Store(true)
+	os.WriteFile(filepath.Join(root, "slow.md"), []byte("# S\nx\n"), 0o644)
+	waitFor(t, "worker blocked in Embed", func() bool { return g.waiting.Load() > 0 })
+	os.WriteFile(filepath.Join(root, ".screeignore"), []byte("journal/\n"), 0o644)
+	time.Sleep(Debounce + 500*time.Millisecond)
+	g.release()
+	waitFor(t, "journal removed and slow.md indexed", func() bool { return slices.Equal(paths(), []string{"slow.md"}) })
+}

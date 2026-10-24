@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
@@ -23,11 +24,12 @@ import (
 
 	"github.com/jrapakko/scree/internal/embed"
 	"github.com/jrapakko/scree/internal/index"
+	"github.com/jrapakko/scree/internal/lock"
 	"github.com/jrapakko/scree/internal/mcpserver"
 	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
 	"github.com/jrapakko/scree/internal/textsafe"
-	"github.com/jrapakko/scree/internal/watch"
+	"github.com/jrapakko/scree/internal/writer"
 )
 
 var version = "dev"
@@ -158,8 +160,11 @@ func zdrSetting() (bool, error) {
 	return b, nil
 }
 
-// open builds an indexer from cfg. checkModel guards against mixing vectors
-// from different models. Release it with closeIndexer.
+// open builds an indexer from cfg. It only reads the index: a recorded folder
+// or model that differs is an error (checkModel guards against mixing
+// vectors from different models), and recording them is left to the
+// process that holds the writer lock (claim). For doctor, a missing index is
+// not created, and the Indexer's Store is nil. Release it with closeIndexer.
 func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if os.Getenv("SCREE_NOTES") != "" && !cfg.doctor {
 		log.Print(notesWarning)
@@ -187,43 +192,73 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if !cfg.dbExplicit {
 		cfg.db = filepath.Join(indexDir(p.Root()), "index.db")
 	}
-	s, err := store.Open(cfg.db)
-	if err != nil {
-		p.Close()
-		return nil, err
-	}
-	if err := s.CheckRoot(p.Root()); err != nil {
-		s.Close()
-		p.Close()
-		return nil, err
-	}
-	if !cfg.dbExplicit {
-		if err := writeRootFile(filepath.Dir(cfg.db), p.Root()); err != nil {
-			s.Close()
-			p.Close()
-			return nil, fmt.Errorf("index %s: %w", cfg.db, err)
-		}
-	}
 	e := embed.New(cfg.url, cfg.apiKey, cfg.model, cfg.dims)
 	e.ZDR = cfg.zdr
 	// Queries fail fast: someone is waiting on the answer.
 	q := *e
 	q.Timeout, q.MaxAttempts = 10*time.Second, 2
-	if checkModel {
-		if err := s.CheckModel(e.Model()); err != nil {
-			s.Close()
-			p.Close()
-			return nil, err
+	ix := &index.Indexer{Policy: p, Embedder: e, QueryEmbedder: &q, Log: log.Default()}
+	if cfg.doctor {
+		if _, err := os.Stat(cfg.db); errors.Is(err, fs.ErrNotExist) {
+			return ix, nil
 		}
 	}
-	return &index.Indexer{Policy: p, Store: s, Embedder: e, QueryEmbedder: &q, Log: log.Default()}, nil
+	s, err := store.Open(cfg.db)
+	if err != nil {
+		p.Close()
+		return nil, err
+	}
+	ix.Store = s
+	err = s.MatchRoot(p.Root())
+	if err == nil && checkModel {
+		err = s.MatchModel(e.Model())
+	}
+	if err != nil {
+		closeIndexer(ix)
+		return nil, err
+	}
+	return ix, nil
+}
+
+// lockPath is the writer lock beside the index file.
+func lockPath(cfg *config) string { return filepath.Join(filepath.Dir(cfg.db), "writer.lock") }
+
+// claim does the writes only the lock holder may do: it records the folder
+// (in the index and, for the default location, in the root file beside it)
+// and, with model set, the embedding model.
+func claim(cfg *config, ix *index.Indexer, model bool) error {
+	if err := ix.Store.CheckRoot(ix.Root()); err != nil {
+		return err
+	}
+	if !cfg.dbExplicit {
+		if err := writeRootFile(filepath.Dir(cfg.db), ix.Root()); err != nil {
+			return fmt.Errorf("index %s: %w", cfg.db, err)
+		}
+	}
+	if model {
+		return ix.Store.CheckModel(ix.Embedder.Model())
+	}
+	return nil
+}
+
+// newWriter builds the writer role for serve and watch.
+func newWriter(cfg *config, ix *index.Indexer) *writer.Writer {
+	w := &writer.Writer{
+		Indexer:   ix,
+		LockPath:  lockPath(cfg),
+		OnAcquire: func(context.Context) error { return claim(cfg, ix, true) },
+	}
+	w.Attach()
+	return w
 }
 
 // notesWarning is shown when the environment still sets SCREE_NOTES.
 const notesWarning = "SCREE_NOTES is no longer read; remove it from the settings file (the folder is now -notes or the git root)"
 
 func closeIndexer(ix *index.Indexer) {
-	ix.Store.Close()
+	if ix.Store != nil {
+		ix.Store.Close()
+	}
 	ix.Policy.Close()
 }
 
@@ -235,15 +270,9 @@ func runWatch(ctx context.Context, args []string) error {
 		return err
 	}
 	defer closeIndexer(ix)
-	log.Printf("syncing %s", ix.Root())
-	st, err := ix.Sync(ctx)
-	if err != nil {
-		return err
-	}
-	log.Printf("sync done: %d notes, %d indexed, %d removed, %d failed, %d deferred",
-		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
-	log.Printf("watching %s", ix.Root())
-	return watch.Run(ctx, ix)
+	// Waits for the lock if another process holds it, then syncs and
+	// watches. An error exits non-zero, so systemd or Docker restarts it.
+	return newWriter(&cfg, ix).Run(ctx)
 }
 
 func runServe(ctx context.Context, args []string) error {
@@ -266,7 +295,23 @@ func runServe(ctx context.Context, args []string) error {
 	}
 	defer closeIndexer(ix)
 	log.Printf("serving %s (index %s)", ix.Root(), cfg.db)
-	srv := mcpserver.New(ix, version)
+	// The writer role runs in the background, so the MCP handshake and
+	// searches never wait for the lock or the first sync. It stops before
+	// the index is closed.
+	w := newWriter(&cfg, ix)
+	wctx, stopWriter := context.WithCancel(ctx)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		if err := w.Run(wctx); err != nil {
+			log.Printf("writer: %v; serving what is indexed", err)
+		}
+	}()
+	defer func() {
+		stopWriter()
+		<-writerDone
+	}()
+	srv := mcpserver.New(ix, w, version)
 	if *addr == "" {
 		return srv.Run(ctx, &mcp.StdioTransport{})
 	}
@@ -303,7 +348,7 @@ func runSearch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(mcpserver.FormatHits(hits))
+	fmt.Println(mcpserver.FormatHits(hits, ""))
 	return nil
 }
 
@@ -317,14 +362,26 @@ func runReindex(ctx context.Context, args []string) error {
 		return err
 	}
 	defer closeIndexer(ix)
+	l, pid, err := lock.TryLock(lockPath(&cfg))
+	if errors.Is(err, lock.ErrHeld) {
+		if *all {
+			return fmt.Errorf("index is in use by pid %d (a Claude Code session or scree watch); close it, then run reindex -all", pid)
+		}
+		fmt.Printf("pid %d keeps this index current; nothing to do\n", pid)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer l.Release()
+	if err := claim(&cfg, ix, !*all); err != nil {
+		return err
+	}
 	if *all {
 		if err := ix.Store.Reset(ctx); err != nil {
 			return err
 		}
-		if err := ix.Store.CheckModel(ix.Embedder.Model()); err != nil {
-			return err
-		}
-		if err := ix.Store.CheckRoot(ix.Root()); err != nil {
+		if err := claim(&cfg, ix, true); err != nil {
 			return err
 		}
 	}
@@ -400,11 +457,25 @@ func runDoctor(ctx context.Context, args []string) error {
 	report(true, "folder %s (from %s)", ix.Root(), cfg.source)
 	doctorScan(ctx, ix, cfg.gitignore, *verbose, report, warn)
 
-	st, err := ix.Store.Stats(ctx)
-	report(err == nil, "index %s: %d notes, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
-
-	have, _ := ix.Store.Model()
+	// doctor only reads: it never creates the index or records anything in
+	// it; the process holding the writer lock does that.
 	want := ix.Embedder.Model()
+	have := ""
+	if ix.Store == nil {
+		report(true, "index %s: not created yet (the first serve, watch or reindex builds it)", cfg.db)
+	} else {
+		st, err := ix.Store.Stats(ctx)
+		report(err == nil, "index %s: %d notes, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
+		have, _ = ix.Store.Model()
+	}
+	switch held, pid, err := lock.Probe(lockPath(&cfg)); {
+	case err != nil:
+		warn("writer lock: %v", err)
+	case held:
+		report(true, "writer: pid %d keeps this index current", pid)
+	default:
+		report(true, "writer: none running (a Claude Code session or scree watch takes the role)")
+	}
 	switch {
 	case have == "":
 		report(true, "model %s (index empty)", want)

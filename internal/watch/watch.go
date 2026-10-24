@@ -28,13 +28,41 @@ const Debounce = 1500 * time.Millisecond
 // file are still the ones it started with. A variable so tests can shorten it.
 var HealthInterval = 10 * time.Second
 
-// onWatcher, when set by a test, receives the watcher Run creates.
-var onWatcher func(*fsnotify.Watcher)
+// Test hooks; nil outside tests.
+var (
+	// onWatcher receives the watcher Run creates.
+	onWatcher func(*fsnotify.Watcher)
+	// errInject delivers errors to Run as if from the watcher.
+	errInject chan error
+	// suppressEvents, when it returns true, makes Run drop every file event,
+	// standing in for events the kernel lost.
+	suppressEvents func() bool
+	// onEvent is called for each file event Run reads.
+	onEvent func()
+)
+
+// Options configures RunOptions.
+type Options struct {
+	// Stale delivers store keys to re-check, such as paths a search found
+	// refused or missing. They are handled like file events.
+	Stale <-chan []string
+}
 
 // Run watches the notes folder until ctx is done. It does not do an initial
 // sync; call ix.Sync first. It returns an error if the notes folder or the
 // index file is removed or replaced, so a supervisor can restart it.
 func Run(ctx context.Context, ix *index.Indexer) error {
+	return RunOptions(ctx, ix, Options{})
+}
+
+// RunOptions is Run with options.
+//
+// File events are read on one goroutine, which debounces them into a set of
+// dirty paths and never waits on the store or the embedding API. A single
+// worker goroutine does every write: it handles dirty paths one at a time and
+// runs a full Sync when an ignore file changed, when the kernel's event queue
+// overflowed (then it also rebuilds the watches), or when an API outage ends.
+func RunOptions(ctx context.Context, ix *index.Indexer, o Options) error {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -49,13 +77,31 @@ func Run(ctx context.Context, ix *index.Indexer) error {
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	q := &workQueue{dirty: map[string]struct{}{}, wake: make(chan struct{}, 1)}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		worker(ctx, w, ix, q)
+	}()
+	defer func() {
+		// Stop the worker and wait, so nothing writes after Run returns.
+		cancel()
+		wg.Wait()
+	}()
+
 	var (
 		mu      sync.Mutex
 		pending = map[string]*time.Timer{}
-		ready   = make(chan string, 256)
-		stopped = make(chan struct{})
 	)
-	defer close(stopped)
+	defer func() {
+		mu.Lock()
+		for _, t := range pending {
+			t.Stop()
+		}
+		mu.Unlock()
+	}()
 	queue := func(abs string) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -67,36 +113,8 @@ func Run(ctx context.Context, ix *index.Indexer) error {
 			mu.Lock()
 			delete(pending, abs)
 			mu.Unlock()
-			select {
-			case ready <- abs:
-			case <-ctx.Done():
-			case <-stopped:
-			}
+			q.add(abs)
 		})
-	}
-
-	// resync runs a Sync once an API pause ends, which picks up every note
-	// deferred during the outage because its stored hash is stale.
-	var (
-		resync  *time.Timer
-		resyncC <-chan time.Time
-	)
-	armResync := func() {
-		d := time.Until(ix.PausedUntil()) + 100*time.Millisecond
-		if resync == nil {
-			resync = time.NewTimer(d)
-		} else {
-			resync.Reset(d)
-		}
-		resyncC = resync.C
-	}
-	defer func() {
-		if resync != nil {
-			resync.Stop()
-		}
-	}()
-	if ix.PausedUntil().After(time.Now()) {
-		armResync()
 	}
 
 	health := time.NewTicker(HealthInterval)
@@ -113,26 +131,26 @@ func Run(ctx context.Context, ix *index.Indexer) error {
 			if err := ix.Store.CheckFile(); err != nil {
 				return err
 			}
-		case <-resyncC:
-			resyncC = nil
-			st, err := ix.Sync(ctx)
-			if err != nil {
-				ix.Log.Printf("error: %v", err)
-			} else {
-				ix.Log.Printf("resync after API outage: %d indexed, %d removed, %d failed, %d deferred",
-					st.Indexed, st.Removed, st.Failed, st.Deferred)
+		case paths := <-o.Stale:
+			for _, rel := range paths {
+				q.add(filepath.Join(root, filepath.FromSlash(rel)))
 			}
-			if st.Deferred > 0 || errors.Is(err, embed.ErrUnavailable) {
-				armResync()
-			}
+		case err := <-errInject:
+			watchError(ix, q, err)
 		case err, ok := <-w.Errors:
 			if !ok {
 				return nil
 			}
-			ix.Log.Printf("watch: %v", err)
+			watchError(ix, q, err)
 		case ev, ok := <-w.Events:
 			if !ok {
 				return nil
+			}
+			if onEvent != nil {
+				onEvent()
+			}
+			if suppressEvents != nil && suppressEvents() {
+				continue
 			}
 			if ev.Has(fsnotify.Chmod) && !ev.Has(fsnotify.Write) {
 				continue
@@ -159,13 +177,160 @@ func Run(ctx context.Context, ix *index.Indexer) error {
 				}
 			}
 			queue(ev.Name)
-		case abs := <-ready:
-			// One path at a time, on this goroutine, so there is one writer.
-			if handle(ctx, w, ix, abs) && resyncC == nil {
+		}
+	}
+}
+
+// watchError handles an error from the watcher. An event queue overflow
+// means events were lost, so the worker resyncs and rebuilds the watches.
+func watchError(ix *index.Indexer, q *workQueue, err error) {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		ix.Log.Printf("watch: event queue overflowed; resyncing")
+		q.requestSync(true)
+		return
+	}
+	ix.Log.Printf("watch: %v", err)
+}
+
+// workQueue hands work from the event goroutine to the worker.
+type workQueue struct {
+	mu       sync.Mutex
+	dirty    map[string]struct{} // absolute paths to handle
+	needSync bool
+	rebuild  bool          // rebuild the watches after the sync
+	wake     chan struct{} // buffer 1: there is work
+}
+
+func (q *workQueue) add(abs string) {
+	q.mu.Lock()
+	q.dirty[abs] = struct{}{}
+	q.mu.Unlock()
+	q.signal()
+}
+
+func (q *workQueue) requestSync(rebuild bool) {
+	q.mu.Lock()
+	q.needSync = true
+	q.rebuild = q.rebuild || rebuild
+	q.mu.Unlock()
+	q.signal()
+}
+
+func (q *workQueue) signal() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+// next takes one piece of work: a sync (which clears every dirty path, since
+// it covers them) or one dirty path. ok is false when there is none.
+func (q *workQueue) next() (doSync, rebuild bool, abs string, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.needSync {
+		rebuild = q.rebuild
+		q.needSync, q.rebuild = false, false
+		clear(q.dirty)
+		return true, rebuild, "", true
+	}
+	for p := range q.dirty {
+		delete(q.dirty, p)
+		return false, false, p, true
+	}
+	return false, false, "", false
+}
+
+// worker is the only goroutine that writes to the index while Run runs.
+func worker(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, q *workQueue) {
+	// resync runs a Sync once an API pause ends, which picks up every note
+	// deferred during the outage because its stored hash is stale.
+	var (
+		resync  *time.Timer
+		resyncC <-chan time.Time
+	)
+	armResync := func() {
+		if resyncC != nil {
+			return
+		}
+		d := time.Until(ix.PausedUntil()) + 100*time.Millisecond
+		if resync == nil {
+			resync = time.NewTimer(d)
+		} else {
+			resync.Reset(d)
+		}
+		resyncC = resync.C
+	}
+	defer func() {
+		if resync != nil {
+			resync.Stop()
+		}
+	}()
+	if ix.PausedUntil().After(time.Now()) {
+		armResync()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-resyncC:
+			resyncC = nil
+			q.requestSync(false)
+		case <-q.wake:
+		}
+		for ctx.Err() == nil {
+			doSync, rebuild, abs, ok := q.next()
+			if !ok {
+				break
+			}
+			if !doSync {
+				if rel, err := ix.Rel(abs); err == nil && isIgnoreFile(rel) {
+					// The rules changed: watch newly included folders and
+					// drop newly ignored ones, then sync, which also picks up
+					// anything created while the watches were changing.
+					if err := syncWatches(w, ix); err != nil {
+						ix.Log.Printf("watch: %v", err)
+					}
+					if runSync(ctx, ix, rel+" changed") {
+						armResync()
+					}
+					continue
+				}
+				if handle(ctx, ix, abs) {
+					armResync()
+				}
+				continue
+			}
+			what := "resync"
+			if rebuild {
+				what = "resync after event overflow"
+			}
+			deferred := runSync(ctx, ix, what)
+			if rebuild {
+				if err := syncWatches(w, ix); err != nil {
+					ix.Log.Printf("watch: %v", err)
+				}
+			}
+			if deferred {
 				armResync()
 			}
 		}
 	}
+}
+
+// runSync runs a Sync and logs it. It reports whether notes were deferred
+// because the embedding API is unavailable.
+func runSync(ctx context.Context, ix *index.Indexer, what string) (deferred bool) {
+	st, err := ix.Sync(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			ix.Log.Printf("error: %v", err)
+		}
+		return errors.Is(err, embed.ErrUnavailable)
+	}
+	ix.Log.Printf("%s: %d notes, %d indexed, %d removed, %d failed, %d deferred",
+		what, st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
+	return st.Deferred > 0
 }
 
 // dropEvent reports whether an event for abs can be ignored without a
@@ -194,7 +359,7 @@ func isIgnoreFile(rel string) bool {
 
 // handle indexes or removes one changed path. It reports whether a note was
 // deferred because the embedding API is unavailable.
-func handle(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, abs string) (deferred bool) {
+func handle(ctx context.Context, ix *index.Indexer, abs string) (deferred bool) {
 	rel, err := ix.Rel(abs)
 	if err != nil {
 		return false
@@ -203,22 +368,6 @@ func handle(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, abs str
 	// spelling, which is how it was stored.
 	if canon, err := ix.Policy.Canonical(rel); err == nil {
 		rel = canon
-	}
-	if isIgnoreFile(rel) {
-		// The rules changed: watch newly included folders and drop newly
-		// ignored ones, then sync, which also picks up anything created
-		// while the watches were changing.
-		if err := syncWatches(w, ix); err != nil {
-			ix.Log.Printf("watch: %v", err)
-		}
-		st, err := ix.Sync(ctx)
-		if err != nil {
-			ix.Log.Printf("error: %v", err)
-			return false
-		}
-		ix.Log.Printf("%s changed: %d notes, %d indexed, %d removed, %d failed, %d deferred",
-			rel, st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
-		return st.Deferred > 0
 	}
 	fi, err := os.Lstat(abs)
 	switch {

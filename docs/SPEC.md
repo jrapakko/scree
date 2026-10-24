@@ -12,9 +12,11 @@ The markdown stays the source of truth. The index is derived from it and can be 
 
 One Go process containing:
 
-- **Watcher + indexer** (fsnotify, hash, chunk): reads markdown notes, calls the embedding API, writes to the index.
+- **Writer** (fsnotify, hash, chunk): reads the folder's markdown, calls the embedding API, writes to the index. In each process that runs it (`serve` or `watch`), it first takes the index's lock file; only the holder writes.
 - **vec1 index** (SQLite): chunks + vectors, on disk.
 - **MCP search server** (`search_notes` tool): reads the index, embeds each query through the same API, serves Claude Code over stdio or HTTP.
+
+Each indexed folder has its own index, and the processes that serve it share it: one writes, the rest read.
 
 External: markdown notes (source of truth), embedding API (OpenRouter), Claude Code, and a human view (editor or browser) that reads the notes directly.
 
@@ -28,9 +30,9 @@ External: markdown notes (source of truth), embedding API (OpenRouter), Claude C
 | Embeddings | API through OpenRouter | No local model. Candidates: pplx-embed-v1-0.6b (~$0.004/M tokens), text-embedding-3-small (~$0.02/M). Test both on real notes. Requests ask for zero-data-retention endpoints with `data_collection: deny` by default (`SCREE_ZDR=0` turns this off); a model with no such endpoint fails with a clear error. Timeouts: 10 s per query with no retry on timeout; 30 s per indexing attempt, and after an outage indexing pauses for 30 s, doubling up to 5 min, then resyncs. |
 | MCP | Official Go MCP SDK | stdio for Claude Code; optional HTTP. |
 | Chunking | By heading | Each chunk keeps its file path and heading trail. |
-| Running it | Native background service | launchd or a systemd user unit. A Dockerfile can ship for reproducibility. |
+| Running it | Per session, plus an optional service | `scree serve` per Claude Code session keeps its own folder current. A systemd user unit running `scree watch` covers a folder outside any session. A Dockerfile ships for reproducibility. |
 
-Library choices are starting points. Check each project's current docs before committing. One writer plus a separate reader process under WAL was tested with vec1 and held up.
+Library choices are starting points. Check each project's current docs before committing. One writer plus several reader processes under WAL was tested with vec1 and held up.
 
 ## How indexing works
 
@@ -41,9 +43,9 @@ Library choices are starting points. Check each project's current docs before co
 5. Split by heading, embed the chunks, then delete the file's old rows and insert the new ones. Within a section, a chunk is closed at a blank line once it reaches about 2500 characters, and it is hard-capped at 3500, even mid-line or inside a code fence; an overlong line is cut on a character boundary. Each heading is capped at 120 characters.
 6. On delete or rename, remove the old path's rows.
 
-The watcher re-adds its watches after a folder is renamed, so edits under the new name are seen. It never watches a folder the policy skips (hidden, gitignored, a nested repository, or excluded by `.screeignore`), and it re-adds its watches after any ignore file changes. It exits with an error when the index file or the notes folder is removed or replaced, and relies on its supervisor (systemd, Docker) to restart it.
+The watcher re-adds its watches after a folder is renamed, so edits under the new name are seen. It never watches a folder the policy skips (hidden, gitignored, a nested repository, or excluded by `.screeignore`), and it re-adds its watches after any ignore file changes. It exits with an error when the index file or the notes folder is removed or replaced. `scree watch` then exits, so its supervisor (systemd, Docker) restarts it. In `serve`, the writer stops, releases the lock and reports the error in search results, while searches continue on what is indexed. File events are read on their own goroutine and never wait for the embedding API; if the kernel's event queue still overflows, the writer resyncs.
 
-One process writes to the index. Files are indexed one at a time, so a large re-index cannot spike memory.
+One process writes to each index: whichever `scree serve` or `scree watch` holds `writer.lock` next to it (flock on Linux, macOS and BSD; `LockFileEx` on Windows). The others only read, and they retry the lock every 5 s, so when the writing session ends another takes over and syncs first. `serve` starts this in the background: the MCP handshake and searches are never blocked, and while the first sync of a new index runs, search results end with a note saying the index is incomplete. Files are indexed one at a time, so a large re-index cannot spike memory. `reindex -all` refuses to run while another process holds the lock.
 
 A file is opened only after checking that what was opened is the regular file the policy checked; a file swapped for a symlink during a sync is skipped and retried.
 

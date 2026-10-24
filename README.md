@@ -212,10 +212,10 @@ The `watch` and `serve` containers share the `scree-data` volume. SQLite's WAL m
 
 ## How it works
 
-- `scree watch` is the one writer. It syncs on startup by content hash, then watches with fsnotify, waits 1.5 s after the last event for a path, and re-embeds only files whose hash changed.
-- `scree serve` reads the same file. SQLite's WAL mode lets it search while the watcher writes. Its `reindex` tool also writes, and SQLite serializes it with the watcher.
+- Each folder has its own index. Whichever `scree serve` (one per Claude Code session) or `scree watch` holds the index's lock file is its one writer: it syncs on startup by content hash, then watches with fsnotify, waits 1.5 s after the last event for a path, and re-embeds only files whose hash changed. Other sessions in the same repo only read, and take over when the writer exits.
+- The first sync runs in the background, so Claude Code connects at once; until it finishes, search results say the index is incomplete. SQLite's WAL mode lets readers search while the writer writes.
 - Search waits at most 10 s for the API (2 attempts). Indexing waits up to 30 s per attempt (3 attempts). After an API outage, indexing pauses for 30 s, doubling up to 5 min, and then resyncs, so notes changed during the outage are picked up without another edit.
-- `scree watch` exits with an error if the index file or the notes folder disappears or is replaced, so systemd or Docker restarts it. It re-adds its watches when a folder inside the notes folder is renamed. The index directory is created 0700 and its files are 0600.
+- `scree watch` exits with an error if the index file or the folder disappears or is replaced, so systemd or Docker restarts it. In `serve`, the writer stops and searches report it. Watches are re-added when a folder is renamed or an ignore file changes. The index directory is created 0700 and its files are 0600.
 - Search results are `<hit>` elements of at most 3500 characters each, and one response is at most 64 KB. `read_note` returns the note in a `<note>` element. The server tells the client to treat both as data, not instructions.
 - Vectors live in [vec1](https://sqlite.org/vec1), SQLite's vector extension, with a flat (exact) cosine index. It is compiled to WebAssembly by [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3), which is what keeps the binary CGO-free.
 - One policy decides what may be read, and indexing, search, `read_note` and `reindex` all go through it. Symlinks are followed only inside the notes folder, and the rules are checked on their target too. Symlinked folders are not descended.
