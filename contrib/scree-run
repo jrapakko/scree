@@ -8,12 +8,24 @@
 # Settings are read from ~/.config/scree/env, where ~ is your home directory
 # in the password database.
 # The scree binary must be installed next to this script.
+
+# Re-exec once in an empty environment before running any command: an
+# inherited environment (a repo's .mcp.json) can define shell functions
+# (bash's BASH_FUNC_*) that would override commands. `case` is a reserved
+# word and `exec` a special builtin (found before functions in POSIX
+# mode), and env is called by absolute path. The guard is this process's
+# PID, which exec keeps and a static .mcp.json can't know.
+case ${SCREE_REEXEC-} in
+"$$") ;;
+*) exec /usr/bin/env -i SCREE_REEXEC="$$" CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR-}" /bin/sh "$0" "$@" ;;
+esac
 set -eu
 prog=scree-run
 
 # Before anything else runs: a project's .mcp.json sets this process's
 # environment, PATH included, so no program may be found through the
-# inherited PATH, and CDPATH must not steer cd. PATH is reset and every
+# inherited PATH, and CDPATH must not steer cd. The re-exec above already
+# emptied it; this is defence in depth. PATH is reset and every
 # SCREE_*, key and proxy variable is cleared before the env file is read, so
 # nothing inherited chooses the binary, the endpoint or the key.
 PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin

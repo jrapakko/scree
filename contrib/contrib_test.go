@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,12 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 		}
 		_ = block
 		b = []byte(strings.Replace(string(b), "eval \"pwhome=~$user\"\n", "pwhome=$TEST_PW_HOME\n", 1))
+		// The re-exec empties the environment; the copies keep the
+		// test's own variables across it.
+		if strings.Count(string(b), reexecLine) != 1 {
+			t.Fatalf("%s: re-exec line not found", s)
+		}
+		b = []byte(strings.Replace(string(b), reexecLine, testReexecLine, 1))
 		if err := os.WriteFile(filepath.Join(e.bin, s), b, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -93,7 +100,16 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 // sets the working directory instead and is not passed on.
 func (e env) run(t *testing.T, script string, extra []string, args ...string) (string, []string, error) {
 	t.Helper()
-	cmd := exec.Command(filepath.Join(e.bin, script), args...)
+	return e.runShell(t, nil, script, extra, args...)
+}
+
+// runShell is run with the script started as shell... script instead of
+// through its #! line when shell is not empty.
+func (e env) runShell(t *testing.T, shell []string, script string, extra []string, args ...string) (string, []string, error) {
+	t.Helper()
+	argv := append(slices.Clone(shell), filepath.Join(e.bin, script))
+	argv = append(argv, args...)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	env := []string{
 		"PATH=/usr/bin:/bin",
 		"HOME=" + e.dir,
@@ -778,5 +794,130 @@ func TestEnvFileNotFromEnvironment(t *testing.T) {
 		if err != nil || !slices.Contains(lines, "env=OPENROUTER_API_KEY="+secret) {
 			t.Errorf("%s: err %v, lines %q", s, err, lines)
 		}
+	}
+}
+
+// reexecLine is the line of each wrapper that re-executes it in an empty
+// environment; testReexecLine is its stand-in in the test copies, which
+// also keeps the variables the tests use.
+const (
+	reexecLine     = `*) exec /usr/bin/env -i SCREE_REEXEC="$$" CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR-}" /bin/sh "$0" "$@" ;;` + "\n"
+	testReexecLine = `*) exec /usr/bin/env -i SCREE_REEXEC="$$" CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR-}" TEST_PW_HOME="${TEST_PW_HOME-}" FAKE_OUT="${FAKE_OUT-}" /bin/sh "$0" "$@" ;;` + "\n"
+)
+
+// TestReexecFirst: the re-exec is the first thing each wrapper runs, and
+// it keeps nothing of the environment but CLAUDE_PROJECT_DIR.
+func TestReexecFirst(t *testing.T) {
+	want := "case ${SCREE_REEXEC-} in\n\"$$\") ;;\n" + reexecLine + "esac\n"
+	for _, s := range scripts {
+		b, err := os.ReadFile(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var code []string
+		for _, l := range strings.SplitAfter(string(b), "\n") {
+			if t := strings.TrimSpace(l); t != "" && !strings.HasPrefix(t, "#") {
+				code = append(code, l)
+			}
+		}
+		if len(code) < 4 || strings.Join(code[:4], "") != want {
+			t.Errorf("%s does not start with the re-exec block:\n%s", s, strings.Join(code[:min(4, len(code))], ""))
+		}
+	}
+}
+
+// funcShells returns the ways to start a wrapper that a bash /bin/sh, or
+// bash itself, could take: through the #! line, as /bin/sh script and as
+// bash --posix script.
+func funcShells(t *testing.T) [][]string {
+	t.Helper()
+	shells := [][]string{nil, {"/bin/sh"}}
+	if real, err := filepath.EvalSymlinks("/bin/sh"); err == nil && !strings.Contains(filepath.Base(real), "bash") {
+		t.Logf("/bin/sh is %s, which does not import functions; checking anyway", real)
+	}
+	if bash, err := exec.LookPath("bash"); err == nil {
+		shells = append(shells, []string{bash, "--posix"})
+	} else {
+		t.Log("no bash on PATH")
+	}
+	return shells
+}
+
+// Commands a wrapper might run, which an exported function could replace.
+// bash --posix refuses to start, rather than import, a function named
+// after a special builtin, so those are checked apart.
+var (
+	funcNames    = []string{"env", "sed", "id", "stat", "cat", "dirname", "ls", "cd", "pwd", "printf", "echo", "test", "read", "command"}
+	specialNames = []string{"exec", "export", "unset", "set", "eval"}
+)
+
+// funcEnv returns BASH_FUNC_ variables that define a function for each
+// name, each touching its own marker in dir.
+func funcEnv(dir string, names []string) (env, markers []string) {
+	for _, name := range names {
+		m := filepath.Join(dir, "pwned-func-"+name)
+		markers = append(markers, m)
+		env = append(env, "BASH_FUNC_"+name+"%%=() { : >>'"+m+"'; builtin "+name+" \"$@\" 2>/dev/null || command "+name+" \"$@\"; }")
+	}
+	return env, markers
+}
+
+// checkNoFuncs runs every wrapper under every shell with extra plus
+// functions for names, and fails if any function ran or reached the
+// child. With refuseOK, the shell may also refuse to start.
+func checkNoFuncs(t *testing.T, names []string, refuseOK bool, extra []string) {
+	t.Helper()
+	for _, shell := range funcShells(t) {
+		for _, s := range scripts {
+			e := setup(t, envFile, 0o600)
+			// The fakes also dump their whole environment.
+			dump := fake + "/usr/bin/env > \"$FAKE_OUT.env\"\n"
+			for _, name := range []string{"scree", "docker"} {
+				if err := os.WriteFile(filepath.Join(e.bin, name), []byte(dump), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fenv, markers := funcEnv(e.dir, names)
+			args := []string{"search", "x"}
+			if s != "scree-run" {
+				args = nil
+			}
+			out, lines, err := e.runShell(t, shell, s, append(append(slices.Clone(extra), fenv...), "INHERITED=1"), args...)
+			for _, m := range markers {
+				if _, serr := os.Stat(m); serr == nil {
+					t.Errorf("%v %s: inherited function %s ran (output %q)", shell, s, strings.TrimPrefix(filepath.Base(m), "pwned-func-"), out)
+				}
+			}
+			if refuseOK && err != nil && lines == nil && strings.Contains(out, "is a special builtin") {
+				continue
+			}
+			if err != nil || !slices.Contains(lines, "env=OPENROUTER_API_KEY="+secret) {
+				t.Errorf("%v %s: err %v, output %q, lines %q", shell, s, err, out, lines)
+			}
+			b, _ := os.ReadFile(e.out + ".env")
+			for _, l := range strings.Split(string(b), "\n") {
+				if strings.HasPrefix(l, "BASH_FUNC_") || strings.HasPrefix(l, "INHERITED=") || strings.HasPrefix(l, "SCREE_REEXEC=") {
+					t.Errorf("%v %s: %q reached the child", shell, s, l)
+				}
+			}
+		}
+	}
+}
+
+// TestNoExportedFunctions: shell functions exported through the
+// environment (bash's BASH_FUNC_name%%) never run in a wrapper and never
+// reach scree.
+func TestNoExportedFunctions(t *testing.T) {
+	checkNoFuncs(t, funcNames, false, nil)
+	checkNoFuncs(t, specialNames, true, nil)
+}
+
+// TestForgedReexecGuard: a SCREE_REEXEC set in the inherited environment
+// does not skip the re-exec, since it is not the wrapper's PID.
+func TestForgedReexecGuard(t *testing.T) {
+	for _, v := range []string{"1", "", "99999999", strconv.Itoa(os.Getpid())} {
+		t.Run("SCREE_REEXEC="+v, func(t *testing.T) {
+			checkNoFuncs(t, funcNames, false, []string{"SCREE_REEXEC=" + v})
+		})
 	}
 }
