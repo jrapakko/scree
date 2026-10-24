@@ -15,7 +15,7 @@ Built from the repo's `Dockerfile`: a Go build stage, then `gcr.io/distroless/st
 docker build -t scree .            # or: podman build -t scree .
 ```
 
-**Planned:** tagged releases push `ghcr.io/jrapakko/scree:<version>` and `:<major>.<minor>` for linux/amd64 and linux/arm64. No version is tagged yet.
+Tagged releases push `ghcr.io/jrapakko/scree:<version>` and `:<major>.<minor>` for linux/amd64 and linux/arm64. No version is tagged yet.
 
 File events reach the container through a bind mount on Linux. Docker Desktop on macOS doesn't pass them through, so `watch` misses edits there.
 
@@ -43,7 +43,7 @@ docker run --rm -e OPENROUTER_API_KEY -v "$HOME/wiki:/notes:ro,z" -v scree-data:
 
 ## Compose
 
-`compose.yaml` has two services sharing the `scree-data` volume. It reads `OPENROUTER_API_KEY` from your shell or from `.env` next to `compose.yaml`, and the folder from `SCREE_NOTES_DIR`:
+`compose.yaml` has two services sharing the `scree-data` volume. It reads `OPENROUTER_API_KEY` from your shell or from `.env` next to `compose.yaml`, and the host folder from `SCREE_NOTES_DIR`, which is only compose's name for the folder mounted at `/notes`:
 
 ```sh
 SCREE_NOTES_DIR=$HOME/wiki docker compose up -d     # starts watch
@@ -52,43 +52,48 @@ docker compose logs -f watch
 
 - `watch` runs `watch -notes /notes`, restarts unless stopped, and mounts the folder `ro,z`.
 - `serve` runs `serve -notes /notes` with stdin open, behind the `mcp` profile, so `up` doesn't start it.
-- Both pass `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_ZDR` and `SCREE_EMBED_URL`, with the same defaults as the binary; `serve` also passes `SCREE_HTTP_TOKEN`.
+- Both pass `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_FIRST_SYNC_MB`, `SCREE_ZDR` and `SCREE_EMBED_URL`, with the same defaults as the binary; `serve` also passes `SCREE_HTTP_TOKEN`.
 
-The two containers share the index through the volume, with one writer at a time as for native processes.
+The two containers share the index through the volume, with one writer at a time as for native processes. SQLite's WAL mode lets `serve` read while `watch` writes.
 
 ## Claude Code with Docker
 
-`contrib/scree-mcp-docker` runs one container per Claude Code session over stdio. A repo's committed `.mcp.json` names `scree-mcp`, so install the Docker wrapper under that name:
+`scree mcp -docker` runs one container per Claude Code session over stdio. The repo's committed `.mcp.json` names `scree mcp`, which everyone shares. To use Docker yourself, add a local-scope entry, which takes precedence over the project's for you:
 
 ```sh
-install -m 755 contrib/scree-mcp-docker ~/.local/bin/scree-mcp
-claude mcp add scree --scope project -- scree-mcp   # once per repo, from its root
+claude mcp add scree --scope local -- "$HOME/.local/bin/scree" mcp -docker
 ```
 
-It loads the settings file like the native wrapper, then runs:
+The native `scree` binary is still needed on the host: it is the launcher. It loads the settings file like `scree mcp`, then runs:
 
 ```
 docker run -i --rm --pull=never \
   -e OPENROUTER_API_KEY [-e SCREE_MODEL …] \
   -v <repo>:<repo>:<SCREE_MOUNT_OPTS> -v scree-data:/data \
-  scree:latest serve -notes <repo>
+  -w <repo> -e CLAUDE_PROJECT_DIR=<project dir> \
+  scree:latest serve
 ```
 
 - **`--pull=never`:** a missing image is never pulled from a registry, since the container receives your key. Build or pull the image yourself first.
-- **The repo mounts at its own path,** read-only, so each repo hashes to its own index in the shared volume. `<repo>` is the git work tree above `CLAUDE_PROJECT_DIR`, found only through a `.git` you own that is not a symlink, never in or above a sticky folder, so `.gitignore` and `.git/info/exclude` are visible.
-- **Refused mounts:** your home directory, a folder above it, `/`, a relative `CLAUDE_PROJECT_DIR`, and paths containing `:`.
-- **Variables by name only:** `OPENROUTER_API_KEY`, `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_ZDR`, `SCREE_MAX_FILE_BYTES`, `SCREE_EMBED_URL` and `SCREE_HTTP_TOKEN`, each only if set. Proxy variables are not passed.
+- **The repo mounts at its own path,** read-only, so each repo hashes to its own index in the shared volume. `<repo>` is the git root of the working directory, found only through a `.git` you own that is not a symlink, never in or above a sticky folder, so `.gitignore` and `.git/info/exclude` are visible.
+- **`CLAUDE_PROJECT_DIR` must lead to the same work tree,** not just the same repository as native `serve` allows; otherwise it refuses to start.
+- **`serve` runs in the mounted folder** (`-w`), where it applies the same folder rule and the `.mcp.json` opt-in check as native `serve`.
+- **Refused mounts:** your home directory (from the password database), a folder above it, `/`, a relative `CLAUDE_PROJECT_DIR`, and paths containing `:`.
+- **Settings by name only:** `OPENROUTER_API_KEY`, `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_ZDR`, `SCREE_FIRST_SYNC_MB`, `SCREE_MAX_FILE_BYTES`, `SCREE_EMBED_URL` and `SCREE_HTTP_TOKEN`, each only if the settings file sets it. Proxy variables are not passed to the container.
+- **The docker CLI's environment** is `HOME`, a `PATH` of `/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin`, the settings, and `DOCKER_HOST` or `DOCKER_CONTEXT` if the settings file sets them. Nothing comes from Claude Code's or the repo's environment, so set those two in the settings file if your engine needs them.
 - **Your global git excludes file is not visible in the container,** so it may index files that native scree ignores. Put such patterns in the repo's `.screeignore`.
-- Like `scree-mcp`, it ignores inherited settings and takes no arguments.
+- **A worktree whose git dir lies outside the mounted folder** can't be read in the container.
+- Like `scree mcp`, it ignores inherited settings and takes no other arguments.
 
 Settings for it, in the settings file:
 
 | Variable | Default | Accepted |
 | --- | --- | --- |
-| `SCREE_DOCKER` | `docker` | `docker` or `podman` |
-| `SCREE_IMAGE` | `scree:latest` | any local image |
+| `SCREE_DOCKER` | `docker` | `docker` or `podman`, found in the folders above, never through `PATH` |
+| `SCREE_IMAGE` | `scree:latest` | any local image, such as a `ghcr.io/jrapakko/scree:<version>` you pulled yourself |
 | `SCREE_DATA_VOLUME` | `scree-data` | a volume name, not a path |
 | `SCREE_MOUNT_OPTS` | `ro` | `ro`, `ro,z`, `ro,Z`; use `ro,z` on SELinux hosts |
+| `DOCKER_HOST`, `DOCKER_CONTEXT` | unset | passed to the docker CLI only |
 
 ## HTTP inside a container
 

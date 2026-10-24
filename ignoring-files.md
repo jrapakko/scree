@@ -1,8 +1,9 @@
 ---
 title: Ignoring files
+nav_title: Ignoring
 ---
 
-An ignored file is never read for indexing, never sent to the embedding API, never returned by search, and refused by `read_doc` and `reindex <path>`. Ignoring is how you keep a private file from leaving the machine. Check what is ignored with `scree-run doctor -v` before you rely on a rule.
+An ignored file is never read for indexing, never sent to the embedding API, never returned by search, and refused by `read_doc` and `reindex <path>`. Ignoring is how you keep a private file from leaving the machine. Check what is ignored with `scree run doctor -v` before you rely on a rule.
 
 ## What gets indexed
 
@@ -90,7 +91,7 @@ Here `archive/2024/notes.md` is indexed again, but `archive/2024/plan.private.md
 
 - `include-hidden .name/` adds a root hidden folder to the allowlist. The name is one segment starting with `.`, ending with `/`, with no wildcards; `.git` is refused. Write `\include-hidden` for a literal pattern that starts with those words.
 - `doctor` reports bad lines by number only.
-- **Fail closed:** if `.screeignore` exists but can't be read, is a symlink, or isn't a regular file, nothing is indexed until it is fixed.
+- **Fail closed:** if `.screeignore` exists but can't be read, is a symlink, isn't a regular file, or has a line scree can't parse (a bad pattern or `include-hidden` directive), nothing is indexed until it is fixed. Sync, `reindex` and the watcher stop with `bad line in .screeignore: …; nothing is indexed until it is fixed (scree doctor lists the lines)`, in the log and, when it happens at a session's start, in search output. They resume once the file is fixed.
 
 ## 4. Front matter
 
@@ -147,7 +148,7 @@ Without this, every section is indexed twice and costs twice.
 **Check before indexing:**
 
 ```sh
-scree-run doctor -v | grep -E 're-included|ignored \(\.screeignore\)'
+scree run doctor -v | grep -E 're-included|ignored \(\.screeignore\)'
 ```
 
 **A dotfiles repo at `~` with `*` in its `.gitignore`.** scree refuses a folder found automatically if it is your home directory, so this repo is never indexed by accident. To index a folder below it without git's rules, use `-notes <folder> -gitignore=false` from the CLI.
