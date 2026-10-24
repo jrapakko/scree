@@ -108,13 +108,10 @@ func (s *Store) UpdateVocab(ctx context.Context, put []VocabFile, del []string) 
 	return tx.Commit()
 }
 
-// InVocabAndNotes reports whether any of words (already lowercased) is in
-// the code vocabulary and also occurs in the notes, as keyword search would
-// match it: one primary-key lookup, then one FTS5 query over the names
-// found, each as a quoted phrase. The phrase is tokenized as the notes
-// were, so pagefetcher matches PageFetcher, and golang.org/x/sync matches
-// the same tokens in a row. A name only in code never counts.
-func (s *Store) InVocabAndNotes(ctx context.Context, words []string) (bool, error) {
+// InVocab reports whether any of words (already lowercased) is in the code
+// vocabulary: one lookup on the table's primary key. Whether the notes also
+// hold the word does not matter here; that gate is VocabStats's alone.
+func (s *Store) InVocab(ctx context.Context, words []string) (bool, error) {
 	if len(words) == 0 {
 		return false, nil
 	}
@@ -122,14 +119,13 @@ func (s *Store) InVocabAndNotes(ctx context.Context, words []string) (bool, erro
 	for i, w := range words {
 		args[i] = w
 	}
-	found, err := s.column(ctx, `SELECT name FROM vocab WHERE name IN (?`+strings.Repeat(`, ?`, len(words)-1)+`)`, args...)
-	if err != nil || len(found) == 0 {
-		return false, err
+	q := `SELECT 1 FROM vocab WHERE name IN (?` + strings.Repeat(`, ?`, len(words)-1) + `) LIMIT 1`
+	var one int
+	err := s.db.QueryRowContext(ctx, q, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
-	for i, n := range found {
-		found[i] = phrase(n)
-	}
-	return s.inNotes(ctx, strings.Join(found, " OR "))
+	return err == nil, err
 }
 
 // phrase quotes name as an FTS5 phrase, with inner quotes doubled.
@@ -146,11 +142,12 @@ func (s *Store) inNotes(ctx context.Context, match string) (bool, error) {
 }
 
 // VocabStats returns the vocabulary's size, how many of its names also
-// occur in the notes (see InVocabAndNotes), the number of files it was read
-// from, and up to sample of the names that occur in the notes, in order.
-// No name found only in code is returned. One-token names are matched
-// against the keyword index's terms in one join; the others, such as
-// dotted module paths, by one phrase query each.
+// occur in the notes, the number of files it was read from, and up to
+// sample of the names that occur in the notes, in order. No name found only
+// in code is returned, since it may be a misread string. One-token names
+// are matched against the keyword index's terms in one join; the others,
+// such as dotted module paths, by one phrase query each, tokenized as the
+// notes were, so golang.org/x/sync matches the same tokens in a row.
 func (s *Store) VocabStats(ctx context.Context, sample int) (names, inNotes, files int, some []string, err error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM vocab), (SELECT count(*) FROM vocab_files)`).
 		Scan(&names, &files); err != nil {

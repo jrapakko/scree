@@ -459,8 +459,8 @@ type Mode string
 
 const (
 	// Auto, the default, is Hybrid when the query holds an identifier-like
-	// word (see HasIdentifier) or a word from the code vocabulary that the
-	// notes also hold (see Indexer.Resolve), and Semantic otherwise.
+	// word (see HasIdentifier) or a word from the code vocabulary (see
+	// Indexer.Resolve), and Semantic otherwise.
 	Auto Mode = "auto"
 	// Hybrid merges vector and keyword search by reciprocal rank fusion.
 	Hybrid Mode = "hybrid"
@@ -497,18 +497,18 @@ func Resolve(mode Mode, query string) Mode {
 
 // Resolve returns the mode a search for query runs in: for Auto (or ""),
 // Hybrid if HasIdentifier(query) or a word of the query, trimmed as
-// HasIdentifier trims it and lowercased, is in the index's code vocabulary
-// and also occurs in the indexed notes (see store.InVocabAndNotes), and
-// Semantic otherwise; any other mode as it is. A name only in code never
-// routes, since keyword search can only find words the notes hold; so a
-// name the extractor misread from a string adds nothing. A failed lookup
-// counts as no match.
+// HasIdentifier trims it and lowercased, is in the index's code vocabulary,
+// and Semantic otherwise; any other mode as it is. The notes need not hold
+// the word: hybrid's keyword side matches the query's other words too, so
+// a question naming code gains even when the docs don't name it. A name the
+// extractor misread from a string can at worst send a question to Hybrid.
+// A failed lookup counts as no match.
 func (ix *Indexer) Resolve(ctx context.Context, mode Mode, query string) Mode {
 	if m := Resolve(mode, query); m != Semantic || (mode != "" && mode != Auto) {
 		return m
 	}
 	if ix.Store != nil {
-		if ok, err := ix.Store.InVocabAndNotes(ctx, queryWords(query)); err == nil && ok {
+		if ok, err := ix.Store.InVocab(ctx, queryWords(query)); err == nil && ok {
 			return Hybrid
 		}
 	}

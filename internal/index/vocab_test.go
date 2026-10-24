@@ -159,17 +159,9 @@ func TestResolveVocab(t *testing.T) {
 	if _, err := ix.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Names in the vocabulary that no note holds stay semantic until a note
-	// mentions them.
-	for _, q := range []string{"is `zustand` used for state", "upgrade golang.org/x/sync", "useCartTotal", "FileHash"} {
-		if got := ix.Resolve(ctx, Auto, q); got != Semantic {
-			t.Errorf("before the note: Resolve(%q) = %q, want semantic", q, got)
-		}
-	}
-	write(t, ix.Root(), "docs/stack.md", "# Stack\nState lives in Zustand. We pin golang.org/x/sync.\n")
-	if _, err := ix.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
+	// A vocabulary name routes to hybrid whether or not a note names it:
+	// zustand, golang.org/x/sync, useCartTotal and FileHash are only in
+	// code, and hybrid's keyword side still matches the query's other words.
 	for _, c := range []struct {
 		mode  Mode
 		query string
@@ -181,8 +173,8 @@ func TestResolveVocab(t *testing.T) {
 		{"", "is `zustand` used for state", Hybrid},
 		{Auto, "upgrade golang.org/x/sync", Hybrid},
 		{Auto, "upgrade golang.org/x", Semantic}, // not a vocabulary name
-		{Auto, "useCartTotal", Semantic},         // only in code
-		{Auto, "the FileHash type", Semantic},    // only in code
+		{Auto, "useCartTotal", Hybrid},           // only in code
+		{Auto, "the FileHash type", Hybrid},      // only in code
 		{Auto, "how do I sync the index", Semantic},
 		{Auto, "run the new build", Semantic},
 		{Auto, "sync run new", Semantic},

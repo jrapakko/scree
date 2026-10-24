@@ -75,8 +75,8 @@ func TestWriteJSON(t *testing.T) {
 
 // TestSearchDefaultsToAuto: with no mode, search_docs runs auto and says
 // which mode it chose; an explicit mode adds no note. A name declared in
-// the folder's code and mentioned in a note routes to hybrid after reindex
-// reads it; one only in code does not.
+// the folder's code routes to hybrid after reindex reads it, whether or not
+// a note mentions it; a mixed-case word the code does not declare does not.
 func TestSearchDefaultsToAuto(t *testing.T) {
 	cs, root, _ := connect(t)
 	if err := os.WriteFile(filepath.Join(root, "zoo.go"), []byte("package zoo\n\ntype ZebraKeeper struct{}\n\ntype ZebraGroomer struct{}\n"), 0o644); err != nil {
@@ -95,7 +95,8 @@ func TestSearchDefaultsToAuto(t *testing.T) {
 		{map[string]any{"query": "zebra"}, "</hit>\n[mode: auto → semantic]"},
 		{map[string]any{"query": "zebra_2 zebra"}, "</hit>\n[mode: auto → hybrid]"},
 		{map[string]any{"query": "who feeds the ZebraKeeper zebra"}, "</hit>\n[mode: auto → hybrid]"},
-		{map[string]any{"query": "who feeds the ZebraGroomer zebra"}, "</hit>\n[mode: auto → semantic]"},
+		{map[string]any{"query": "who feeds the ZebraGroomer zebra"}, "</hit>\n[mode: auto → hybrid]"},
+		{map[string]any{"query": "who feeds the ZebraWasher zebra"}, "</hit>\n[mode: auto → semantic]"},
 		{map[string]any{"query": "zebra", "mode": "auto"}, "</hit>\n[mode: auto → semantic]"},
 		{map[string]any{"query": "zebra", "mode": "hybrid"}, "</hit>"},
 		{map[string]any{"query": "zebra", "mode": "semantic"}, "</hit>"},

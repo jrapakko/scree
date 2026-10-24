@@ -96,8 +96,8 @@ func TestCLISearchKeywordJSON(t *testing.T) {
 
 // TestCLISearchDefaultsToAuto: with no -mode, a plain query runs semantic
 // and an identifier query hybrid, as the JSON mode field and the XML
-// note say. A name from the code vocabulary that the notes also hold gives
-// hybrid; one only in code does not.
+// note say. A name from the code vocabulary gives hybrid, whether or not
+// the notes hold it.
 func TestCLISearchDefaultsToAuto(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -109,7 +109,7 @@ func TestCLISearchDefaultsToAuto(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "test-key")
 	t.Setenv("SCREE_ZDR", "0")
 	for q, want := range map[string]string{"nightly run": "semantic", "purge_old_records": "hybrid", "does the PageFetcher purge?": "hybrid",
-		"does the codeonlyhelper purge?": "semantic"} {
+		"does the codeonlyhelper purge?": "hybrid"} {
 		var runErr error
 		out := captureStdout(t, func() {
 			runErr = runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "json", q})

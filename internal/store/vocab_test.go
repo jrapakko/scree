@@ -11,8 +11,8 @@ import (
 func TestVocab(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
-	if ok, err := s.InVocabAndNotes(ctx, []string{"pagefetcher"}); err != nil || ok {
-		t.Fatalf("empty InVocabAndNotes = %v, %v", ok, err)
+	if ok, err := s.InVocab(ctx, []string{"pagefetcher"}); err != nil || ok {
+		t.Fatalf("empty InVocab = %v, %v", ok, err)
 	}
 	if err := s.UpdateVocab(ctx, []VocabFile{
 		{Path: "a.py", Hash: "1", Names: []string{"pagefetcher", "psycopg", "codeonlyname"}},
@@ -21,9 +21,13 @@ func TestVocab(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	// In the vocabulary but not yet in any note: nothing routes.
-	if ok, err := s.InVocabAndNotes(ctx, []string{"pagefetcher"}); err != nil || ok {
-		t.Fatalf("InVocabAndNotes without notes = %v, %v", ok, err)
+	// In the vocabulary but not yet in any note: InVocab finds it, and
+	// VocabStats counts and samples nothing.
+	if ok, err := s.InVocab(ctx, []string{"pagefetcher"}); err != nil || !ok {
+		t.Fatalf("InVocab without notes = %v, %v", ok, err)
+	}
+	if n, in, _, some, err := s.VocabStats(ctx, 10); err != nil || n != 5 || in != 0 || len(some) != 0 {
+		t.Fatalf("VocabStats without notes = %d, %d, %q, %v", n, in, some, err)
 	}
 	if err := s.ReplaceFile(ctx, "n.md", "h", 1, nil, []Chunk{{Path: "n.md", Heading: "Psycopg", Line: 1, EndLine: 1,
 		Text: "The PageFetcher uses golang.org/x/sync; example.com/codeonly is a site, and the mod file too."}}, [][]float32{{1, 0}}); err != nil {
@@ -38,15 +42,14 @@ func TestVocab(t *testing.T) {
 	}
 	for words, want := range map[string]bool{
 		"how does pagefetcher": true, "sync": false, "golang.org/x/sync": true, "psycopg": true,
-		// In the vocabulary, not in the notes; the second one's tokens are
-		// there, but not as a phrase.
-		"codeonlyname": false, "example.com/codeonly/mod": false,
+		// In the vocabulary, not in the notes: found all the same.
+		"codeonlyname": true, "example.com/codeonly/mod": true,
 		// In the notes, not in the vocabulary.
 		"site uses": false,
 	} {
-		ok, err := s.InVocabAndNotes(ctx, strings.Fields(words))
+		ok, err := s.InVocab(ctx, strings.Fields(words))
 		if err != nil || ok != want {
-			t.Errorf("InVocabAndNotes(%q) = %v, %v", words, ok, err)
+			t.Errorf("InVocab(%q) = %v, %v", words, ok, err)
 		}
 	}
 	if err := s.UpdateVocab(ctx, []VocabFile{{Path: "a.py", Hash: "4", Names: []string{"fetchpage"}}}, []string{"go.mod"}); err != nil {
