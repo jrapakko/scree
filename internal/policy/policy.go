@@ -114,6 +114,7 @@ var ErrChanged = errors.New("file changed while reading")
 // TestHooks lets tests act between read's steps. They are nil outside tests.
 var TestHooks struct {
 	BeforeLstat, BeforeOpen func(rel string)
+	ReadDir                 func(parent string) // Canonical lists a folder
 }
 
 // readErr wraps a read failure with the quoted store key. It drops the
@@ -294,14 +295,11 @@ func relUnder(root, abs string) (string, bool) {
 // none of them refuse rel. A file that passes may still be refused by Read,
 // which also fails when the git rules cannot be loaded.
 func (p *Policy) CheckName(rel string) Reason {
-	clean, err := p.Canonical(rel)
-	if err != nil {
-		var ie *IgnoredError
-		if errors.As(err, &ie) {
-			return ie.Reason
-		}
-		return Invalid
-	}
+	return p.NewCanon().CheckName(rel)
+}
+
+// checkName is CheckName on a canonical path.
+func (p *Policy) checkName(clean string) Reason {
 	if r := p.nameReason(clean); r != Allowed {
 		return r
 	}
@@ -330,10 +328,11 @@ func (p *Policy) Read(rel string) ([]byte, error) {
 // ReadStat is Read that also returns the opened file's FileInfo, which
 // matches the content returned.
 func (p *Policy) ReadStat(rel string) ([]byte, fs.FileInfo, error) {
-	clean, err := p.Canonical(rel)
-	if err != nil {
-		return nil, nil, err
-	}
+	return p.NewCanon().ReadStat(rel)
+}
+
+// readStat is ReadStat on a canonical path.
+func (p *Policy) readStat(clean string) ([]byte, fs.FileInfo, error) {
 	rs, err := p.load()
 	if err != nil {
 		return nil, nil, err
@@ -393,7 +392,9 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, fs.FileInfo, 
 	if TestHooks.BeforeOpen != nil {
 		TestHooks.BeforeOpen(realRel)
 	}
-	f, err := p.r.Open(realRel)
+	// Never wait on a FIFO swapped in after the checks; the checks after
+	// opening refuse anything but the regular file Lstat saw.
+	f, err := p.r.OpenFile(realRel, os.O_RDONLY|userOpenFlags, 0)
 	if err != nil {
 		return nil, nil, readErr(rel, err)
 	}
@@ -674,40 +675,52 @@ func (p *Policy) CheckRoot() error {
 
 // matcher returns the .screeignore rules, reloading them when the file's
 // modification time or size changed. A missing file means no rules; any
-// other problem is returned so callers fail closed.
+// other problem is returned so callers fail closed. The file is stat'ed and
+// read without holding p.mu, which only guards the cached result.
 func (p *Policy) matcher() (*ignore.Matcher, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	st, err := p.statIgnore()
 	if err != nil {
+		p.mu.Lock()
 		p.m, p.stamp, p.loadErr = nil, fileStamp{}, nil
 		p.allow, p.dirErrs = DefaultHiddenAllow, nil
+		p.mu.Unlock()
 		return nil, err
 	}
+	p.mu.Lock()
 	if p.stamp == st {
-		return p.m, p.loadErr
+		m, err := p.m, p.loadErr
+		p.mu.Unlock()
+		return m, err
 	}
-	p.m, p.loadErr = nil, nil
-	p.allow, p.dirErrs = DefaultHiddenAllow, nil
+	p.mu.Unlock()
+	var (
+		m       *ignore.Matcher
+		loadErr error
+		allow   = DefaultHiddenAllow
+		dirErrs []string
+	)
 	if st.missing {
-		p.m = ignore.ParseWith(nil, p.opts)
+		m = ignore.ParseWith(nil, p.opts)
 	} else {
 		data, rst, err := p.readIgnore()
 		switch {
 		case err != nil:
-			p.loadErr = err
+			loadErr = err
 		case rst.missing:
-			p.m = ignore.ParseWith(nil, p.opts)
+			m = ignore.ParseWith(nil, p.opts)
 		default:
-			allow, rest, errs := parseDirectives(data)
-			p.m = ignore.ParseWith(rest, p.opts)
-			p.allow = append(slices.Clone(DefaultHiddenAllow), allow...)
-			p.dirErrs = errs
+			var extra []string
+			var rest []byte
+			extra, rest, dirErrs = parseDirectives(data)
+			m = ignore.ParseWith(rest, p.opts)
+			allow = append(slices.Clone(DefaultHiddenAllow), extra...)
 			st = rst
 		}
 	}
-	p.stamp = st
-	return p.m, p.loadErr
+	p.mu.Lock()
+	p.m, p.loadErr, p.allow, p.dirErrs, p.stamp = m, loadErr, allow, dirErrs, st
+	p.mu.Unlock()
+	return m, loadErr
 }
 
 func (p *Policy) statIgnore() (fileStamp, error) {

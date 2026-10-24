@@ -1,11 +1,21 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jrapakko/scree/internal/policy"
 )
+
+// gitRoot is policy.FindGitTop with errors read as "no work tree", for
+// tests that only need the answer.
+func gitRoot(dir string) string {
+	top, _ := policy.FindGitTop(dir)
+	return top
+}
 
 // tempDir returns a fresh temp dir with symlinks resolved (macOS: /var ->
 // /private/var), so it compares equal to resolved results.
@@ -229,5 +239,38 @@ func TestResolveHomeAncestors(t *testing.T) {
 	t.Setenv("CLAUDE_PROJECT_DIR", repo)
 	if root, _, err := resolveFolder("", true); err != nil || root != repo {
 		t.Errorf("symlinked HOME, repo: %q, %v", root, err)
+	}
+}
+
+func TestResolveNoLiftAcrossSticky(t *testing.T) {
+	t.Setenv("HOME", tempDir(t))
+	s := filepath.Join(tempDir(t), "s")
+	p := filepath.Join(s, "p")
+	mkdir(t, filepath.Join(s, ".git"))
+	mkdir(t, p)
+	if err := os.Chmod(s, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(s); err != nil || fi.Mode()&os.ModeSticky == 0 {
+		t.Skip("no sticky bit on this filesystem")
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", p)
+	if root, _, err := resolveFolder("", true); err != nil || root != p {
+		t.Errorf("resolveFolder = %q, %v; want %q", root, err, p)
+	}
+}
+
+func TestResolveRefusesSymlinkGit(t *testing.T) {
+	t.Setenv("HOME", tempDir(t))
+	base := tempDir(t)
+	mkdir(t, filepath.Join(base, "real.git"))
+	repo := filepath.Join(base, "repo")
+	mkdir(t, filepath.Join(repo, "sub"))
+	if err := os.Symlink(filepath.Join(base, "real.git"), filepath.Join(repo, ".git")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", filepath.Join(repo, "sub"))
+	if _, _, err := resolveFolder("", true); !errors.Is(err, policy.ErrUntrustedGit) {
+		t.Errorf("resolveFolder = %v", err)
 	}
 }

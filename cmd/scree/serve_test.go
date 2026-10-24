@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jrapakko/scree/internal/writer"
 )
 
 // serveEnv isolates HOME, XDG_* and the scree variables, and returns the data
@@ -104,5 +107,28 @@ func TestCLIUnaffected(t *testing.T) {
 	}
 	if _, err := os.Stat(db); err != nil {
 		t.Errorf("search did not use -db: %v", err)
+	}
+}
+
+func TestShutdownTimeout(t *testing.T) {
+	serveEnv(t)
+	notes := filepath.Join(tempDir(t), "notes")
+	mkdir(t, notes)
+	release := make(chan struct{})
+	oldRun, oldTimeout := runWriter, ShutdownTimeout
+	runWriter = func(context.Context, *writer.Writer) error { <-release; return nil } // ignores ctx
+	ShutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { close(release); runWriter, ShutdownTimeout = oldRun, oldTimeout })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	runServe(ctx, []string{"-notes", notes})
+	if d := time.Since(start); d < ShutdownTimeout || d > ShutdownTimeout+2*time.Second {
+		t.Errorf("serve returned after %s, want about %s", d, ShutdownTimeout)
+	}
+	start = time.Now()
+	runWatch(ctx, []string{"-notes", notes})
+	if d := time.Since(start); d < ShutdownTimeout || d > ShutdownTimeout+2*time.Second {
+		t.Errorf("watch returned after %s, want about %s", d, ShutdownTimeout)
 	}
 }

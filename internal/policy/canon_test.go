@@ -3,10 +3,12 @@ package policy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -308,5 +310,101 @@ func TestReadRaceSwapFolder(t *testing.T) {
 		if !errors.Is(err, ErrChanged) {
 			t.Fatalf("%s: err = %v, want ErrChanged", how, err)
 		}
+	}
+}
+
+// countReadDirs counts Canonical's folder listings for the rest of the test.
+func countReadDirs(t *testing.T) *int {
+	t.Helper()
+	n := new(int)
+	TestHooks.ReadDir = func(string) { *n++ }
+	t.Cleanup(func() { TestHooks.ReadDir = nil })
+	return n
+}
+
+func TestCanonicalFastPathNoReadDir(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the fast path is Linux only")
+	}
+	dir := fixture(t)
+	root := filepath.Join(dir, "notes")
+	write(t, filepath.Join(root, "docs", "Guide.md"), "g")
+	p := open(t, root, 0)
+	if p.FoldsCase() {
+		t.Skip("case-insensitive filesystem")
+	}
+	n := countReadDirs(t)
+	for i := 0; i < 10; i++ {
+		if c, err := p.Canonical("docs/Guide.md"); err != nil || c != "docs/Guide.md" {
+			t.Fatalf("Canonical = %q, %v", c, err)
+		}
+	}
+	if _, err := p.Read("docs/Guide.md"); err != nil {
+		t.Fatal(err)
+	}
+	if *n != 0 {
+		t.Errorf("%d folder listings for an existing path", *n)
+	}
+	// A missing path takes the slow path, which still keeps it as given.
+	if c, err := p.Canonical("docs/missing.md"); err != nil || c != "docs/missing.md" {
+		t.Errorf("missing: %q, %v", c, err)
+	}
+}
+
+// A leaf that is also reachable with one letter's case swapped, as in an
+// ext4 casefold folder, takes the slow path. A hard link stands in for the
+// casefold lookup here.
+func TestCanonicalFastPathCasefoldLeaf(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the fast path is Linux only")
+	}
+	dir := fixture(t)
+	root := filepath.Join(dir, "notes")
+	write(t, filepath.Join(root, "docs", "guide.md"), "g")
+	if err := os.Link(filepath.Join(root, "docs", "guide.md"), filepath.Join(root, "docs", "Guide.md")); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	p := open(t, root, 0)
+	if p.FoldsCase() {
+		t.Skip("case-insensitive filesystem")
+	}
+	n := countReadDirs(t)
+	if c, err := p.Canonical("docs/Guide.md"); err != nil || c != "docs/Guide.md" {
+		t.Fatalf("Canonical = %q, %v", c, err)
+	}
+	if *n == 0 {
+		t.Error("the swapped-case twin did not send the lookup to the slow path")
+	}
+	if swapOne("guide.md") != "Guide.md" || swapOne("123.md") != "123.Md" || swapOne("12") != "12" {
+		t.Errorf("swapOne: %q %q %q", swapOne("guide.md"), swapOne("123.md"), swapOne("12"))
+	}
+}
+
+func TestCanonBatchReadsDirOnce(t *testing.T) {
+	dir := fixture(t)
+	root := filepath.Join(dir, "notes")
+	for i := 0; i < 100; i++ {
+		write(t, filepath.Join(root, "d", fmt.Sprintf("f%03d.md", i)), "x")
+	}
+	p := open(t, root, 0)
+	p.opts.FoldCase = true // force the slow path on every OS
+	n := countReadDirs(t)
+	c := p.NewCanon()
+	for i := 0; i < 100; i++ {
+		rel := fmt.Sprintf("d/f%03d.md", i)
+		if got, err := c.Canonical(rel); err != nil || got != rel {
+			t.Fatalf("Canonical(%s) = %q, %v", rel, got, err)
+		}
+	}
+	if *n != 2 { // "." and "d"
+		t.Errorf("%d folder listings for 100 lookups in one folder, want 2", *n)
+	}
+	// A file created after the listing is still found: a miss re-lists.
+	write(t, filepath.Join(root, "d", "new.md"), "x")
+	if got, err := c.Canonical("d/new.md"); err != nil || got != "d/new.md" {
+		t.Errorf("new file: %q, %v", got, err)
+	}
+	if *n != 3 {
+		t.Errorf("%d listings after a new file, want 3", *n)
 	}
 }

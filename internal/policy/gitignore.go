@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/jrapakko/scree/internal/ignore"
@@ -26,7 +27,8 @@ const maxGitFileBytes = 256 << 10
 var matchAll = ignore.Parse([]byte("*\n"))
 
 // gitRepo is the git work tree around the root, and the cached ignore
-// sources. Fields below the blank line are guarded by Policy.mu.
+// sources. Fields below the blank line are guarded by Policy.mu, which is
+// never held while a file is read.
 type gitRepo struct {
 	top     string   // the work tree top, symlinks resolved
 	prefix  string   // the root relative to top: "" or "a/b/"
@@ -57,32 +59,22 @@ type dirRules struct {
 	err   error           // the file exists but cannot be used; the folder is excluded
 }
 
-// findRepo walks up from the resolved root looking for an entry named
-// ".git". It returns nil when the root is not in a work tree.
+// findRepo finds the git work tree around the resolved root with
+// FindGitTop. It returns nil when the root is not in one.
 func findRepo(root string) (*gitRepo, error) {
-	for d := root; ; {
-		dotGit := filepath.Join(d, ".git")
-		_, err := os.Lstat(dotGit)
-		if err == nil {
-			g, err := newRepo(root, d, dotGit)
-			if err != nil {
-				return nil, fmt.Errorf("git work tree at %s: %w", d, err)
-			}
-			return g, nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("git work tree at %s: %w", d, err)
-		}
-		parent := filepath.Dir(d)
-		if parent == d {
-			return nil, nil
-		}
-		d = parent
+	top, err := FindGitTop(root)
+	if err != nil || top == "" {
+		return nil, err
 	}
+	g, err := newRepo(root, top, filepath.Join(top, ".git"))
+	if err != nil {
+		return nil, fmt.Errorf("git work tree at %s: %w", top, err)
+	}
+	return g, nil
 }
 
 func newRepo(root, top, dotGit string) (*gitRepo, error) {
-	fi, err := os.Stat(dotGit)
+	fi, err := os.Lstat(dotGit)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +94,9 @@ func newRepo(root, top, dotGit string) (*gitRepo, error) {
 		if !filepath.IsAbs(dir) {
 			dir = filepath.Join(top, dir)
 		}
+		if err := checkGitDir(dir, dotGit); err != nil {
+			return nil, err
+		}
 		gitDir = dir
 	default:
 		return nil, errors.New(".git is not a folder or a file")
@@ -114,6 +109,9 @@ func newRepo(root, top, dotGit string) (*gitRepo, error) {
 		c := strings.TrimSpace(string(data))
 		if !filepath.IsAbs(c) {
 			c = filepath.Join(gitDir, c)
+		}
+		if err := checkGitDir(c, filepath.Join(gitDir, "commondir")); err != nil {
+			return nil, err
 		}
 		common = c
 	}
@@ -208,64 +206,75 @@ func configValue(s string) string {
 }
 
 // loadBase returns the global excludes file and info/exclude, in that order,
-// reloading what changed. The caller holds Policy.mu.
-func (g *gitRepo) loadBase() ([]*ignore.Matcher, error) {
+// reloading what changed. Files are stat'ed and read without holding
+// Policy.mu, which is taken only to compare stamps and swap cached values, so
+// a slow filesystem stalls only its own caller.
+func (p *Policy) loadBase() ([]*ignore.Matcher, error) {
+	g := p.git
 	stamps := make([]fileStamp, len(g.configs))
-	changed := len(g.cfgStamps) != len(stamps)
 	for i, c := range g.configs {
 		st, err := statUserFile(c)
 		if err != nil {
+			p.mu.Lock()
 			g.cfgStamps = nil
+			p.mu.Unlock()
 			return nil, err
 		}
 		stamps[i] = st
-		changed = changed || g.cfgStamps[i] != st
 	}
+	p.mu.Lock()
+	changed := !slices.Equal(g.cfgStamps, stamps)
+	excludes := g.excludes
+	p.mu.Unlock()
 	if changed {
-		excludes, set := "", false
+		value, set := "", false
 		for i, c := range g.configs {
 			if stamps[i].missing {
 				continue
 			}
 			data, _, err := readUserFile(c)
 			if err != nil {
+				p.mu.Lock()
 				g.cfgStamps = nil
+				p.mu.Unlock()
 				return nil, err
 			}
 			if v, ok := excludesFile(data); ok {
-				excludes, set = v, true
+				value, set = v, true
 			}
 		}
 		switch {
-		case !set || excludes == "":
+		case !set || value == "":
 			excludes = g.xdgIgn
-		case strings.HasPrefix(excludes, "~/") && g.home != "":
-			excludes = filepath.Join(g.home, excludes[2:])
-		case !filepath.IsAbs(excludes):
-			excludes = filepath.Join(g.top, excludes)
+		case strings.HasPrefix(value, "~/") && g.home != "":
+			excludes = filepath.Join(g.home, value[2:])
+		case !filepath.IsAbs(value):
+			excludes = filepath.Join(g.top, value)
+		default:
+			excludes = value
 		}
+		p.mu.Lock()
 		g.excludes, g.cfgStamps = excludes, stamps
+		p.mu.Unlock()
 	}
-	global, err := g.global.load(g.excludes, true, g.opts)
+	global, err := p.loadExt(&g.global, excludes, true)
 	if err != nil {
 		return nil, err
 	}
-	exclude, err := g.exclude.load(filepath.Join(g.common, "info", "exclude"), false, g.opts)
+	exclude, err := p.loadExt(&g.exclude, filepath.Join(g.common, "info", "exclude"), false)
 	if err != nil {
 		return nil, err
 	}
 	return []*ignore.Matcher{global, exclude}, nil
 }
 
-// load returns the rules in the file at name, re-reading it when its stamp
-// changed. An empty name or a missing file means no rules. user says whether
-// the file is user-controlled (symlinks followed) or comes with the repo.
-func (f *extFile) load(name string, user bool, o ignore.Options) (*ignore.Matcher, error) {
+// loadExt returns the rules in the file at name, cached in f, re-reading it
+// when its stamp changed. An empty name or a missing file means no rules.
+// user says whether the file is user-controlled (symlinks followed) or comes
+// with the repo. Policy.mu guards f and is never held during I/O.
+func (p *Policy) loadExt(f *extFile, name string, user bool) (*ignore.Matcher, error) {
 	if name == "" {
 		return nil, nil
-	}
-	if f.path != name {
-		*f = extFile{path: name}
 	}
 	stat, read := statRepoFile, readRepoFile
 	if user {
@@ -273,23 +282,33 @@ func (f *extFile) load(name string, user bool, o ignore.Options) (*ignore.Matche
 	}
 	st, err := stat(name)
 	if err != nil {
-		f.stamp = fileStamp{}
+		p.mu.Lock()
+		*f = extFile{path: name}
+		p.mu.Unlock()
 		return nil, err
 	}
-	if st == f.stamp {
-		return f.m, nil
+	p.mu.Lock()
+	if f.path == name && f.stamp == st {
+		m := f.m
+		p.mu.Unlock()
+		return m, nil
 	}
-	f.m = nil
+	p.mu.Unlock()
+	var m *ignore.Matcher
 	if !st.missing {
 		data, rst, err := read(name)
 		if err != nil {
-			f.stamp = fileStamp{}
+			p.mu.Lock()
+			*f = extFile{path: name}
+			p.mu.Unlock()
 			return nil, err
 		}
-		f.m, st = ignore.ParseWith(data, o), rst
+		m, st = ignore.ParseWith(data, p.git.opts), rst
 	}
-	f.stamp = st
-	return f.m, nil
+	p.mu.Lock()
+	*f = extFile{path: name, stamp: st, m: m}
+	p.mu.Unlock()
+	return m, nil
 }
 
 // rootRel maps a top-relative folder to the root. inside is false for the
@@ -318,22 +337,22 @@ func (g *gitRepo) fileName(dir string) string {
 // dirMatcher returns the rules of the .gitignore in the top-relative folder
 // dir, reloading it when its stamp changed. A .gitignore is never read
 // through a symlink, and a file inside the root is read through the root
-// handle. The caller holds Policy.mu.
+// handle. Like loadBase, it holds Policy.mu only around the cache.
 func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 	g := p.git
-	dr := g.dirs[dir]
-	if dr == nil {
-		dr = &dirRules{}
-		g.dirs[dir] = dr
-	}
 	rel, inside := g.rootRel(dir)
 	name := g.fileName(dir)
+	store := func(dr *dirRules) (*ignore.Matcher, error) {
+		p.mu.Lock()
+		g.dirs[dir] = dr
+		p.mu.Unlock()
+		return dr.m, dr.err
+	}
 	fail := func(err error) (*ignore.Matcher, error) {
 		if inside {
 			err = readErr(name, err)
 		}
-		dr.stamp, dr.m, dr.err = fileStamp{}, nil, fmt.Errorf("%w; folder skipped", err)
-		return nil, dr.err
+		return store(&dirRules{err: fmt.Errorf("%w; folder skipped", err)})
 	}
 	var st fileStamp
 	var err error
@@ -345,24 +364,27 @@ func (p *Policy) dirMatcher(dir string) (*ignore.Matcher, error) {
 	if err != nil {
 		return fail(err)
 	}
-	if st == dr.stamp {
-		return dr.m, dr.err
+	p.mu.Lock()
+	if dr := g.dirs[dir]; dr != nil && dr.stamp == st {
+		m, err := dr.m, dr.err
+		p.mu.Unlock()
+		return m, err
 	}
-	dr.m, dr.err = nil, nil
+	p.mu.Unlock()
+	dr := &dirRules{stamp: st}
 	if !st.missing {
 		var data []byte
 		if inside {
-			data, st, err = p.readRootRepoFile(path.Join(rel, GitIgnoreFileName))
+			data, dr.stamp, err = p.readRootRepoFile(path.Join(rel, GitIgnoreFileName))
 		} else {
-			data, st, err = readRepoFile(name)
+			data, dr.stamp, err = readRepoFile(name)
 		}
 		if err != nil {
 			return fail(err)
 		}
 		dr.m = ignore.ParseWith(data, g.opts)
 	}
-	dr.stamp = st
-	return dr.m, nil
+	return store(dr)
 }
 
 // stripPath drops the path a *fs.PathError carries.
@@ -394,9 +416,7 @@ func (p *Policy) gitView() (*gitView, error) {
 	if p.git == nil {
 		return nil, nil
 	}
-	p.mu.Lock()
-	base, err := p.git.loadBase()
-	p.mu.Unlock()
+	base, err := p.loadBase()
 	if err != nil {
 		return nil, err
 	}
@@ -429,9 +449,7 @@ func (v *gitView) dir(d string) *ignore.Matcher {
 	if m, ok := v.memo[d]; ok {
 		return m
 	}
-	v.p.mu.Lock()
 	m, err := v.p.dirMatcher(d)
-	v.p.mu.Unlock()
 	if err != nil {
 		v.errs[d] = err
 		m = matchAll

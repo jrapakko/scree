@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -109,7 +110,7 @@ func TestGitFileSymlinkRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	link(t, filepath.Join(base, "gitfile"), filepath.Join(top, ".git"))
-	if _, err := Open(top, 0); err == nil || !strings.Contains(err.Error(), "symlinks are not followed") {
+	if _, err := Open(top, 0); !errors.Is(err, ErrUntrustedGit) {
 		t.Fatalf("Open err = %v", err)
 	}
 }

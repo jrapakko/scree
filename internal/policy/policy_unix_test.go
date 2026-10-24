@@ -237,3 +237,96 @@ func TestRepoConfigExcludesFileIgnored(t *testing.T) {
 		}
 	}
 }
+
+// within fails the test if fn does not return within d.
+func within(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); fn() }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s blocked", what)
+	}
+}
+
+func mkfifo(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(p, 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+}
+
+func TestFIFOGitignoreDoesNotBlock(t *testing.T) {
+	top := repoFixture(t)
+	mkfifo(t, filepath.Join(top, "docs", ".gitignore"))
+	write(t, filepath.Join(top, "docs", "a.md"), "a")
+	write(t, filepath.Join(top, "ok.md"), "ok")
+	p := open(t, top, 0)
+	var s Summary
+	within(t, 2*time.Second, "Scan", func() {
+		var err error
+		s, err = p.Scan(context.Background())
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	if s.Allowed != 1 || !reflect.DeepEqual(s.Ignored[GitIgnore], []string{"docs/"}) || len(s.ReadErrors) != 1 {
+		t.Errorf("Scan = %+v", s)
+	}
+}
+
+func TestFIFOInfoExclude(t *testing.T) {
+	top := repoFixture(t)
+	mkfifo(t, filepath.Join(top, ".git", "info", "exclude"))
+	write(t, filepath.Join(top, "a.md"), "a")
+	p := open(t, top, 0)
+	within(t, 2*time.Second, "Read", func() {
+		if _, err := p.Read("a.md"); err == nil {
+			t.Error("Read succeeded with a FIFO info/exclude")
+		}
+	})
+}
+
+func TestFIFOUserExcludesFile(t *testing.T) {
+	top := repoFixture(t)
+	home := os.Getenv("HOME")
+	mkfifo(t, filepath.Join(home, ".config", "git", "ignore"))
+	write(t, filepath.Join(top, "a.md"), "a")
+	p := open(t, top, 0)
+	within(t, 2*time.Second, "Scan", func() {
+		if _, err := p.Scan(context.Background()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("Scan err = %v", err)
+		}
+	})
+	// A FIFO named by ~/.gitconfig (followed, as a user file) is refused too.
+	write(t, filepath.Join(home, ".gitconfig"), "[core]\n\texcludesFile = ~/fifo\n")
+	mkfifo(t, filepath.Join(home, "fifo"))
+	within(t, 2*time.Second, "Scan", func() {
+		if _, err := p.Scan(context.Background()); err == nil {
+			t.Error("Scan succeeded")
+		}
+	})
+}
+
+// A note swapped for a FIFO between the checks and the open is never waited
+// on.
+func TestFIFOSwappedNoteDoesNotBlock(t *testing.T) {
+	dir := fixture(t)
+	root := filepath.Join(dir, "notes")
+	write(t, filepath.Join(root, "a.md"), "a")
+	p := open(t, root, 0)
+	TestHooks.BeforeOpen = func(rel string) {
+		os.Remove(filepath.Join(root, rel))
+		syscall.Mkfifo(filepath.Join(root, rel), 0o644)
+	}
+	defer func() { TestHooks.BeforeOpen = nil }()
+	within(t, 2*time.Second, "Read", func() {
+		if _, err := p.Read("a.md"); !errors.Is(err, ErrChanged) {
+			t.Errorf("Read err = %v, want ErrChanged", err)
+		}
+	})
+}

@@ -107,13 +107,19 @@ func (ix *Indexer) Rel(abs string) (string, error) { return ix.Policy.Rel(abs) }
 // returned, with changed reporting whether rows were removed. rel is first
 // mapped to its on-disk name (Policy.Canonical), which is the store key.
 func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err error) {
+	return ix.IndexFileCanon(ctx, ix.Policy.NewCanon(), rel)
+}
+
+// IndexFileCanon is IndexFile with the folder listings of the batch c, for
+// the watcher, which handles many paths at a time.
+func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel string) (changed bool, err error) {
 	ix.writeMu.Lock()
 	defer ix.writeMu.Unlock()
-	clean, err := ix.Policy.Canonical(rel)
+	clean, err := c.Canonical(rel)
 	if err == nil {
 		var src []byte
 		var fi fs.FileInfo
-		src, fi, err = ix.Policy.ReadStat(clean)
+		src, fi, err = c.ReadStat(clean)
 		switch {
 		case err == nil:
 			return ix.indexSrc(ctx, clean, src, fi)

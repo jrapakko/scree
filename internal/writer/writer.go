@@ -15,6 +15,7 @@ import (
 
 	"github.com/jrapakko/scree/internal/index"
 	"github.com/jrapakko/scree/internal/lock"
+	"github.com/jrapakko/scree/internal/store"
 	"github.com/jrapakko/scree/internal/textsafe"
 	"github.com/jrapakko/scree/internal/watch"
 )
@@ -24,6 +25,12 @@ const DefaultRetry = 5 * time.Second
 
 // SyncedAtKey is the meta key the writer sets when a full sync finishes.
 const SyncedAtKey = "synced_at"
+
+// MarkSynced records in s that a full sync just finished. Only the holder of
+// the writer lock may call it: the writer after its sync, and CLI reindex.
+func MarkSynced(s *store.Store) error {
+	return s.SetMeta(SyncedAtKey, time.Now().UTC().Format(time.RFC3339))
+}
 
 // Phase is what a Writer is doing.
 type Phase int
@@ -152,7 +159,7 @@ func (w *Writer) hold(ctx context.Context) error {
 	// A first sync allocates much more than watching does; hand the heap
 	// back now rather than holding it for the life of the session.
 	debug.FreeOSMemory()
-	if err := ix.Store.SetMeta(SyncedAtKey, time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if err := MarkSynced(ix.Store); err != nil {
 		return err
 	}
 	w.mu.Lock()

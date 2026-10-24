@@ -84,6 +84,7 @@ func main() {
 	cmd, args := os.Args[1], os.Args[2:]
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go exitOnSecondSignal(ctx, stop)
 
 	var err error
 	switch cmd {
@@ -108,6 +109,53 @@ func main() {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, "scree:", textsafe.Strip(err.Error()))
 		os.Exit(1)
+	}
+}
+
+// exitOnSecondSignal waits for the first SIGINT or SIGTERM, which cancels
+// ctx and starts a clean shutdown, then exits at once on a second one.
+func exitOnSecondSignal(ctx context.Context, stop context.CancelFunc) {
+	<-ctx.Done()
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	stop()
+	<-c
+	fmt.Fprintln(os.Stderr, "scree: second signal; exiting now")
+	os.Exit(1)
+}
+
+// ShutdownTimeout bounds how long serve and watch wait for the writer to
+// stop after the client goes away or a signal arrives. A writer stuck in a
+// file read or an API call then cannot keep the process alive.
+var ShutdownTimeout = 5 * time.Second
+
+// runWriter runs the writer role; tests replace it.
+var runWriter = func(ctx context.Context, w *writer.Writer) error { return w.Run(ctx) }
+
+// startWriter runs w in the background. stop cancels it and waits at most
+// ShutdownTimeout; it reports whether the writer stopped, and only then may
+// the index be closed.
+func startWriter(ctx context.Context, w *writer.Writer, onErr func(error)) (done <-chan error, stop func() bool) {
+	wctx, cancel := context.WithCancel(ctx)
+	ch := make(chan error, 1)
+	run := runWriter
+	go func() {
+		err := run(wctx, w)
+		if err != nil && onErr != nil {
+			onErr(err)
+		}
+		ch <- err
+		close(ch)
+	}()
+	return ch, func() bool {
+		cancel()
+		select {
+		case <-ch:
+			return true
+		case <-time.After(ShutdownTimeout):
+			log.Printf("writer did not stop within %s; exiting", ShutdownTimeout)
+			return false
+		}
 	}
 }
 
@@ -270,10 +318,19 @@ func runWatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer closeIndexer(ix)
 	// Waits for the lock if another process holds it, then syncs and
 	// watches. An error exits non-zero, so systemd or Docker restarts it.
-	return newWriter(&cfg, ix).Run(ctx)
+	done, stop := startWriter(ctx, newWriter(&cfg, ix), nil)
+	select {
+	case err := <-done:
+		closeIndexer(ix)
+		return err
+	case <-ctx.Done():
+	}
+	if stop() {
+		closeIndexer(ix)
+	}
+	return nil
 }
 
 func runServe(ctx context.Context, args []string) error {
@@ -297,23 +354,19 @@ func runServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer closeIndexer(ix)
 	log.Printf("serving %s (index %s)", ix.Root(), cfg.db)
 	// The writer role runs in the background, so the MCP handshake and
-	// searches never wait for the lock or the first sync. It stops before
-	// the index is closed.
+	// searches never wait for the lock or the first sync. On the way out it
+	// gets ShutdownTimeout to stop; the index is closed only if it did, and
+	// otherwise the process exits with it still running.
 	w := newWriter(&cfg, ix)
-	wctx, stopWriter := context.WithCancel(ctx)
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		if err := w.Run(wctx); err != nil {
-			log.Printf("writer: %v; serving what is indexed", err)
-		}
-	}()
+	_, stopWriter := startWriter(ctx, w, func(err error) {
+		log.Printf("writer: %v; serving what is indexed", err)
+	})
 	defer func() {
-		stopWriter()
-		<-writerDone
+		if stopWriter() {
+			closeIndexer(ix)
+		}
 	}()
 	srv := mcpserver.New(ix, w, version)
 	if *addr == "" {
@@ -395,6 +448,17 @@ func runReindex(ctx context.Context, args []string) error {
 		if *all {
 			return fmt.Errorf("index is in use by pid %d (a Claude Code session or scree watch); close it, then run reindex -all", pid)
 		}
+		if fs.NArg() == 1 {
+			// Refuse an ignored path as the MCP tool does, before saying
+			// another process has it covered.
+			rel, err := argRel(ix, fs.Arg(0))
+			if err != nil {
+				return err
+			}
+			if _, err := ix.Policy.Read(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
 		fmt.Printf("pid %d keeps this index current; nothing to do\n", pid)
 		return nil
 	}
@@ -420,6 +484,9 @@ func runReindex(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := writer.MarkSynced(ix.Store); err != nil {
+		return err
+	}
 	fmt.Printf("%d notes: %d indexed, %d removed, %d failed, %d deferred\n",
 		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
 	if st.Failed+st.Deferred > 0 {
@@ -431,14 +498,7 @@ func runReindex(ctx context.Context, args []string) error {
 // reindexOne indexes one note, given relative to the notes folder or as an
 // absolute path under it. A refusal is an error.
 func reindexOne(ctx context.Context, ix *index.Indexer, arg string) error {
-	rel := filepath.ToSlash(arg)
-	if filepath.IsAbs(arg) {
-		var err error
-		if rel, err = ix.Rel(arg); err != nil {
-			return err
-		}
-	}
-	rel, err := ix.Policy.Canonical(rel)
+	rel, err := argRel(ix, arg)
 	if err != nil {
 		return err
 	}
@@ -452,6 +512,19 @@ func reindexOne(ctx context.Context, ix *index.Indexer, arg string) error {
 		fmt.Printf("%q is already up to date\n", rel)
 	}
 	return nil
+}
+
+// argRel maps a path argument, relative to the folder or absolute under it,
+// to its canonical store key.
+func argRel(ix *index.Indexer, arg string) (string, error) {
+	rel := filepath.ToSlash(arg)
+	if filepath.IsAbs(arg) {
+		var err error
+		if rel, err = ix.Rel(arg); err != nil {
+			return "", err
+		}
+	}
+	return ix.Policy.Canonical(rel)
 }
 
 func runDoctor(ctx context.Context, args []string) error {
@@ -495,6 +568,11 @@ func runDoctor(ctx context.Context, args []string) error {
 		st, err := ix.Store.Stats(ctx)
 		report(err == nil, "index %s: %d notes, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
 		have, _ = ix.Store.Model()
+		synced, _ := ix.Store.Meta(writer.SyncedAtKey)
+		if synced == "" {
+			synced = "never"
+		}
+		report(true, "last full sync: %s", synced)
 	}
 	switch held, pid, err := lock.Probe(lockPath(&cfg)); {
 	case err != nil:

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/jrapakko/scree/internal/policy"
 )
 
 // folderSource says where the indexed folder came from.
@@ -36,7 +38,9 @@ func (s folderSource) String() string {
 
 // resolveFolder picks the folder to index. serve passes useProjectDir=true.
 // explicit is the -notes value ("" if not given) and is used as is. A folder
-// found any other way is lifted to its git root, and refused if it is the
+// found any other way is lifted to its git root (policy.FindGitTop: never
+// in or above a sticky folder, and only through a .git the user owns that is
+// not a symlink), and refused if it is the
 // home directory, a folder above it, or a filesystem root.
 func resolveFolder(explicit string, useProjectDir bool) (root string, src folderSource, err error) {
 	if explicit != "" {
@@ -63,7 +67,11 @@ func resolveFolder(explicit string, useProjectDir bool) (root string, src folder
 		return "", 0, fmt.Errorf("folder: %w", err)
 	}
 	root = base
-	if top := gitRoot(base); top != "" {
+	top, err := policy.FindGitTop(base)
+	if err != nil {
+		return "", 0, err
+	}
+	if top != "" {
 		root = top
 		if src == cwd {
 			src = gitRootOfCwd
@@ -103,21 +111,6 @@ func relUnder(dir, path string) (string, bool) {
 		return "", false
 	}
 	return rel, true
-}
-
-// gitRoot walks up from dir to the nearest folder containing a ".git"
-// entry; "" if none.
-func gitRoot(dir string) string {
-	for {
-		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-		dir = parent
-	}
 }
 
 // dataHome returns $XDG_DATA_HOME, or ~/.local/share when it is unset.

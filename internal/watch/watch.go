@@ -278,6 +278,8 @@ func worker(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, q *work
 			q.requestSync(false)
 		case <-q.wake:
 		}
+		// One batch of folder listings per drain, renewed after a sync.
+		canon := ix.Policy.NewCanon()
 		for ctx.Err() == nil {
 			doSync, rebuild, abs, ok := q.next()
 			if !ok {
@@ -294,9 +296,10 @@ func worker(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, q *work
 					if runSync(ctx, ix, rel+" changed") {
 						armResync()
 					}
+					canon = ix.Policy.NewCanon()
 					continue
 				}
-				if handle(ctx, ix, abs) {
+				if handle(ctx, ix, canon, abs) {
 					armResync()
 				}
 				continue
@@ -306,6 +309,7 @@ func worker(ctx context.Context, w *fsnotify.Watcher, ix *index.Indexer, q *work
 				what = "resync after event overflow"
 			}
 			deferred := runSync(ctx, ix, what)
+			canon = ix.Policy.NewCanon()
 			if rebuild {
 				if err := syncWatches(w, ix); err != nil {
 					ix.Log.Printf("watch: %v", err)
@@ -359,15 +363,15 @@ func isIgnoreFile(rel string) bool {
 
 // handle indexes or removes one changed path. It reports whether a note was
 // deferred because the embedding API is unavailable.
-func handle(ctx context.Context, ix *index.Indexer, abs string) (deferred bool) {
+func handle(ctx context.Context, ix *index.Indexer, canon *policy.Canon, abs string) (deferred bool) {
 	rel, err := ix.Rel(abs)
 	if err != nil {
 		return false
 	}
 	// Match and store the on-disk name only. A missing path keeps its
 	// spelling, which is how it was stored.
-	if canon, err := ix.Policy.Canonical(rel); err == nil {
-		rel = canon
+	if c, err := canon.Canonical(rel); err == nil {
+		rel = c
 	}
 	fi, err := os.Lstat(abs)
 	switch {
@@ -378,12 +382,12 @@ func handle(ctx context.Context, ix *index.Indexer, abs string) (deferred bool) 
 		}
 	case fi.IsDir():
 		return false
-	case ix.Policy.CheckName(rel) != policy.Allowed:
+	case canon.CheckName(rel) != policy.Allowed:
 		// Not a note; IndexFile only drops any stale rows.
-		ix.IndexFile(ctx, rel)
+		ix.IndexFileCanon(ctx, canon, rel)
 		return false
 	}
-	_, err = ix.IndexFile(ctx, rel)
+	_, err = ix.IndexFileCanon(ctx, canon, rel)
 	switch {
 	case errors.Is(err, index.ErrPaused):
 		// Already logged when the pause began.
