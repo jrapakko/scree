@@ -125,7 +125,7 @@ scree reindex            # index new and changed files
 scree reindex docs/a.md  # re-index one file
 scree reindex -all       # rebuild from scratch
 scree search "how do I rotate the backup keys"
-scree search -mode keyword DELETE_STALE_INTAKE   # exact words, no API call
+scree search -mode keyword PURGE_OLD_RECORDS   # exact words, no API call
 scree search -format json "…"                    # one JSON object per hit
 scree watch              # keep the index current (run as a service)
 scree serve -notes .     # MCP over stdio, from a terminal
@@ -139,7 +139,7 @@ Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=f
 
 `scree search -mode` and the `search_docs` tool's `mode` take:
 
-- **`auto`** (the default): `semantic`, unless the query has an identifier-like word, a word with a letter plus `_` or a digit, such as `DELETE_STALE_INTAKE`, `psycopg_pool`, `D1-Q4` or `v2`; then `hybrid`. `ID`, `API`, `2026` and `well-known` don't count.
+- **`auto`** (the default): `semantic`, unless the query has an identifier-like word, a word with a letter plus `_` or a digit, such as `PURGE_OLD_RECORDS`, `psycopg_pool`, `R7-Q2` or `v2`; then `hybrid`. `ID`, `API`, `2026` and `well-known` don't count.
 - **`hybrid`**: a vector search and an SQLite FTS5 keyword search over chunk text, heading and path, merged by reciprocal rank fusion, so exact names rank first.
 - **`semantic`**: vectors only.
 - **`keyword`**: FTS5 only. It makes no API call, so it works without a key or while the API is down. A failed embedding call says so.

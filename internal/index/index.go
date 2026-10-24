@@ -365,7 +365,7 @@ func Resolve(mode Mode, query string) Mode {
 // makes auto mode add keyword search. The query is split on whitespace and
 // each word trimmed of surrounding quotes, brackets, backticks and
 // .,;:?!; a word qualifies if it has at least one ASCII letter and at least
-// one "_" or ASCII digit: DELETE_STALE_INTAKE, psycopg_pool, D1-Q4, v2
+// one "_" or ASCII digit: PURGE_OLD_RECORDS, psycopg_pool, R7-Q2, v2
 // qualify; ID, API, 2026, well-known, psycopg do not.
 func HasIdentifier(query string) bool {
 	for _, w := range strings.Fields(query) {

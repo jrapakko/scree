@@ -20,7 +20,7 @@ func TestFTS5Available(t *testing.T) {
 		`CREATE VIRTUAL TABLE t_uni USING fts5(x, tokenize="unicode61 remove_diacritics 2 tokenchars '_-'")`,
 		`CREATE VIRTUAL TABLE t_tri USING fts5(x, tokenize=trigram)`,
 		`CREATE VIRTUAL TABLE t_vocab USING fts5vocab(t_uni, row)`,
-		`INSERT INTO t_uni(x) VALUES('Run DELETE_STALE_INTAKE after D1-Q4 with psycopg_pool. Café')`,
+		`INSERT INTO t_uni(x) VALUES('Run PURGE_OLD_RECORDS after R7-Q2 with psycopg_pool. Café')`,
 		`INSERT INTO t_tri(x) VALUES('psycopg_pool')`,
 	} {
 		if _, err := s.db.Exec(q); err != nil {
@@ -38,7 +38,7 @@ func TestFTS5Available(t *testing.T) {
 		terms = append(terms, term)
 	}
 	rows.Close()
-	for _, want := range []string{"delete_stale_intake", "d1-q4", "psycopg_pool", "cafe"} {
+	for _, want := range []string{"purge_old_records", "r7-q2", "psycopg_pool", "cafe"} {
 		if !slices.Contains(terms, want) {
 			t.Errorf("token %q missing; tokens %q", want, terms)
 		}
@@ -198,7 +198,7 @@ func TestMigrateFTSTiming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	words := strings.Fields("the backup keys rotate every quarter using SCREE_DB and D1-Q4 notes about psycopg_pool configuration with headings and paths that vary across a folder of markdown documents")
+	words := strings.Fields("the backup keys rotate every quarter using SCREE_DB and R7-Q2 notes about psycopg_pool configuration with headings and paths that vary across a folder of markdown documents")
 	const n = 100_000
 	for i := range n {
 		var b strings.Builder

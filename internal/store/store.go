@@ -53,8 +53,8 @@ CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 // ftsSchema is the keyword index: an external-content FTS5 table over chunk
 // text, heading and path, so the text is not stored twice. The triggers keep
 // it in step with chunks inside the same transaction as every write. With
-// "_" and "-" as token characters, identifiers such as DELETE_STALE_INTAKE
-// or D1-Q4 stay one token.
+// "_" and "-" as token characters, identifiers such as PURGE_OLD_RECORDS
+// or R7-Q2 stay one token.
 const ftsSchema = `
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 	text, heading, path,

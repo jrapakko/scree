@@ -20,7 +20,7 @@ func searchFixture(t *testing.T) (notes, db string) {
 	t.Helper()
 	notes = filepath.Join(tempDir(t), "notes")
 	mkdir(t, notes)
-	src := "# Ops\n\nrun DELETE_STALE_INTAKE nightly\n"
+	src := "# Ops\n\nrun PURGE_OLD_RECORDS nightly\n"
 	if err := os.WriteFile(filepath.Join(notes, "ops.md"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func searchFixture(t *testing.T) (notes, db string) {
 	if err := s.CheckRoot(root); err != nil {
 		t.Fatal(err)
 	}
-	chunks := []store.Chunk{{Path: "ops.md", Heading: "Ops", Line: 1, EndLine: 3, Text: "# Ops\n\nrun DELETE_STALE_INTAKE nightly"}}
+	chunks := []store.Chunk{{Path: "ops.md", Heading: "Ops", Line: 1, EndLine: 3, Text: "# Ops\n\nrun PURGE_OLD_RECORDS nightly"}}
 	if err := s.ReplaceFile(context.Background(), "ops.md", "h", 1, nil, chunks, [][]float32{{1, 0}}); err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestCLISearchKeywordJSON(t *testing.T) {
 	notes, db := searchFixture(t)
 	var runErr error
 	out := captureStdout(t, func() {
-		runErr = runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "json", "delete_stale_intake"})
+		runErr = runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "json", "purge_old_records"})
 	})
 	if runErr != nil {
 		t.Fatal(runErr)
@@ -98,7 +98,7 @@ func TestCLISearchDefaultsToAuto(t *testing.T) {
 	t.Setenv("SCREE_EMBED_URL", api.URL)
 	t.Setenv("OPENROUTER_API_KEY", "test-key")
 	t.Setenv("SCREE_ZDR", "0")
-	for q, want := range map[string]string{"nightly run": "semantic", "delete_stale_intake": "hybrid"} {
+	for q, want := range map[string]string{"nightly run": "semantic", "purge_old_records": "hybrid"} {
 		var runErr error
 		out := captureStdout(t, func() {
 			runErr = runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "json", q})

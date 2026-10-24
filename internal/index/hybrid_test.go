@@ -35,8 +35,8 @@ func TestParseMode(t *testing.T) {
 
 func TestFTSQuery(t *testing.T) {
 	for in, want := range map[string]string{
-		"DELETE_STALE_INTAKE":      `"DELETE_STALE_INTAKE"`,
-		"what is (D1-Q4)?":         `"what" OR "is" OR "D1-Q4"`,
+		"PURGE_OLD_RECORDS":        `"PURGE_OLD_RECORDS"`,
+		"what is (R7-Q2)?":         `"what" OR "is" OR "R7-Q2"`,
 		`foo" OR "bar`:             `"foo" OR "OR" OR "bar"`,
 		`foo"OR"bar`:               `"foo""OR""bar"`,
 		"col:text":                 `"col:text"`,
@@ -135,8 +135,8 @@ func (d *decoyEmbedder) Model() string { return "decoy" }
 func TestHybridIdentifierFirst(t *testing.T) {
 	ix, _ := setup(t)
 	ix.Embedder = &decoyEmbedder{}
-	ids := []string{"DELETE_STALE_INTAKE", "D1-Q4", "S3-CI", "psycopg_pool"}
-	write(t, ix.Root(), "decoy.md", "# Decoy\nthe decoy talks about stale intake, pools and quarters\n")
+	ids := []string{"PURGE_OLD_RECORDS", "R7-Q2", "B2-CI", "psycopg_pool"}
+	write(t, ix.Root(), "decoy.md", "# Decoy\nthe decoy talks about old records, pools and quarters\n")
 	for i := range 25 {
 		write(t, ix.Root(), fmt.Sprintf("n%02d.md", i), fmt.Sprintf("# Note %d\nordinary text number %d about deleting stale things\n", i, i))
 	}
@@ -428,14 +428,14 @@ func TestRepoDocsIdentifiers(t *testing.T) {
 
 func TestHasIdentifier(t *testing.T) {
 	for q, want := range map[string]bool{
-		"DELETE_STALE_INTAKE": true,
-		"psycopg_pool":        true,
-		"D1-Q4":               true,
-		"S3-CI":               true,
-		"RT2-13":              true,
-		"v2":                  true,
+		"PURGE_OLD_RECORDS": true,
+		"psycopg_pool":      true,
+		"R7-Q2":             true,
+		"B2-CI":             true,
+		"RT2-13":            true,
+		"v2":                true,
 		"what sets `IDLE_IN_TRANSACTION_TIMEOUT_MS`?": true,
-		"is (D1-Q4) done?":                            true,
+		"is (R7-Q2) done?":                            true,
 		`"psycopg_pool",`:                             true,
 		"ID":                                          false,
 		"ORM":                                         false,
@@ -462,10 +462,10 @@ func TestResolve(t *testing.T) {
 	}{
 		{Auto, "how do backups work", Semantic},
 		{"", "how do backups work", Semantic},
-		{Auto, "what is D1-Q4", Hybrid},
+		{Auto, "what is R7-Q2", Hybrid},
 		{"", "psycopg_pool sizing", Hybrid},
 		{Hybrid, "how do backups work", Hybrid},
-		{Semantic, "D1-Q4", Semantic},
+		{Semantic, "R7-Q2", Semantic},
 		{Keyword, "how do backups work", Keyword},
 	} {
 		if got := Resolve(c.mode, c.query); got != c.want {
@@ -480,7 +480,7 @@ func TestAutoMode(t *testing.T) {
 	ix, _ := setup(t)
 	ix.Embedder = &decoyEmbedder{}
 	write(t, ix.Root(), "decoy.md", "# Decoy\nthe decoy talks about rotation\n")
-	write(t, ix.Root(), "id.md", "# Ops\nrun DELETE_STALE_INTAKE when needed\n")
+	write(t, ix.Root(), "id.md", "# Ops\nrun PURGE_OLD_RECORDS when needed\n")
 	write(t, ix.Root(), "plain.md", "# Plain\nrotate the backup keys\n")
 	if _, err := ix.Sync(context.Background()); err != nil {
 		t.Fatal(err)
@@ -507,7 +507,7 @@ func TestAutoMode(t *testing.T) {
 	if want := paths(plain, Semantic); !slices.Equal(got, want) {
 		t.Errorf("auto plain = %v, semantic %v", got, want)
 	}
-	id := "when does DELETE_STALE_INTAKE run"
+	id := "when does PURGE_OLD_RECORDS run"
 	got = paths(id, Auto)
 	if keyword != 1 {
 		t.Errorf("auto ran %d keyword queries for an identifier", keyword)
