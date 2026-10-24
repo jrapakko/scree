@@ -61,11 +61,14 @@ func runIndexesOut(t *testing.T, prune bool) (string, error) {
 	return b.String(), err
 }
 
-// lineFor returns the listing line for root.
+// lineFor returns the listing line for root: it starts with the root, cut
+// to maxMetaRunes as the listing does (temp paths can be longer, as on
+// macOS), and ends with the index directory's name, which tells apart roots
+// that share the cut prefix.
 func lineFor(t *testing.T, out, root string) string {
 	t.Helper()
 	for _, l := range strings.Split(out, "\n") {
-		if strings.HasPrefix(l, quote(root)+"  ") {
+		if strings.HasPrefix(l, quote(capRunes(root))+"  ") && strings.HasSuffix(l, "  ("+quote(filepath.Base(indexDir(root)))+")") {
 			return l
 		}
 	}

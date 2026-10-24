@@ -52,7 +52,7 @@ func TestGitignoreSymlinkInRootRefused(t *testing.T) {
 
 func TestAncestorGitignoreSymlinkRefused(t *testing.T) {
 	top := repoFixture(t)
-	secret := filepath.Join(t.TempDir(), "secret.txt")
+	secret := filepath.Join(tempDir(t), "secret.txt")
 	write(t, secret, fakeSecret)
 	link(t, secret, filepath.Join(top, "sub", ".gitignore"))
 	root := filepath.Join(top, "sub", "inner")
@@ -70,7 +70,7 @@ func TestAncestorGitignoreSymlinkRefused(t *testing.T) {
 
 func TestInfoExcludeSymlinkRefused(t *testing.T) {
 	top := repoFixture(t)
-	secret := filepath.Join(t.TempDir(), "secret.txt")
+	secret := filepath.Join(tempDir(t), "secret.txt")
 	write(t, secret, fakeSecret)
 	link(t, secret, filepath.Join(top, ".git", "info", "exclude"))
 	write(t, filepath.Join(top, "a.md"), "a")
@@ -103,7 +103,7 @@ func TestScreeignoreSymlinkRefused(t *testing.T) {
 
 func TestGitFileSymlinkRefused(t *testing.T) {
 	isolateGit(t)
-	base := t.TempDir()
+	base := tempDir(t)
 	top := filepath.Join(base, "repo")
 	write(t, filepath.Join(base, "gitfile"), "gitdir: "+filepath.Join(base, "real.git")+"\n")
 	if err := os.MkdirAll(filepath.Join(base, "real.git", "info"), 0o755); err != nil {
@@ -143,7 +143,7 @@ func TestUserExcludesFileSymlinkFollowed(t *testing.T) {
 func TestUserExcludesFileContentNotEchoed(t *testing.T) {
 	top := repoFixture(t)
 	home := os.Getenv("HOME")
-	secret := filepath.Join(t.TempDir(), "secret.txt")
+	secret := filepath.Join(tempDir(t), "secret.txt")
 	write(t, secret, fakeSecret)
 	write(t, filepath.Join(home, ".gitconfig"), "[core]\n\texcludesFile = "+secret+"\n")
 	write(t, filepath.Join(top, "a.md"), "a")

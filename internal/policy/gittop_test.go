@@ -26,7 +26,7 @@ func fakeOwner(t *testing.T, name string) {
 
 func TestNoLiftAcrossSticky(t *testing.T) {
 	isolateGit(t)
-	s := filepath.Join(t.TempDir(), "s")
+	s := filepath.Join(tempDir(t), "s")
 	p := filepath.Join(s, "p")
 	if err := os.MkdirAll(filepath.Join(s, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestForeignGitRefused(t *testing.T) {
 
 func TestSymlinkDotGitRefused(t *testing.T) {
 	isolateGit(t)
-	base := t.TempDir()
+	base := tempDir(t)
 	if err := os.MkdirAll(filepath.Join(base, "real.git", "info"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestSymlinkDotGitRefused(t *testing.T) {
 
 func TestGitdirTargetOwner(t *testing.T) {
 	isolateGit(t)
-	base := t.TempDir()
+	base := tempDir(t)
 	gitdir := filepath.Join(base, "real.git")
 	common := filepath.Join(base, "common.git")
 	for _, d := range []string{filepath.Join(gitdir, "info"), filepath.Join(common, "info")} {

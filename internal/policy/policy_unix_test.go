@@ -198,7 +198,7 @@ func TestWorktreesPrunedUnlisted(t *testing.T) {
 // block, or with O_NONBLOCK fail as not a regular file.
 func TestRepoConfigExcludesFileIgnored(t *testing.T) {
 	top := repoFixture(t)
-	fifo := filepath.Join(t.TempDir(), "x")
+	fifo := filepath.Join(tempDir(t), "x")
 	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
 		t.Skipf("mkfifo: %v", err)
 	}

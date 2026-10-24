@@ -17,7 +17,7 @@ import (
 // returns the home folder.
 func isolateGit(t *testing.T) string {
 	t.Helper()
-	home := t.TempDir()
+	home := tempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	return home
@@ -28,7 +28,7 @@ func isolateGit(t *testing.T) string {
 func repoFixture(t *testing.T) string {
 	t.Helper()
 	isolateGit(t)
-	top := filepath.Join(t.TempDir(), "repo")
+	top := filepath.Join(tempDir(t), "repo")
 	if err := os.MkdirAll(filepath.Join(top, ".git", "info"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestExcludesFileParse(t *testing.T) {
 
 func TestGitignoreWorktreeFile(t *testing.T) {
 	isolateGit(t)
-	dir := t.TempDir()
+	dir := tempDir(t)
 	common := filepath.Join(dir, "main", ".git")
 	gitDir := filepath.Join(common, "worktrees", "wt")
 	write(t, filepath.Join(common, "info", "exclude"), "from-common.md\n")
@@ -214,7 +214,7 @@ func TestGitignoreWorktreeFile(t *testing.T) {
 
 func TestGitFileUnparseableFailsOpen(t *testing.T) {
 	isolateGit(t)
-	top := t.TempDir()
+	top := tempDir(t)
 	write(t, filepath.Join(top, ".git"), "not a gitdir line\n")
 	if p, err := Open(top, 0); err == nil {
 		p.Close()
@@ -359,7 +359,7 @@ func TestGitignoreChecksSymlinkTarget(t *testing.T) {
 
 func TestGitignoreSymlinkOutsideSkipsFolder(t *testing.T) {
 	top := repoFixture(t)
-	outside := filepath.Join(t.TempDir(), "ign")
+	outside := filepath.Join(tempDir(t), "ign")
 	write(t, outside, "nothing\n")
 	link(t, outside, filepath.Join(top, "docs", ".gitignore"))
 	write(t, filepath.Join(top, "docs", "a.md"), "a")

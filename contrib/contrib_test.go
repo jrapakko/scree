@@ -14,6 +14,18 @@ import (
 	"testing"
 )
 
+// tempDir returns a fresh temp dir with symlinks resolved (macOS: /var ->
+// /private/var), so it compares equal to the resolved paths the code under
+// test returns.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	d, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 const secret = "sk-or-v1-test-secret-0123456789"
 
 // fake is a stand-in for scree or docker. It records its arguments and the
@@ -42,7 +54,7 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("no /bin/sh")
 	}
-	dir := t.TempDir()
+	dir := tempDir(t)
 	e := env{dir: dir, bin: filepath.Join(dir, "bin"), envFile: filepath.Join(dir, ".config", "scree", "env"), out: filepath.Join(dir, "out"),
 		project: filepath.Join(dir, "proj")}
 	if err := os.Mkdir(e.project, 0o755); err != nil {

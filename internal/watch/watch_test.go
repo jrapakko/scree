@@ -21,6 +21,18 @@ import (
 	"github.com/jrapakko/scree/internal/store"
 )
 
+// tempDir returns a fresh temp dir with symlinks resolved (macOS: /var ->
+// /private/var), so it compares equal to the resolved paths the code under
+// test returns.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	d, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 type constEmbedder struct{}
 
 func (constEmbedder) Embed(_ context.Context, in []string) ([][]float32, error) {
@@ -59,7 +71,7 @@ func startWith(t *testing.T, prepare func(dir, root string), configure func(*ind
 	if testing.Short() {
 		t.Skip("uses real file events and timers")
 	}
-	dir := t.TempDir()
+	dir := tempDir(t)
 	root := filepath.Join(dir, "notes")
 	os.MkdirAll(root, 0o755)
 	if prepare != nil {
@@ -235,7 +247,7 @@ func runUntilExit(t *testing.T, act func(dir, root string)) error {
 	old := HealthInterval
 	HealthInterval = 100 * time.Millisecond
 	t.Cleanup(func() { HealthInterval = old })
-	dir := t.TempDir()
+	dir := tempDir(t)
 	root := filepath.Join(dir, "notes")
 	os.MkdirAll(root, 0o755)
 	s, err := store.Open(filepath.Join(dir, "index.db"))
@@ -284,7 +296,7 @@ func TestWatchExitsWhenRootMoved(t *testing.T) {
 // folders being watched, relative to the root.
 func startRepo(t *testing.T, gitignore string, prepare func(root string)) (string, func() []string, func() []string) {
 	t.Helper()
-	home := t.TempDir()
+	home := tempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	var watcher atomic.Pointer[fsnotify.Watcher]

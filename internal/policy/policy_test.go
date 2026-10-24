@@ -13,10 +13,22 @@ import (
 	"time"
 )
 
+// tempDir returns a fresh temp dir with symlinks resolved (macOS: /var ->
+// /private/var), so it compares equal to the resolved paths the code under
+// test returns.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	d, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 // fixture creates dir/notes and dir/outside, and returns dir.
 func fixture(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := tempDir(t)
 	for _, d := range []string{"notes", "outside"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
 			t.Fatal(err)
@@ -362,7 +374,7 @@ func TestRel(t *testing.T) {
 	}
 	// A path that reaches the root through some other symlink, such as
 	// macOS's /var -> /private/var, still maps to the same key.
-	alt := filepath.Join(t.TempDir(), "alt")
+	alt := filepath.Join(tempDir(t), "alt")
 	link(t, dir, alt)
 	if rel, err := p.Rel(filepath.Join(alt, "notes", "new", "c.md")); err != nil || rel != "new/c.md" {
 		t.Errorf("Rel through another symlink = %q, %v", rel, err)
