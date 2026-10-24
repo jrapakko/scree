@@ -4,21 +4,23 @@ Local semantic search over the markdown in your repos and notes, served to Claud
 
 ## Why it exists
 
-Long markdown files get unwieldy as context, and reorganizing them by hand only delays the problem. Scree splits notes into small pieces, embeds them, and lets Claude Code pull in just the pieces that match a question.
+Long markdown files get unwieldy as context, and reorganizing them by hand only delays the problem. Scree splits notes into small pieces, embeds them, and lets Claude Code pull in just the pieces that match a question. In a code repo, the same applies to READMEs, design docs and ADRs.
 
 The markdown stays the source of truth. The index is derived from it and can be deleted and rebuilt at any time.
 
 ## Architecture
 
-One Go process containing:
+One Go process per Claude Code session (`scree serve`), started by the repo's committed `.mcp.json` (`claude mcp add scree --scope project -- scree-mcp`). A repo without that entry is never indexed. The folder is the git root above `CLAUDE_PROJECT_DIR`, which Claude Code sets in the server's environment. Under Claude Code, `serve` refuses `-notes`, `-db` and `SCREE_DB`; those are command-line options. A folder outside any repo, such as `~/notes`, is searched from the CLI, or from a Claude Code session started in that folder. MCP roots are not used: they are deprecated as of protocol 2026-07-28, they include `--add-dir` folders that have not opted in, and the Go SDK refuses server-initiated `roots/list` on that version. Outside Claude Code, `-notes <dir>` names the folder; the CLI defaults to the git root of the current directory. Each folder has its own index under `$XDG_DATA_HOME/scree/indexes/`. Each process contains:
 
 - **Writer** (fsnotify, hash, chunk): reads the folder's markdown, calls the embedding API, writes to the index. In each process that runs it (`serve` or `watch`), it first takes the index's lock file; only the holder writes.
-- **vec1 index** (SQLite): chunks + vectors, on disk.
-- **MCP search server** (`search_docs`, `read_doc`, `reindex`): reads the index, embeds each query through the same API, serves Claude Code over stdio or HTTP.
+- **Index** (SQLite): chunks with their line ranges and text hashes, vectors in vec1, and an FTS5 keyword index, on disk.
+- **MCP search server** (`search_docs`, `read_doc`, `reindex`): reads the index, embeds each query through the same API when the search mode needs it, serves Claude Code over stdio or HTTP.
 
-Each indexed folder has its own index, and the processes that serve it share it: one writes, the rest read.
+The processes that serve one folder share its index: one writes, the rest read.
 
-External: markdown notes (source of truth), embedding API (OpenRouter), Claude Code, and a human view (editor or browser) that reads the notes directly.
+The wrappers `scree-mcp` (native) and `scree-mcp-docker` are what `.mcp.json` names. They read settings only from `~/.config/scree/env`, with the home directory taken from the password database, and ignore the environment and arguments a repo's `.mcp.json` can set, so a repo cannot choose the binary, the settings file, the endpoint or the key.
+
+External: the markdown files (source of truth), embedding API (OpenRouter), Claude Code, and a human view (editor or browser) that reads the files directly.
 
 ## Go stack
 
@@ -26,24 +28,35 @@ External: markdown notes (source of truth), embedding API (OpenRouter), Claude C
 | --- | --- | --- |
 | Language | Go | One small static binary, low idle memory, no runtime to install. |
 | File watching | `fsnotify` | Native events when run directly on the laptop. Containers on Docker Desktop lose these events on bind mounts. |
-| Vector storage | SQLite with [vec1](https://sqlite.org/vec1) | Disk-backed, so memory stays flat. `ncruces/go-sqlite3` ships vec1 compiled to WebAssembly, so the binary stays CGO-free. Flat (exact) cosine index. `sqlite-vec` was the first choice, but its Go bindings pin driver v0.17.1, far behind current releases. |
-| Embeddings | API through OpenRouter | No local model. Candidates: pplx-embed-v1-0.6b (~$0.004/M tokens), text-embedding-3-small (~$0.02/M). Test both on real notes. Requests ask for zero-data-retention endpoints with `data_collection: deny` by default (`SCREE_ZDR=0` turns this off); a model with no such endpoint fails with a clear error. Timeouts: 10 s per query with no retry on timeout; 30 s per indexing attempt, and after an outage indexing pauses for 30 s, doubling up to 5 min, then resyncs. |
+| Vector storage | SQLite with [vec1](https://sqlite.org/vec1) | Disk-backed, so memory stays flat. `ncruces/go-sqlite3` ships vec1 compiled to WebAssembly, so the binary stays CGO-free. Flat (exact) cosine index. `sqlite-vec` was the first choice, but its Go bindings pin driver v0.17.1, far behind current releases. Keyword search uses the FTS5 extension from the same driver (unicode61 tokenizer, with `_` and `-` as token characters so identifiers stay whole). |
+| Embeddings | API through OpenRouter | No local model. Default `openai/text-embedding-3-small` (~$0.02/M tokens) at 512 dimensions, chosen over pplx-embed-v1-0.6b on real notes (see Open items). Requests ask for zero-data-retention endpoints with `data_collection: deny` by default (`SCREE_ZDR=0` turns this off); a model with no such endpoint fails with a clear error. Timeouts: 10 s per query with no retry on timeout; 30 s per indexing attempt, and after an outage indexing pauses for 30 s, doubling up to 5 min, then resyncs. |
 | MCP | Official Go MCP SDK | stdio for Claude Code; optional HTTP. |
-| Chunking | By heading | Each chunk keeps its file path and heading trail. |
+| Chunking | By heading | Each chunk keeps its file path and heading trail, and records its first and last source line and a hash of its text. |
 | Running it | Per session, plus an optional service | `scree serve` per Claude Code session keeps its own folder current. A systemd user unit running `scree watch` covers a folder outside any session. A Dockerfile ships for reproducibility. |
 
 Library choices are starting points. Check each project's current docs before committing. One writer plus several reader processes under WAL was tested with vec1 and held up.
 
 ## How indexing works
 
-1. On startup, compare every file's content hash to the index and queue anything new or changed.
+Which folder and which index:
+
+- `-notes <dir>` names the folder. Without it, `serve` uses `CLAUDE_PROJECT_DIR` and the CLI the current directory, each lifted to the git root above it (the nearest folder with a `.git` you own; see Ignoring files). Outside git, that folder itself is used. `serve` with neither `CLAUDE_PROJECT_DIR` nor `-notes` exits with an error.
+- A folder found this way, not given with `-notes`, is refused if it is your home directory, a folder above it, or a filesystem root, so a dotfiles repo at `~` cannot pull in everything below it.
+- The index is `$XDG_DATA_HOME/scree/indexes/<base>-<hash16>/index.db`, where `hash16` is the first 16 hex digits of the SHA-256 of the resolved folder path and `<base>` is the folder's name made safe. A `root` file beside it holds the folder's path, and `writer.lock` sits next to it. `-db` or `SCREE_DB` names another file.
+- The index records its folder and refuses to be used for a different one, since syncing it against another folder would delete that folder's rows. An index from the single-folder version, which recorded none, is adopted by the first folder that opens it.
+
+Then:
+
+1. When the writer starts (the first session in a repo, a takeover, or `scree watch`), compare every file's content hash to the index and queue anything new or changed. For a new index larger than `SCREE_FIRST_SYNC_MB`, a session or `watch` skips this until `scree reindex` is run, and search says so.
 2. The watcher queues a path on each file event, ignoring editor swap and temp files.
-3. Wait one to two seconds after the last event for that path, since editors fire several per save.
+3. Wait 1.5 s after the last event for that path, since editors fire several per save.
 4. Hash the file. If the hash matches the index, stop.
-5. Split by heading, embed the chunks, then delete the file's old rows and insert the new ones. Within a section, a chunk is closed at a blank line once it reaches about 2500 characters, and it is hard-capped at 3500, even mid-line or inside a code fence; an overlong line is cut on a character boundary. Each heading is capped at 120 characters.
+5. Split by heading, embed the chunks, then delete the file's old rows and insert the new ones, with each chunk's line range and text hash. The FTS5 index is maintained by triggers in the same transaction. Within a section, a chunk is closed at a blank line once it reaches about 2500 characters, and it is hard-capped at 3500, even mid-line or inside a code fence; an overlong line is cut on a character boundary. Each heading is capped at 120 characters. A chunk's line range is its first and last non-blank source line.
 6. On delete or rename, remove the old path's rows.
 
-The watcher re-adds its watches after a folder is renamed, so edits under the new name are seen. It never watches a folder the policy skips (hidden, gitignored, a nested repository, or excluded by `.screeignore`), and it re-adds its watches after any ignore file changes. It exits with an error when the index file or the notes folder is removed or replaced. `scree watch` then exits, so its supervisor (systemd, Docker) restarts it. In `serve`, the writer stops, releases the lock and reports the error in search results, while searches continue on what is indexed. File events are read on their own goroutine and never wait for the embedding API; if the kernel's event queue still overflows, the writer resyncs.
+An index from an earlier version is upgraded in place when it is opened: line ranges are filled in on the next sync without re-embedding when the file is unchanged, text hashes are computed from stored chunks, and the keyword index is built from stored chunks (about a second per 100,000 chunks). The first process to open it does this inside one transaction; others wait.
+
+The watcher re-adds its watches after a folder is renamed, so edits under the new name are seen. It never watches a folder the policy skips (hidden, gitignored, a nested repository, or excluded by `.screeignore`), and it re-adds its watches after any ignore file changes. It exits with an error when the index file or the indexed folder is removed or replaced. `scree watch` then exits, so its supervisor (systemd, Docker) restarts it. In `serve`, the writer stops, releases the lock and reports the error in search results, while searches continue on what is indexed. File events are read on their own goroutine and never wait for the embedding API; if the kernel's event queue still overflows, the writer resyncs.
 
 One process writes to each index: whichever `scree serve` or `scree watch` holds `writer.lock` next to it (flock on Linux, macOS and BSD; `LockFileEx` on Windows). The others only read, and they retry the lock every 5 s, so when the writing session ends another takes over and syncs first. `serve` starts this in the background: the MCP handshake and searches are never blocked, and while the first sync of a new index runs, search results end with a note saying the index is incomplete. Files are indexed one at a time, so a large re-index cannot spike memory. `reindex -all` refuses to run while another process holds the lock.
 
@@ -64,12 +77,12 @@ Four layers, checked in this order:
 1. **Built-in rules, always on:**
    - Hidden files and folders, meaning any path segment starting with `.` (`.git`, `.obsidian`, `.trash`), with two exceptions. `.screeignore` itself is watched but never indexed. And these folders **at the root** of the indexed folder are searched like any other: `.claude/` (except `.claude/worktrees/`, which holds full copies of the repo), `.github/`, `.gitlab/`, `.gitea/`, `.forgejo/`, `.cursor/`, `.codex/`, `.gemini/`, `.windsurf/`, `.circleci/` and `.buildkite/`. The same name deeper in the tree, and any hidden segment inside them, stays hidden. Every other rule applies inside them.
    - Anything that isn't `.md` or `.markdown`.
-   - Symlinks whose target resolves outside the notes folder. A symlink inside it is followed like a normal file, and every rule here, including the extension and `.screeignore`, applies to both the link path and the resolved target. Symlinked folders are never descended.
+   - Symlinks whose target resolves outside the indexed folder. A symlink inside it is followed like a normal file, and every rule here, including the extension and `.screeignore`, applies to both the link path and the resolved target. Symlinked folders are never descended.
    - Files larger than 1 MB, which are usually exports or logs rather than notes. `SCREE_MAX_FILE_BYTES` changes the limit.
    - File names containing control characters or invalid UTF-8 (unsafe name).
    - Non-regular files such as FIFOs and devices, which are skipped without being opened.
 2. **Git's ignore rules**, when the folder is inside a git work tree (a `.git` folder or file in it or any folder above it): every `.gitignore` from the work tree's top down, `.git/info/exclude`, and the global excludes file (`core.excludesFile` from `~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`, default `$XDG_CONFIG_HOME/git/ignore`; `[include]` is not followed). Git's semantics apply: a pattern is relative to the folder of its `.gitignore`, a deeper file overrides a shallower one, and a file inside an excluded folder cannot be re-included, so excluded folders such as `node_modules/` are never descended. A folder that holds its own `.git` (a nested repository or submodule) is skipped. One divergence: a tracked file that matches a pattern is still ignored, since scree does not read git's index. A `.gitignore` that cannot be read excludes its folder. `-gitignore=false` turns this layer off. Git's files are read the way git reads them: a `.gitignore`, `.git/info/exclude` and the `.git` file are never followed through a symlink and must be regular files. The global excludes file is taken only from your own git config (`~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`), never from a repository's `.git/config`. A work tree is trusted only if its `.git` is owned by you and not a symlink, and the git dir or common dir a `.git` file names must be a folder you own, not a symlink. scree never looks for a `.git` in or above a shared sticky folder such as `/tmp`. A `.git` owned by someone else is an error, not a skip; `-notes <folder> -gitignore=false` on the command line indexes a folder below it without git's rules. Windows has no ownership check. Messages about these files name the file and line, never its content.
-3. **`.screeignore`** at the root of the notes folder, using gitignore syntax: one pattern per line, `#` comments, `!` to re-include, a leading `/` anchors to the root, a trailing `/` matches folders only, and `**` matches any depth. Only the root file is read, not nested ones. It is applied after git's rules and can only exclude more. Example:
+3. **`.screeignore`** at the root of the indexed folder, using gitignore syntax: one pattern per line, `#` comments, `!` to re-include, a leading `/` anchors to the root, a trailing `/` matches folders only, and `**` matches any depth. Only the root file is read, not nested ones. It is applied after git's rules and can only exclude more. Example:
 
    ```
    # journal stays local
@@ -84,7 +97,7 @@ Four layers, checked in this order:
    If `.screeignore` exists but cannot be read, or is a symlink or not a regular file, nothing is indexed until it is fixed. Scree fails closed rather than ignoring the rules.
 
    A line `include-hidden .name/` adds another root folder to that list (one segment starting with `.`; `.git` is refused; write `\include-hidden` for a literal pattern). To drop a default, exclude it with an ordinary pattern such as `/.cursor/`.
-4. **Front matter opt-out** for a single note, without touching the ignore file:
+4. **Front matter opt-out** for a single file, without touching the ignore file:
 
    ```
    ---
@@ -92,14 +105,14 @@ Four layers, checked in this order:
    ---
    ```
 
-   The key may be quoted and followed by spaces before the colon; the value `ignore` is matched in any case. The file has to be read to see this, but nothing is chunked or embedded. If the note is already indexed, it is removed.
+   The key may be quoted and followed by spaces before the colon; the value `ignore` is matched in any case. The file has to be read to see this, but nothing is chunked or embedded. If the file is already indexed, it is removed.
 
 Every rule is checked against the file's name as stored on disk, never the spelling a caller passed. `read_doc`, `reindex` and the watcher first map a path to its on-disk name. Names and patterns are compared in Unicode NFC, and case-insensitively when the filesystem is (macOS and Windows by default). Root hidden folders in the allowlist must match exactly, so `.GITHUB/` stays hidden.
 
 When the rules change, the index follows:
 
 - Editing `.screeignore` triggers a sync. Newly ignored files are removed from the index, and newly included ones are indexed.
-- Adding `scree: ignore` to a note removes it on the next save. Removing the line re-indexes it.
+- Adding `scree: ignore` to a file removes it on the next save. Removing the line re-indexes it.
 - Editing a `.gitignore` at any level triggers a sync, like `.screeignore`. Changes to `.git/info/exclude` or the global excludes file are picked up on the next sync (session start, `reindex`, or any ignore-file edit).
 
 `scree doctor` reports how many files each layer ignored, including `.gitignore` (with nested repositories counted separately). A hidden folder or a folder `.screeignore` excludes outright counts as one entry. `scree doctor -v` lists the ignored paths, so a pattern can be checked before it matters.
@@ -109,24 +122,31 @@ When the rules change, the index follows:
 MCP tools:
 
 ```
-search_docs(query, k)
+search_docs(query, k, mode?)        mode: auto (default) | hybrid | semantic | keyword
 read_doc(path, start?, end?)
 reindex(path?)
 ```
 
-Search returns the top chunks with file path and heading, so Claude can open the whole file only when it needs to. Each result is an element:
+Search returns the top chunks with file path, line range and heading, so Claude can read just those lines, or the whole file only when it needs to. Each result is an element:
 
 ```
-<hit n="1" path="sub/a.md" line="12" heading="Projects > scree" score="0.912">
+<hit n="1" path="sub/a.md" lines="12-19" heading="Projects > scree" score="0.912" match="both">
 chunk text
 </hit>
 ```
 
-- `path` and `heading` are quoted strings. Control characters are stripped, and any `<hit` or `</hit` inside note text becomes `&lt;hit`, so a note cannot forge a result.
-- A hit's text is capped at 4000 characters and one response at 64 KB; the rest is replaced by a `[N more hits omitted: output limit]` line.
-- `read_doc` returns `<doc path="…">…</doc>`, treated the same way, truncated at 256 KB.
-- The server instructions name the project folder, say that results are its markdown files with paths relative to its root (including the root forge and agent folders such as `.github/` and `.claude/`), and tell the client that text inside `<hit>` and `<doc>` is file content, possibly copied from elsewhere, and is data, not instructions. Agent folders such as `.claude/agents` and `.cursor/rules` hold imperative text written for models, so their hits are especially prompt-shaped; the instructions say so.
-- While the first sync of a new index runs, or when another process is building it, search output ends with a one-line `[index incomplete: …]` note. With another process holding the writer lock, `reindex` reports that process instead of writing.
+- `k` defaults to 8, at most 50.
+- **Modes.** `semantic` is a vector search. `keyword` is an SQLite FTS5 search over chunk text, heading and path, ranked by BM25 with text weighted twice as much as heading or path; it needs no embedding call and works while the API is down. `hybrid` runs both, each fetching up to `min(max(4k, 40), 200)` chunks, and merges them by reciprocal rank fusion (`Σ 1/(60 + rank)`, equal weights). `auto`, the default, runs `hybrid` when the query has an identifier-like word (after trimming quotes, brackets, backticks and `.,;:?!`: at least one ASCII letter and at least one `_` or ASCII digit, as in `DELETE_STALE_INTAKE`, `D1-Q4` or `v2`; not `ID`, `API`, `2026` or `well-known`) and `semantic` otherwise, and its output ends with `[mode: auto → hybrid]` or `[mode: auto → semantic]`. A failed embedding call returns an error that says `mode="keyword"` still works.
+- **Why auto.** On a private set of 16 plain-language and 7 identifier queries over real notes, `auto` kept plain-question file MRR at 0.89 while raising identifier MRR from 0.46 to 0.80. Always-on `hybrid` matched the identifier gain but dropped plain questions (0.76 at equal weights, 0.83 with the keyword side at half weight).
+- **The query is never FTS5 syntax.** It is split on whitespace; each word has control characters stripped and `.,;:!?()[]{}"'` trimmed from its ends, at most 32 words of at most 64 bytes are kept, and each becomes a quoted string with inner quotes doubled, joined with `OR`. Operators such as `AND`, `NEAR`, `*`, `^` and `col:` are plain text inside quotes.
+- `lines` is the range of source lines the chunk came from, first and last non-blank line, so a client can read exactly that range (`read_doc(path, start, end)`, or an editor). If the file changed since it was indexed, search finds the chunk in the current file (exactly, then ignoring whitespace differences, choosing the occurrence nearest the stored line) and reports the current range; each changed file is read at most once per search. If the text is no longer there, the hit says `stale="true"` and has no range. Changed files are queued for re-indexing when this process is the writer.
+- `match` says which search found the hit (`semantic`, `keyword` or `both`). `score` is the cosine similarity, present only when the vector search found the chunk.
+- Identical chunks in several files (for example committed build copies) come back as one hit. The primary is the copy with the fewest path segments, then the shortest path, then the first in byte order, and `also="path:12-18, …"` lists up to three others that the current rules allow, with `also_more="N"` for the rest. A path containing `,`, `:` or a quote is written as a quoted string. Excluding build folders with `.screeignore` is still better: it saves embedding cost and keeps the index small.
+- `path` and `heading` are quoted strings. Control characters are stripped, and any `<hit` or `</hit` inside file text becomes `&lt;hit`, so a file cannot forge a result.
+- A hit's text is capped at 4000 characters (with `[cut]`) and one response at 64 KB; the rest is replaced by a `[N more hits omitted: output limit]` line.
+- `read_doc` takes optional 1-based `start` and `end` lines (inclusive; `end` past the last line is clamped, `start` alone reads to the end) and returns `<doc path="…" lines="a-b">…</doc>`, or `<doc path="…">` for the whole file, treated the same way, truncated at 256 KB.
+- The server instructions name the project folder, say that results are its markdown files with paths relative to its root (including the root forge and agent folders such as `.github/` and `.claude/`), explain the search modes, and tell the client that text inside `<hit>` and `<doc>` is file content, possibly copied from elsewhere, and is data, not instructions. Agent folders such as `.claude/agents` and `.cursor/rules` hold imperative text written for models, so their hits are especially prompt-shaped; the instructions say so.
+- While the first sync of a new index runs, or when another process is building it, search output ends with a one-line `[index incomplete: …]` note; a folder over the first-sync cap gets a `[not indexed: …]` note instead. With another process holding the writer lock, `reindex` reports that process instead of writing.
 - Search re-checks every hit against the current rules before returning it, so a newly ignored, opted-out or deleted file drops out at once, before any re-sync.
 
 CLI:
@@ -135,18 +155,21 @@ CLI:
 scree watch
 scree serve
 scree serve -http addr [-allow-remote]
-scree search "query"
-scree reindex --all
-scree doctor
-scree doctor -v
+scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format xml|json] "query"
+scree reindex [-all] [path]
+scree doctor [-v] [-offline]
 scree indexes [-prune]
 ```
 
-`scree indexes` lists every index with its folder, size and last sync; `-prune` deletes those whose folder is gone.
+`-format json` prints one object per hit, the stable format for evals: `{"n","mode","path","start","end","heading","score","match","stale","also"}`, with `mode` the mode that ran, `null` for an absent line or score, and `also` a list of `{"path","start","end"}`.
 
-Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent. `-notes`, `-db` and `SCREE_DB` are refused by `serve` when `CLAUDE_PROJECT_DIR` is set: under Claude Code, a session's folder and index follow from the repo alone. A folder outside any repo, such as `~/notes`, is searched from the CLI, or from a Claude Code session started in that folder.
+`scree indexes` lists every index with its folder, size and last sync; `-prune` deletes those whose folder is gone. It also shows each index's file and chunk counts, its model, and whether a writer holds it. Listing never writes: it reads each index over a read-only connection without upgrading it, and checks the lock without creating it. `-prune` keeps an index a writer holds, works only on real directories directly inside the indexes folder, and never follows a symlink out of it. It also points out an index left by the single-folder version.
 
-`reindex --all` rebuilds from scratch after a model or chunking change.
+Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent. `-notes`, `-db` and `SCREE_DB` are refused by `serve` when `CLAUDE_PROJECT_DIR` is set: under Claude Code, a session's folder and index follow from the repo alone.
+
+`doctor` checks the configuration, the folder and what each ignore layer drops, the size and an upper-bound cost estimate, the index and its keyword index (`-v` also runs FTS5's integrity check and lists every ignored path), the writer, the model and, unless `-offline`, one test call to the API.
+
+`reindex -all` rebuilds from scratch after a model or chunking change, and refuses to run while another process holds the writer lock.
 
 HTTP transport (`serve -http`):
 
@@ -156,9 +179,11 @@ HTTP transport (`serve -http`):
 
 ## Resource budget
 
-Target roughly 20–50 MB of memory while idle; measured idle memory is about 13–15 MB per process. Hence no local embedding model, no in-memory vector store, no Docker Desktop VM. Reducing the embedding to 512 dimensions, if the model supports it, shrinks disk and memory further.
+Target roughly 20–50 MB of memory while idle. Measured idle memory is about 13–15 MB per process for a small index and about 20 MB with 1000 files (4000 chunks); adding the keyword index did not change it, since both indexes are on disk. Hence no local embedding model, no in-memory vector store, no Docker Desktop VM. Reducing the embedding to 512 dimensions, if the model supports it, shrinks disk and memory further.
 
-Cost is small: a 10 MB folder of markdown is about 2.5M tokens, a fraction of a cent on the cheapest models, and only changed files are re-embedded. `scree doctor` prints the estimate for a folder. A Claude Code session will not start the first index of a folder with more than `SCREE_FIRST_SYNC_MB` (default 50) of markdown; `scree reindex` in the folder does it explicitly. Each `serve` process stays within the budget. Only the writer holds file watches.
+The keyword index (external-content FTS5, so the text is not stored twice) added about half the size of the chunk text on disk in a 1000-file measurement (+16% on the whole index); line ranges and text hashes add about 30 bytes per chunk.
+
+Cost: indexing measured about $0.0025 per MB of markdown with `openai/text-embedding-3-small`, so a 10 MB folder costs about 2.5 cents to embed in full, and only changed files are re-embedded. `scree doctor` prints an estimate at four bytes per token, an upper bound of about 5 cents for 10 MB. A Claude Code session will not start the first index of a folder with more than `SCREE_FIRST_SYNC_MB` (default 50) of markdown; `scree reindex` in the folder does it explicitly. Each `serve` process stays within the budget. Only the writer holds file watches. A search embeds one query, except in `keyword` mode.
 
 ## Name
 
@@ -166,10 +191,32 @@ Cost is small: a 10 MB folder of markdown is about 2.5M tokens, a fraction of a 
 
 ## Open items
 
-- **Local and LAN embedding models.** Test scree against an OpenAI-compatible server on this machine (Ollama, llama.cpp) and on another machine on the LAN, through `SCREE_EMBED_URL` with `SCREE_ZDR=0`. Compare retrieval with the current default on the same real-notes question set, and measure the model server's memory. A LAN server should only be reached over TLS or a VPN such as WireGuard, since embedding requests carry note text in the clear.
 - **Human view.** Decide between plain files in an editor and a small local search page over the same index.
 - **MCP registry.** The license, CI, release workflow and OCI label are done. Still to do: cut `v0.1.0`, build an MCPB bundle, write `server.json` for `io.github.jrapakko/scree`, and publish with `mcp-publisher`.
 - **Base image pinning.** The Dockerfile's `golang` and distroless images are referenced by tag. Pin them by digest once something like Dependabot keeps the digests current.
-- **Wrapper portability.** `contrib/scree-*` are tested under bash, dash and busybox ash as `/bin/sh` (ownership and the sticky bit come from `stat` and `ls -ld`, not `test -O`/`-k`). Not yet checked on BSD or macOS `sh`, or with `shellcheck`, including the git-root walk in `scree-mcp-docker`.
+- **Wrapper portability.** `contrib/scree-*` are tested under bash, dash and busybox ash as `/bin/sh` (ownership and the sticky bit come from `stat` and `ls -ld`, not `test -O`/`-k`; the home directory comes from `~user` expansion of `id -un`). Not yet checked on BSD or macOS `sh`, or with `shellcheck`, including the git-root walk in `scree-mcp-docker`. A user name outside `[A-Za-z0-9._@-]`, or one the password database cannot resolve, makes the wrappers refuse to start.
+- **Tracked-but-ignored files.** Read `.git/index` so that tracked files matching a `.gitignore` pattern are indexed, as git considers them. Today they are skipped.
+- **`[include]` in git config.** `core.excludesFile` is read only from the three standard config files.
+- **Several folders per session.** Index `--add-dir` folders only if each has opted in (for example its own `.mcp.json` entry), with a `root` attribute on hits.
+- **Roots without `CLAUDE_PROJECT_DIR`.** For other clients, consider roots via MRTR input requests (protocol 2026-07-28) instead of `-notes`.
 - Resolved: embedding model `openai/text-embedding-3-small` at 512 dimensions. It beat `perplexity/pplx-embed-v1-0.6b` on 16 questions over 75 real notes (file-level MRR 0.89 vs 0.78).
 - Resolved: the SQLite driver plus vector extension builds without CGO, using vec1 instead of `sqlite-vec` (see Go stack).
+- Resolved: the default search mode is `auto` (see Tools and commands).
+
+## Explorations
+
+Ideas to try before committing to them. Each one lists the questions an exploration has to answer.
+
+- **Identifier routing.** The `auto` rule misses names with no `_` or digit, such as `psycopg` or a `CamelCase` type. Options, in order of preference:
+  - **(c) A code-derived vocabulary, the primary option.** Collect names locally from dependency manifests (`requirements.txt`, `pyproject.toml`, `go.mod`, `package.json`, `Cargo.toml`), import statements and declarations (`def`, `class`, `func`, `type`, `const`, `export`). The same ignore policy applies, and the vocabulary is never embedded or sent to the API. A query word found in it counts as an identifier. Membership is the signal, not frequency.
+  - **(b) A language server** (`workspace/symbol`): the fuller version of (c), at the cost of a process per language. Check whether Claude Code's own LSP support makes it unnecessary.
+  - Rare FTS-vocabulary terms were considered and dropped: library names like `psycopg` are frequent in a repo's docs, so a frequency signal misses exactly them.
+  - Questions: BM25 also discounts frequent terms, so does routing a frequent name to `hybrid` improve results at all, or is semantic search already enough? Measure on a real repo with both code and docs, since the notes-only eval sets can't. Does reading code (names only) change how scree should describe its scope?
+- **Keyword tokenizer.** Whether `.` and `/` should join tokens (file names, paths), or a trigram side index for partial identifiers; measure with the identifier eval (`internal/index/testdata/eval/identifiers.tsv` for this repo's docs).
+- **CI workflow YAML.** Index workflow files in the allowlisted forge and CI folders, one chunk per job, with a heading trail like `ci.yml > jobs.test`. Questions:
+  - Which files count: GitHub, Gitea and Forgejo `workflows/`, `.gitlab-ci.yml` (and its includes?), `.circleci/config.yml`, `.buildkite/pipeline.yml`?
+  - A YAML parser or a line-based split, given that chunk text must be the original lines with their line numbers?
+  - Resistance to hostile YAML, such as alias expansion and deep nesting?
+  - How to handle GitLab's shape, where top-level keys are jobs except reserved ones (`stages`, `variables`, `include`, `default`, …)?
+  - Does retrieval actually improve for CI questions, measured the way the embedding models were compared?
+- **Local and LAN embedding models.** Test scree against an OpenAI-compatible server on this machine (Ollama, llama.cpp) and on another machine on the LAN, through `SCREE_EMBED_URL` with `SCREE_ZDR=0`. Compare retrieval with the current default on the same real-notes question set, and measure the model server's memory. A LAN server should only be reached over TLS or a VPN such as WireGuard, since embedding requests carry note text in the clear.

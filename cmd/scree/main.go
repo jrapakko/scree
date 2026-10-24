@@ -53,9 +53,9 @@ Usage:
                            and last sync; -prune deletes those whose folder
                            is gone
 
-Every command but indexes takes -notes, -db and -gitignore. The folder is -notes if
-given; for serve, else $CLAUDE_PROJECT_DIR; otherwise the git root of the
-current directory, or the current directory outside git. Under Claude Code
+Every command but indexes takes -notes, -db and -gitignore. The folder is
+-notes if given; for serve, else $CLAUDE_PROJECT_DIR; otherwise the git root
+of the current directory, or the current directory outside git. Under Claude Code
 (CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB. Environment:
   SCREE_DB            index file (default $XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
@@ -675,7 +675,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	case have == want:
 		report(true, "model %s", want)
 	default:
-		report(false, "index built with %s but configured for %s; run `scree reindex --all`", have, want)
+		report(false, "index built with %s but configured for %s; run `scree reindex -all`", have, want)
 	}
 
 	report(cfg.apiKey != "", "OPENROUTER_API_KEY %s", map[bool]string{true: "set", false: "not set"}[cfg.apiKey != ""])

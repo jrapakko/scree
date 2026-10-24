@@ -12,7 +12,8 @@
 #   install -m 755 contrib/scree-mcp-docker ~/.local/bin/scree-mcp
 #   claude mcp add scree --scope project -- scree-mcp
 #
-# SCREE_ENV_FILE     env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
+# Settings are read from ~/.config/scree/env, where ~ is your home directory
+# in the password database. Besides scree's own, it can set:
 # SCREE_DOCKER       docker (default) or podman
 # SCREE_IMAGE        image (default scree:latest)
 # SCREE_DATA_VOLUME  index volume (default scree-data)
@@ -22,7 +23,28 @@
 set -eu
 prog=scree-mcp-docker
 
-env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
+# The env file is always ~/.config/scree/env, with ~ taken from the password
+# database (the shell's ~user expansion, which calls getpwnam), never from
+# $HOME or $XDG_CONFIG_HOME: a project's .mcp.json can set those, and the
+# repo must not choose which settings file is loaded.
+# BEGIN passwd home (contrib_test.go runs this block alone and replaces it)
+user=$(id -un 2>/dev/null) || user=
+case $user in
+'' | [!A-Za-z0-9_]* | *[!A-Za-z0-9._@-]*)
+	echo "$prog: cannot look up your user name" >&2
+	exit 1
+	;;
+esac
+eval "pwhome=~$user"
+case $pwhome in
+/*) ;;
+*)
+	echo "$prog: cannot find the home directory of $user" >&2
+	exit 1
+	;;
+esac
+# END passwd home
+env_file=$pwhome/.config/scree/env
 # Settings come only from the env file. A project's .mcp.json can launch this
 # wrapper with its own environment and arguments, so nothing inherited may
 # choose the binary, the endpoint or the key: PATH is reset and every SCREE_*,
@@ -156,8 +178,9 @@ case $dir in
 	exit 1
 	;;
 esac
-# Never mount the home directory, a folder above it, or /.
-home=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || home=$HOME
+# Never mount the home directory, a folder above it, or /. Home is the one
+# from the password database, so an inherited HOME cannot move it.
+home=$(cd -P -- "$pwhome" 2>/dev/null && pwd -P) || home=$pwhome
 refuse=
 case $dir in / | "$home") refuse=1 ;; esac
 case $home/ in "$dir"/*) refuse=1 ;; esac

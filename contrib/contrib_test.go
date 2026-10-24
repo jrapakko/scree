@@ -3,8 +3,10 @@
 package contrib
 
 import (
+	"errors"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -40,9 +42,12 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 		t.Skip("no /bin/sh")
 	}
 	dir := t.TempDir()
-	e := env{dir: dir, bin: filepath.Join(dir, "bin"), envFile: filepath.Join(dir, "env"), out: filepath.Join(dir, "out"),
+	e := env{dir: dir, bin: filepath.Join(dir, "bin"), envFile: filepath.Join(dir, ".config", "scree", "env"), out: filepath.Join(dir, "out"),
 		project: filepath.Join(dir, "proj")}
 	if err := os.Mkdir(e.project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(e.envFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if content != "" {
@@ -61,6 +66,13 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The copies take the home directory from $TEST_PW_HOME instead of
+		// the password database, so they never read the real env file.
+		block, err := passwdBlock(string(b))
+		if err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+		b = []byte(strings.Replace(string(b), block, "pwhome=$TEST_PW_HOME\n", 1))
 		if err := os.WriteFile(filepath.Join(e.bin, s), b, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +95,7 @@ func (e env) run(t *testing.T, script string, extra []string, args ...string) (s
 	cmd.Env = append([]string{
 		"PATH=/usr/bin:/bin",
 		"HOME=" + e.dir,
-		"SCREE_ENV_FILE=" + e.envFile,
+		"TEST_PW_HOME=" + e.dir,
 		"FAKE_OUT=" + e.out,
 		"CLAUDE_PROJECT_DIR=" + e.project,
 	}, extra...)
@@ -470,22 +482,29 @@ func TestDockerRefusesHomeAncestors(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, "code", "r"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The env file lives in the home taken from the password database.
+	if err := os.MkdirAll(filepath.Join(home, ".config", "scree"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".config", "scree", "env"), []byte(envFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for _, dir := range []string{home, filepath.Join(e.dir, "home"), e.dir, "/"} {
-		out, lines, err := e.run(t, "scree-mcp-docker", []string{"HOME=" + home, "CLAUDE_PROJECT_DIR=" + dir})
+		out, lines, err := e.run(t, "scree-mcp-docker", []string{"TEST_PW_HOME=" + home, "CLAUDE_PROJECT_DIR=" + dir})
 		if err == nil || lines != nil || !strings.Contains(out, "refusing to mount") {
 			t.Errorf("%s: err %v, child ran %v, output %q", dir, err, lines != nil, out)
 		}
 	}
-	// A symlinked HOME is compared resolved.
+	// A symlinked home is compared resolved.
 	link := filepath.Join(e.dir, "homelink")
 	if err := os.Symlink(home, link); err != nil {
 		t.Fatal(err)
 	}
-	out, lines, err := e.run(t, "scree-mcp-docker", []string{"HOME=" + link, "CLAUDE_PROJECT_DIR=" + filepath.Join(e.dir, "home")})
+	out, lines, err := e.run(t, "scree-mcp-docker", []string{"TEST_PW_HOME=" + link, "CLAUDE_PROJECT_DIR=" + filepath.Join(e.dir, "home")})
 	if err == nil || lines != nil || !strings.Contains(out, "refusing to mount") {
-		t.Errorf("symlinked HOME: err %v, child ran %v, output %q", err, lines != nil, out)
+		t.Errorf("symlinked home: err %v, child ran %v, output %q", err, lines != nil, out)
 	}
-	args, _ := dockerArgs(t, e, filepath.Join(home, "code", "r"), "HOME="+link)
+	args, _ := dockerArgs(t, e, filepath.Join(home, "code", "r"), "TEST_PW_HOME="+link)
 	if got := mountOf(t, args); got != filepath.Join(home, "code", "r") {
 		t.Errorf("mounted %q", got)
 	}
@@ -598,6 +617,67 @@ func TestWrapperRefusesForeignEnvFile(t *testing.T) {
 		out, lines, err := e.run(t, s, nil)
 		if err == nil || lines != nil || !strings.Contains(out, s+": "+e.envFile+" is not owned by you") {
 			t.Errorf("%s: err %v, child ran %v, output %q", s, err, lines != nil, out)
+		}
+	}
+}
+
+const (
+	blockBegin = "# BEGIN passwd home"
+	blockEnd   = "# END passwd home\n"
+)
+
+// passwdBlock returns the part of a wrapper that finds the home directory
+// in the password database, from its BEGIN line through its END line.
+func passwdBlock(script string) (string, error) {
+	i := strings.Index(script, blockBegin)
+	j := strings.Index(script, blockEnd)
+	if i < 0 || j < i {
+		return "", errors.New("no passwd home block")
+	}
+	return script[i : j+len(blockEnd)], nil
+}
+
+// TestPasswdHome runs each wrapper's lookup block alone: it finds the
+// home directory in the password database, whatever HOME and
+// XDG_CONFIG_HOME say.
+func TestPasswdHome(t *testing.T) {
+	u, err := user.Current()
+	if err != nil || u.HomeDir == "" {
+		t.Skip("no current user:", err)
+	}
+	for _, s := range scripts {
+		b, err := os.ReadFile(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		block, err := passwdBlock(string(b))
+		if err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+		cmd := exec.Command("/bin/sh", "-c", "set -eu; prog=test\n"+block+`printf '%s' "$pwhome"`)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir(), "XDG_CONFIG_HOME=" + t.TempDir(), "SCREE_ENV_FILE=/tmp/x"}
+		out, err := cmd.CombinedOutput()
+		if err != nil || string(out) != u.HomeDir {
+			t.Errorf("%s: home %q, %v; want %q", s, out, err, u.HomeDir)
+		}
+	}
+}
+
+// TestEnvFileNotFromEnvironment: SCREE_ENV_FILE, XDG_CONFIG_HOME and HOME
+// from a project's .mcp.json do not choose the settings file.
+func TestEnvFileNotFromEnvironment(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	other := filepath.Join(e.dir, "other")
+	planted := filepath.Join(other, "scree", "env")
+	os.MkdirAll(filepath.Dir(planted), 0o700)
+	if err := os.WriteFile(planted, []byte("OPENROUTER_API_KEY=planted-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range scripts {
+		os.Remove(e.out)
+		_, lines, err := e.run(t, s, []string{"SCREE_ENV_FILE=" + planted, "XDG_CONFIG_HOME=" + other, "HOME=" + filepath.Join(other, "..")})
+		if err != nil || !slices.Contains(lines, "env=OPENROUTER_API_KEY="+secret) {
+			t.Errorf("%s: err %v, lines %q", s, err, lines)
 		}
 	}
 }

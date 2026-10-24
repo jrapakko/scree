@@ -14,7 +14,7 @@ Constraints that must hold after your change:
 - `go vet ./...` and `go test ./...` pass.
 - `gofmt -l .` prints nothing.
 - Only the process holding an index's writer lock (`scree serve` or `scree watch`) writes to it; files are indexed one at a time.
-- `read_note` and any new path-taking code refuse paths and symlinks outside the notes folder.
+- `read_doc`, `reindex` and any new path-taking code go through `internal/policy` and refuse paths and symlinks outside the indexed folder.
 - Never read, print, or log the contents of `.env` or any API key.
 
 Scope:

@@ -5,12 +5,34 @@
 #   scree-run doctor -v
 #   scree-run search "backup password"
 #
-# SCREE_ENV_FILE  env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
+# Settings are read from ~/.config/scree/env, where ~ is your home directory
+# in the password database.
 # The scree binary must be installed next to this script.
 set -eu
 prog=scree-run
 
-env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
+# The env file is always ~/.config/scree/env, with ~ taken from the password
+# database (the shell's ~user expansion, which calls getpwnam), never from
+# $HOME or $XDG_CONFIG_HOME: a project's .mcp.json can set those, and the
+# repo must not choose which settings file is loaded.
+# BEGIN passwd home (contrib_test.go runs this block alone and replaces it)
+user=$(id -un 2>/dev/null) || user=
+case $user in
+'' | [!A-Za-z0-9_]* | *[!A-Za-z0-9._@-]*)
+	echo "$prog: cannot look up your user name" >&2
+	exit 1
+	;;
+esac
+eval "pwhome=~$user"
+case $pwhome in
+/*) ;;
+*)
+	echo "$prog: cannot find the home directory of $user" >&2
+	exit 1
+	;;
+esac
+# END passwd home
+env_file=$pwhome/.config/scree/env
 # Settings come only from the env file. A project's .mcp.json can launch this
 # wrapper with its own environment and arguments, so nothing inherited may
 # choose the binary, the endpoint or the key: PATH is reset and every SCREE_*,

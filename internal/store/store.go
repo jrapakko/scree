@@ -25,8 +25,8 @@ import (
 )
 
 // ErrModelMismatch means the index was built with a different embedding
-// model than the one configured. Rebuild with `scree reindex --all`.
-var ErrModelMismatch = errors.New("index was built with a different embedding model; run `scree reindex --all`")
+// model than the one configured. Rebuild with `scree reindex -all`.
+var ErrModelMismatch = errors.New("index was built with a different embedding model; run `scree reindex -all`")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
