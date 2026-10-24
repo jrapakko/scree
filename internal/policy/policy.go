@@ -386,6 +386,19 @@ func (p *Policy) Check(rel string) (fs.FileInfo, error) {
 type rules struct {
 	m *ignore.Matcher
 	g *gitView // nil when the git layer does not apply
+	// extra, when set, accepts files the markdown rule refuses (see
+	// WalkStatWith); every other rule still applies to them.
+	extra func(rel string) bool
+}
+
+// nameReason is Policy.nameReason, with the files rs.extra accepts allowed
+// despite not being markdown.
+func (rs rules) nameReason(p *Policy, rel string) Reason {
+	r := p.nameReason(rel)
+	if r == NotMarkdown && rs.extra != nil && rs.extra(rel) {
+		return Allowed
+	}
+	return r
 }
 
 // load loads .screeignore and the git rules. Either failing is an error, so
@@ -464,7 +477,7 @@ func (p *Policy) check(rel string, resolve bool, rs rules) (string, fs.FileInfo,
 			if unsafeName(realRel) {
 				return "", nil, ignored(rel, UnsafeName)
 			}
-			if r := p.nameReason(realRel); r != Allowed {
+			if r := rs.nameReason(p, realRel); r != Allowed {
 				return "", nil, ignored(rel, r)
 			}
 		}
@@ -525,14 +538,25 @@ func (p *Policy) resolve(rel string) (string, error) {
 // error, and fails before visiting anything if .screeignore or the git rules
 // that apply to the root cannot be read.
 func (p *Policy) Walk(ctx context.Context, fn func(rel string, src []byte, err error) error) error {
-	_, err := p.walk(ctx, true, func(rel string, src []byte, _ fs.FileInfo, err error) error { return fn(rel, src, err) })
+	_, err := p.walk(ctx, true, nil, func(rel string, src []byte, _ fs.FileInfo, err error) error { return fn(rel, src, err) })
 	return err
 }
 
 // WalkStat is Walk that also passes the FileInfo of each allowed file as it
 // was opened, matching src.
 func (p *Policy) WalkStat(ctx context.Context, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) error {
-	_, err := p.walk(ctx, true, fn)
+	_, err := p.walk(ctx, true, nil, fn)
+	return err
+}
+
+// WalkStatWith is WalkStat that also reads the files extra accepts although
+// they are not markdown, such as dependency manifests and source files for
+// the code vocabulary. Every other rule (hidden folders, git's ignore rules,
+// .screeignore, size, symlinks) applies to them as to notes. Only the walk
+// is widened: Read, Check and CheckName still refuse such files, so they
+// can never be searched, read with read_doc or embedded through those.
+func (p *Policy) WalkStatWith(ctx context.Context, extra func(rel string) bool, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) error {
+	_, err := p.walk(ctx, true, extra, fn)
 	return err
 }
 
@@ -540,7 +564,7 @@ func (p *Policy) WalkStat(ctx context.Context, fn func(rel string, src []byte, f
 // without opening any of them: every name, git, .screeignore and size rule
 // applies, but front matter is not checked, so it is an upper bound.
 func (p *Policy) Estimate(ctx context.Context) (files int, bytes int64, err error) {
-	_, err = p.walk(ctx, false, func(rel string, _ []byte, fi fs.FileInfo, err error) error {
+	_, err = p.walk(ctx, false, nil, func(rel string, _ []byte, fi fs.FileInfo, err error) error {
 		if err == nil && fi != nil {
 			files++
 			bytes += fi.Size()
@@ -551,12 +575,14 @@ func (p *Policy) Estimate(ctx context.Context) (files int, bytes int64, err erro
 }
 
 // walk is Walk. With read false, files are only checked (Lstat, never
-// opened), and fn gets a nil src.
-func (p *Policy) walk(ctx context.Context, read bool, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) (rules, error) {
+// opened), and fn gets a nil src. extra is as for WalkStatWith; nil allows
+// markdown only.
+func (p *Policy) walk(ctx context.Context, read bool, extra func(string) bool, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) (rules, error) {
 	rs, err := p.load()
 	if err != nil {
 		return rs, err
 	}
+	rs.extra = extra
 	return rs, filepath.WalkDir(p.root, func(abs string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -601,7 +627,7 @@ func (p *Policy) walk(ctx context.Context, read bool, fn func(rel string, src []
 				}
 			}
 		}
-		if r := p.nameReason(rel); r != Allowed {
+		if r := rs.nameReason(p, rel); r != Allowed {
 			return fn(rel, nil, nil, ignored(rel, r))
 		}
 		if !read {
@@ -689,7 +715,7 @@ type Summary struct {
 func (p *Policy) Scan(ctx context.Context) (Summary, error) {
 	s := Summary{Ignored: map[Reason][]string{}}
 	var allowed []string
-	rs, err := p.walk(ctx, true, func(rel string, src []byte, _ fs.FileInfo, err error) error {
+	rs, err := p.walk(ctx, true, nil, func(rel string, src []byte, _ fs.FileInfo, err error) error {
 		var ie *IgnoredError
 		switch {
 		case err == nil:

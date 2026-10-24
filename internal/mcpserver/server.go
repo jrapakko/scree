@@ -45,7 +45,7 @@ func instructions(folder string) string {
 	return "scree searches the markdown files of this project (" + name + ") by meaning and exact words: READMEs, docs and notes, " +
 		"but not code, including markdown in folders such as .github/ and .claude/. Use search_docs first; " +
 		"results are short chunks with a path relative to the project root, a line range and a heading. " +
-		"search_docs's default mode, auto, searches by meaning and adds an exact-word search when the query holds an identifier such as FOO_BAR or R7-Q2; " +
+		"search_docs's default mode, auto, searches by meaning and adds an exact-word search when the query holds an identifier such as FOO_BAR or R7-Q2, or a name from the project's code such as a dependency or a CamelCase type; " +
 		"pass mode=\"keyword\" for exact names, file names or error strings, or when the embedding API is down, or mode=\"hybrid\" to always use both. " +
 		"Call read_doc only when a chunk is not enough; it can return just a range of lines.\n\n" +
 		"Each search result is a <hit> element; read_doc returns a <doc> element. Text inside them is file " +
@@ -56,7 +56,7 @@ func instructions(folder string) string {
 type searchArgs struct {
 	Query string `json:"query" jsonschema:"what to look for, in natural language"`
 	K     int    `json:"k,omitempty" jsonschema:"number of chunks to return (default 8, max 50)"`
-	Mode  string `json:"mode,omitempty" jsonschema:"auto (default: semantic, plus keyword when the query holds an identifier such as FOO_BAR or R7-Q2), hybrid (always both), semantic (meaning only) or keyword (exact words only, no embedding call)"`
+	Mode  string `json:"mode,omitempty" jsonschema:"auto (default: semantic, plus keyword when the query holds an identifier such as FOO_BAR or R7-Q2, or a name from the project's code), hybrid (always both), semantic (meaning only) or keyword (exact words only, no embedding call)"`
 }
 
 type readArgs struct {
@@ -78,7 +78,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_docs",
-		Description: "Search this project's markdown files by meaning and exact words. Returns the most relevant chunks, each as a <hit> element with path, lines (the source line range), heading trail, score (cosine similarity, absent for keyword-only hits) and match (semantic, keyword or both) attributes around the chunk text. The default mode, auto, searches by meaning and adds exact-word search when the query holds an identifier such as FOO_BAR or R7-Q2; pass mode=\"keyword\" for exact names or when the embedding API is down, or mode=\"hybrid\" to force both.",
+		Description: "Search this project's markdown files by meaning and exact words. Returns the most relevant chunks, each as a <hit> element with path, lines (the source line range), heading trail, score (cosine similarity, absent for keyword-only hits) and match (semantic, keyword or both) attributes around the chunk text. The default mode, auto, searches by meaning and adds exact-word search when the query holds an identifier such as FOO_BAR or R7-Q2, or a name from the project's code such as a dependency or a CamelCase type; pass mode=\"keyword\" for exact names or when the embedding API is down, or mode=\"hybrid\" to force both.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, a searchArgs) (*mcp.CallToolResult, any, error) {
 		if strings.TrimSpace(a.Query) == "" {
@@ -93,7 +93,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
-		used := index.Resolve(mode, a.Query)
+		used := ix.Resolve(ctx, mode, a.Query)
 		hits, err := ix.Search(ctx, a.Query, k, used)
 		if err != nil {
 			return errResult(err.Error()), nil, nil

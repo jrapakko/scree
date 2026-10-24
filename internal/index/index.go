@@ -21,6 +21,7 @@ import (
 	"github.com/jrapakko/scree/internal/embed"
 	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
+	"github.com/jrapakko/scree/internal/vocab"
 )
 
 // Indexer embeds the notes its Policy allows into Store.
@@ -247,16 +248,29 @@ func (ix *Indexer) RemovePrefix(ctx context.Context, rel string) error {
 }
 
 // SyncStats reports what a Sync did. Deferred counts files left for later
-// because the embedding API was unavailable; their old rows are kept.
+// because the embedding API was unavailable; their old rows are kept. The
+// counts are of notes; Sources counts the manifests and source files read
+// for the code vocabulary, and SourcesChanged those whose names were
+// re-read because they are new or changed.
 type SyncStats struct {
 	Scanned, Indexed, Removed, Failed, Deferred int
+	Sources, SourcesChanged                     int
 }
+
+// MaxSourceFiles caps the manifests and source files one Sync reads for the
+// code vocabulary; files past it keep the names stored for them, if any.
+const MaxSourceFiles = 20000
 
 // Sync indexes every new or changed note the policy allows and drops notes
 // that no longer exist or are now ignored. Files are processed one at a
 // time. A failure on one file is logged and does not stop the rest, and its
 // existing rows are kept. Sync fails, indexing nothing, if .screeignore
 // cannot be read or has a bad line.
+//
+// The same walk rebuilds the code vocabulary (see package vocab) from the
+// manifests and source files the policy would allow if they were markdown.
+// A file whose hash is unchanged is not parsed again. Only names are kept;
+// code is never embedded or sent anywhere.
 func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	ix.writeMu.Lock()
 	defer ix.writeMu.Unlock()
@@ -267,12 +281,37 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 		st   SyncStats
 		seen = map[string]bool{}
 		keep []string // folders that could not be read: keep their rows
+
+		codeSeen = map[string]bool{}
+		put      []store.VocabFile
 	)
-	err := ix.Policy.WalkStat(ctx, func(rel string, src []byte, fi fs.FileInfo, err error) error {
+	codeHave, err := ix.Store.VocabHashes(ctx)
+	if err != nil {
+		return st, err
+	}
+	err = ix.Policy.WalkStatWith(ctx, vocab.IsSource, func(rel string, src []byte, fi fs.FileInfo, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if errors.Is(err, policy.ErrIgnored) {
+			return nil
+		}
+		if vocab.IsSource(rel) {
+			// A read failure, or a file past the cap, keeps its stored names.
+			codeSeen[rel] = true
+			if err != nil || st.Sources >= MaxSourceFiles {
+				if err == nil && st.Sources == MaxSourceFiles {
+					ix.logf("vocabulary: over %d source files; not reading the rest", MaxSourceFiles)
+					st.Sources++
+				}
+				return nil
+			}
+			st.Sources++
+			sum := sha256.Sum256(src)
+			if hash := hex.EncodeToString(sum[:]); codeHave[rel] != hash {
+				put = append(put, store.VocabFile{Path: rel, Hash: hash, Names: vocab.Extract(rel, src)})
+				st.SourcesChanged++
+			}
 			return nil
 		}
 		st.Scanned++
@@ -306,18 +345,33 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	if err != nil {
 		return st, err
 	}
+	kept := func(p string) bool {
+		return slices.ContainsFunc(keep, func(dir string) bool { return strings.HasPrefix(p, dir) })
+	}
 	paths, err := ix.Store.Paths(ctx)
 	if err != nil {
 		return st, err
 	}
 	for _, p := range paths {
-		if seen[p] || slices.ContainsFunc(keep, func(dir string) bool { return strings.HasPrefix(p, dir) }) {
+		if seen[p] || kept(p) {
 			continue
 		}
 		if _, err := ix.remove(ctx, p); err != nil {
 			return st, err
 		}
 		st.Removed++
+	}
+	var del []string
+	for p := range codeHave {
+		if !codeSeen[p] && !kept(p) {
+			del = append(del, p)
+		}
+	}
+	if err := ix.Store.UpdateVocab(ctx, put, del); err != nil {
+		return st, err
+	}
+	if len(put)+len(del) > 0 {
+		ix.logf("vocabulary: %d source files read, %d removed", len(put), len(del))
 	}
 	return st, nil
 }
@@ -327,7 +381,8 @@ type Mode string
 
 const (
 	// Auto, the default, is Hybrid when the query holds an identifier-like
-	// word (see HasIdentifier) and Semantic otherwise.
+	// word (see HasIdentifier) or a word from the code vocabulary (see
+	// Indexer.Resolve), and Semantic otherwise.
 	Auto Mode = "auto"
 	// Hybrid merges vector and keyword search by reciprocal rank fusion.
 	Hybrid Mode = "hybrid"
@@ -348,9 +403,10 @@ func ParseMode(s string) (Mode, error) {
 	return "", fmt.Errorf("mode must be auto, hybrid, semantic or keyword, not %q", s)
 }
 
-// Resolve returns the mode a search for query runs in: for Auto (or ""),
-// Hybrid if HasIdentifier(query) and Semantic otherwise; any other mode as
-// it is.
+// Resolve returns the mode a search for query runs in, without the code
+// vocabulary: for Auto (or ""), Hybrid if HasIdentifier(query) and Semantic
+// otherwise; any other mode as it is. Indexer.Resolve also consults the
+// vocabulary.
 func Resolve(mode Mode, query string) Mode {
 	if mode != "" && mode != Auto {
 		return mode
@@ -359,6 +415,44 @@ func Resolve(mode Mode, query string) Mode {
 		return Hybrid
 	}
 	return Semantic
+}
+
+// Resolve returns the mode a search for query runs in: for Auto (or ""),
+// Hybrid if HasIdentifier(query) or a word of the query, trimmed as
+// HasIdentifier trims it and lowercased, is in the index's code vocabulary,
+// and Semantic otherwise; any other mode as it is. A failed vocabulary
+// lookup counts as no match.
+func (ix *Indexer) Resolve(ctx context.Context, mode Mode, query string) Mode {
+	if m := Resolve(mode, query); m != Semantic || (mode != "" && mode != Auto) {
+		return m
+	}
+	if ix.Store != nil {
+		if ok, err := ix.Store.InVocab(ctx, queryWords(query)); err == nil && ok {
+			return Hybrid
+		}
+	}
+	return Semantic
+}
+
+// maxVocabWords caps the query words looked up in the vocabulary.
+const maxVocabWords = 32
+
+// queryWords returns the distinct words of query as the vocabulary stores
+// names: trimmed as HasIdentifier trims them, lowercased, at most
+// vocab.MaxNameBytes each.
+func queryWords(query string) []string {
+	var out []string
+	for _, w := range strings.Fields(query) {
+		w = strings.ToLower(strings.Trim(w, "\"'`()[]{}<>.,;:?!"))
+		if w == "" || len(w) > vocab.MaxNameBytes || slices.Contains(out, w) {
+			continue
+		}
+		out = append(out, w)
+		if len(out) == maxVocabWords {
+			break
+		}
+	}
+	return out
 }
 
 // HasIdentifier reports whether query holds an identifier-like word, which
@@ -411,7 +505,7 @@ const keywordHint = `; mode="keyword" still works without the embedding API`
 // with identical text in several files are folded into one hit, with the
 // other copies in Also. Paths dropped or changed are passed to OnStale.
 func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) ([]store.Hit, error) {
-	mode = Resolve(mode, query)
+	mode = ix.Resolve(ctx, mode, query)
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
 	}

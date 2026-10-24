@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS chunks(
 	text_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
+CREATE TABLE IF NOT EXISTS vocab(name TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS vocab_files(
+	path TEXT PRIMARY KEY,
+	hash TEXT NOT NULL,
+	names TEXT NOT NULL
+);
 `
 
 // ftsSchema is the keyword index: an external-content FTS5 table over chunk
@@ -93,7 +99,7 @@ var ErrIndexGone = errors.New("index file was removed or replaced")
 
 // SchemaVersion is recorded as meta "schema" once the tables have every
 // column this version uses.
-const SchemaVersion = "3"
+const SchemaVersion = "4"
 
 // Chunk is a stored piece of a note.
 type Chunk struct {
@@ -346,7 +352,9 @@ func createVecs(ctx context.Context, conn *sql.Conn) error {
 // columns it adds are NULL in existing rows, which callers treat as
 // unknown: files.mtime and files.size (search re-reads the file), and
 // chunks.end_line (filled in by the next sync without re-embedding). Text
-// hashes and the keyword index are built from the stored chunks.
+// hashes and the keyword index are built from the stored chunks. The
+// vocabulary tables (version 4) are created empty by schema, and the next
+// sync fills them.
 func migrate(ctx context.Context, conn *sql.Conn) error {
 	for _, add := range []struct{ table, col string }{
 		{"files", "mtime"}, {"files", "size"}, {"chunks", "end_line"},
@@ -830,6 +838,8 @@ func (s *Store) Reset(ctx context.Context) error {
 		DROP TABLE IF EXISTS vecs;
 		DELETE FROM chunks;
 		DELETE FROM files;
+		DELETE FROM vocab;
+		DELETE FROM vocab_files;
 		DELETE FROM meta;`)
 	if err != nil {
 		return err

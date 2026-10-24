@@ -139,12 +139,14 @@ Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=f
 
 `scree search -mode` and the `search_docs` tool's `mode` take:
 
-- **`auto`** (the default): `semantic`, unless the query has an identifier-like word, a word with a letter plus `_` or a digit, such as `PURGE_OLD_RECORDS`, `psycopg_pool`, `R7-Q2` or `v2`; then `hybrid`. `ID`, `API`, `2026` and `well-known` don't count.
+- **`auto`** (the default): `semantic`, unless the query has an identifier-like word, a word with a letter plus `_` or a digit, such as `PURGE_OLD_RECORDS`, `psycopg_pool`, `R7-Q2` or `v2`, or a word from the folder's code vocabulary (below); then `hybrid`. `ID`, `API`, `2026` and `well-known` don't count.
 - **`hybrid`**: a vector search and an SQLite FTS5 keyword search over chunk text, heading and path, merged by reciprocal rank fusion, so exact names rank first.
 - **`semantic`**: vectors only.
 - **`keyword`**: FTS5 only. It makes no API call, so it works without a key or while the API is down. A failed embedding call says so.
 
 On a private set of 16 plain-language and 7 identifier queries over real notes, `auto` kept plain-question file MRR at 0.89 while raising identifier MRR from 0.46 to 0.80. Always-on `hybrid` raised identifiers as much but cost plain questions, which is why it is not the default.
+
+The code vocabulary catches names with no `_` or digit, such as `psycopg` or `PageFetcher`. Each sync reads, under the same ignore rules as markdown, the dependency names in `requirements*.txt`, `pyproject.toml`, `package.json`, `go.mod` and `Cargo.toml`, and the mixed-case names (`PageFetcher`, `useState`) in import statements and declarations of Python, JavaScript, TypeScript and Go files; vendored folders and unchanged files are skipped. Ordinary words never count, even as package names: `golang.org/x/sync` adds only its full path, and a short stoplist drops names like `sync`, `text` or `common`. Only the lowercased names are kept, in the local index; code is never chunked, embedded or sent to the API, and `scree doctor -v` shows the vocabulary's size and a sample. On two repos with code and docs, this raised results for questions naming code a little and sent no plain question to `hybrid`.
 
 The query is never passed to FTS5 as syntax: each word becomes a quoted term. Words keep `_` and `-`, so `psycopg_pool` is one term, and `pool` alone finds it only through the vector side.
 

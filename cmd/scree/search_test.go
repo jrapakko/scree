@@ -38,6 +38,9 @@ func searchFixture(t *testing.T) (notes, db string) {
 	if err := s.ReplaceFile(context.Background(), "ops.md", "h", 1, nil, chunks, [][]float32{{1, 0}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpdateVocab(context.Background(), []store.VocabFile{{Path: "app.py", Hash: "h", Names: []string{"pagefetcher"}}}, nil); err != nil {
+		t.Fatal(err)
+	}
 	return notes, db
 }
 
@@ -78,7 +81,8 @@ func TestCLISearchKeywordJSON(t *testing.T) {
 	out = captureStdout(t, func() {
 		runDoctor(context.Background(), []string{"-v", "-offline", "-notes", notes, "-db", db})
 	})
-	for _, want := range []string{"ok   keyword index: 1 chunks", "ok   keyword index integrity check"} {
+	for _, want := range []string{"ok   keyword index: 1 chunks", "ok   keyword index integrity check",
+		"ok   code vocabulary: 1 names from 1 manifests and source files", `  vocabulary sample: "pagefetcher"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor lacks %q:\n%s", want, out)
 		}
@@ -87,7 +91,7 @@ func TestCLISearchKeywordJSON(t *testing.T) {
 
 // TestCLISearchDefaultsToAuto: with no -mode, a plain query runs semantic
 // and an identifier query hybrid, as the JSON mode field and the XML
-// note say.
+// note say. A name from the code vocabulary also gives hybrid.
 func TestCLISearchDefaultsToAuto(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -98,7 +102,7 @@ func TestCLISearchDefaultsToAuto(t *testing.T) {
 	t.Setenv("SCREE_EMBED_URL", api.URL)
 	t.Setenv("OPENROUTER_API_KEY", "test-key")
 	t.Setenv("SCREE_ZDR", "0")
-	for q, want := range map[string]string{"nightly run": "semantic", "purge_old_records": "hybrid"} {
+	for q, want := range map[string]string{"nightly run": "semantic", "purge_old_records": "hybrid", "does the PageFetcher purge?": "hybrid"} {
 		var runErr error
 		out := captureStdout(t, func() {
 			runErr = runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "json", q})

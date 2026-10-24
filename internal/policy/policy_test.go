@@ -427,3 +427,47 @@ func TestReasonStrings(t *testing.T) {
 		t.Error("git reasons are out of order")
 	}
 }
+
+// TestWalkStatWith: the files extra accepts are walked under every other
+// rule, a symlink to outside the folder included, while Read, Check and
+// CheckName still refuse them.
+func TestWalkStatWith(t *testing.T) {
+	dir := fixture(t)
+	notes := filepath.Join(dir, "notes")
+	write(t, filepath.Join(dir, "outside", "out.go"), "package out")
+	write(t, filepath.Join(notes, "a.go"), "package a")
+	write(t, filepath.Join(notes, "n.md"), "# n")
+	write(t, filepath.Join(notes, ".hidden", "h.go"), "package h")
+	write(t, filepath.Join(notes, "skip", "s.go"), "package s")
+	write(t, filepath.Join(notes, "a.txt"), "not accepted")
+	write(t, filepath.Join(notes, IgnoreFileName), "skip/\n")
+	link(t, filepath.Join(dir, "outside", "out.go"), filepath.Join(notes, "link.go"))
+	p, err := Open(notes, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	var got []string
+	err = p.WalkStatWith(context.Background(), func(rel string) bool { return strings.HasSuffix(rel, ".go") },
+		func(rel string, src []byte, _ fs.FileInfo, err error) error {
+			if err == nil {
+				got = append(got, rel+"="+string(src))
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a.go=package a", "n.md=# n"}; !slices.Equal(got, want) {
+		t.Errorf("walked %q, want %q", got, want)
+	}
+	if _, err := p.Read("a.go"); !errors.Is(err, ErrIgnored) {
+		t.Errorf("Read(a.go) = %v", err)
+	}
+	if _, err := p.Check("a.go"); !errors.Is(err, ErrIgnored) {
+		t.Errorf("Check(a.go) = %v", err)
+	}
+	if r := p.CheckName("a.go"); r != NotMarkdown {
+		t.Errorf("CheckName(a.go) = %v", r)
+	}
+}
