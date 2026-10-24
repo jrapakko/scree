@@ -1,6 +1,18 @@
 ---
 layout: default
 ---
+<div class="scree-layout">
+
+<nav class="scree-sidebar" aria-label="Pages">
+  <ul>
+    {%- for p in site.data.nav -%}
+    {%- assign doc = site.pages | where: "path", p.path | first -%}
+    <li>{% if doc.url == page.url %}<a href="{{ doc.url | relative_url }}" aria-current="page">{{ doc.nav_title | default: doc.title | escape }}</a>{% else %}<a href="{{ doc.url | relative_url }}">{{ doc.nav_title | default: doc.title | escape }}</a>{% endif %}</li>
+    {%- endfor -%}
+  </ul>
+</nav>
+
+<div class="scree-main">
 <p class="scree-banner">Documents the per-repo version in development on the <code>per-repo</code> branch; the current release on <code>main</code> indexes a single notes folder.</p>
 
 <article class="post">
@@ -14,13 +26,6 @@ layout: default
   </div>
 
 </article>
+</div>
 
-<nav class="scree-docnav" aria-label="All pages">
-  <h2>All pages</h2>
-  <ol>
-    {%- for p in site.data.nav -%}
-    {%- assign doc = site.pages | where: "path", p.path | first -%}
-    <li>{% if doc.url == page.url %}<strong>{{ doc.title | escape }}</strong>{% else %}<a href="{{ doc.url | relative_url }}">{{ doc.title | escape }}</a>{% endif %}</li>
-    {%- endfor -%}
-  </ol>
-</nav>
+</div>

@@ -1,5 +1,8 @@
 ---
 ---
+// Room for the sidebar next to the text.
+$content-width: 1080px;
+
 @import "minima";
 
 .scree-banner {
@@ -9,12 +12,39 @@
   margin-bottom: 24px;
   font-size: 15px;
 }
-.scree-docnav {
-  border-top: 1px solid #e8e8e8;
-  margin-top: 40px;
-  padding-top: 16px;
+// Page list: a sticky sidebar on wide screens, above the text on narrow ones.
+.scree-layout {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  gap: 40px;
+}
+.scree-sidebar {
+  position: sticky;
+  top: 20px;
+  align-self: start;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  padding-right: 16px;
+  border-right: 1px solid #e8e8e8;
   font-size: 15px;
-  h2 { font-size: 18px; }
+  ul { list-style: none; margin: 0; }
+  li { margin: 0 0 6px; }
+  a { color: inherit; display: block; padding: 2px 8px; border-radius: 4px; }
+  a:hover { background: rgba(127, 127, 127, 0.12); text-decoration: none; }
+  a[aria-current="page"] { font-weight: 600; background: rgba(42, 122, 226, 0.12); }
+}
+@media screen and (max-width: 800px) {
+  .scree-layout { display: block; }
+  .scree-sidebar {
+    position: static;
+    max-height: none;
+    padding: 0 0 12px;
+    margin-bottom: 20px;
+    border-right: 0;
+    border-bottom: 1px solid #e8e8e8;
+    ul { display: flex; flex-wrap: wrap; gap: 4px 2px; }
+    li { margin: 0; }
+  }
 }
 table { display: block; overflow-x: auto; }
 
@@ -64,7 +94,9 @@ table { display: block; overflow-x: auto; }
   .highlight .o, .highlight .p { color: #d8dde3; }
   .highlight .err { color: #f85149; background: none; }
   .scree-banner { background: #2b2611; border-left-color: #b08800; color: #e6dcb8; }
-  .scree-docnav { border-top-color: #30363d; }
+  .scree-sidebar { border-color: #30363d; }
+  .scree-sidebar a { color: #d8dde3; }
+  .scree-sidebar a[aria-current="page"] { background: rgba(108, 182, 255, 0.16); }
   .theme-toggle { border-color: #444c56; }
 }
 @media (prefers-color-scheme: dark) {

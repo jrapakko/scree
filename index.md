@@ -1,5 +1,6 @@
 ---
 title: scree
+nav_title: Overview
 ---
 
 scree is a Go MCP server that gives Claude Code semantic search over the markdown in a repository: READMEs, design docs, ADRs, agent instructions and notes, but not code.

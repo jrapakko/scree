@@ -21,20 +21,10 @@ kramdown:
   input: GFM
   syntax_highlighter: rouge
 
-# Pages in the top navigation bar. Every page also lists all pages at the
-# bottom (see _layouts/page.html).
-header_pages:
-  - getting-started.md
-  - using-with-claude-code.md
-  - cli.md
-  - configuration.md
-  - ignoring-files.md
-  - security.md
-  - troubleshooting.md
+# Pages are listed in the sidebar; the order comes from _data/nav.yml.
 
 defaults:
   - scope:
       path: ""
     values:
       layout: page
-
