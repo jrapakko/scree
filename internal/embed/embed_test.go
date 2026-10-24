@@ -262,3 +262,31 @@ func TestErrorUsesJSONMessage(t *testing.T) {
 		t.Error("402 counted as unavailable")
 	}
 }
+
+func TestErrorRedactsKeyAtCutAndSplit(t *testing.T) {
+	const key = "sk-or-v1-0123456789abcdef0123456789abcdef"
+	cases := map[string]string{
+		// The key straddles the 300-byte cut.
+		"at the cut": strings.Repeat("x", 292) + key,
+		// An invisible character splits the key.
+		"split": "bad key: " + key[:9] + "​" + key[9:],
+		// Only the key's tail survives.
+		"tail only": "key ends in " + key[len(key)-14:],
+	}
+	for name, body := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, body, http.StatusUnauthorized)
+		}))
+		_, err := New(srv.URL, key, "m", 0).Embed(context.Background(), []string{"x"})
+		srv.Close()
+		if err == nil {
+			t.Fatalf("%s: no error", name)
+		}
+		msg := err.Error()
+		for _, part := range []string{key, key[:8], key[len(key)-12:]} {
+			if strings.Contains(msg, part) {
+				t.Errorf("%s: error leaks %q: %q", name, part, msg)
+			}
+		}
+	}
+}

@@ -21,7 +21,8 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
    ```sh
    mkdir -p ~/.config/scree
    printf 'OpenRouter API key: '; stty -echo; IFS= read -r key; stty echo; echo
-   ( umask 077; printf 'SCREE_NOTES=%s\nOPENROUTER_API_KEY=%s\n' "$HOME/notes" "$key" > ~/.config/scree/env )
+   ( umask 077; printf "SCREE_NOTES='%s'\nOPENROUTER_API_KEY='%s'\n" "$HOME/notes" "$key" > ~/.config/scree/env )
+   chmod 600 ~/.config/scree/env
    unset key
    ```
 
@@ -29,13 +30,13 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
 
    ```sh
    mkdir -p ~/.local/bin
-   install -m 755 bin/scree contrib/scree-mcp ~/.local/bin/
+   install -m 755 bin/scree contrib/scree-mcp contrib/scree-run ~/.local/bin/
    ```
 
-4. **Check and build the index.** The CLI reads its settings from the environment, so load the file into a subshell:
+4. **Check and build the index.** `scree-run` loads the settings file and runs a scree command:
 
    ```sh
-   ( set -a; . ~/.config/scree/env; set +a; scree doctor -v && scree reindex )
+   scree-run doctor -v && scree-run reindex
    ```
 
    `doctor -v` lists every file that will be ignored. Add a [`.screeignore`](#ignoring-files) before indexing if anything private shows up as indexable.
@@ -121,9 +122,9 @@ After upgrading from an earlier version, run `scree reindex -all` once so existi
 
 ### Settings file
 
-Claude Code, the wrapper scripts and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. Step 2 of the [Quick start](#quick-start) creates it. For the CLI, load it into a subshell: `( set -a; . ~/.config/scree/env; set +a; scree search "…" )`.
+Claude Code, the wrapper scripts and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. Step 2 of the [Quick start](#quick-start) creates it. For the CLI, `scree-run <command>` loads it, for example `scree-run search "…"`.
 
-Use plain `NAME=value` lines without quotes, since systemd reads the file too. Other variables from the Configure table can go in the same file. If you made the file another way, run `chmod 600 ~/.config/scree/env`, or the wrappers refuse to start.
+Write one `NAME=value` per line, and wrap values in single quotes, as step 2 does, so a path with spaces stays one value. systemd reads the same quotes. The wrapper scripts read the file as data and never run it as shell, so nothing in a value is expanded. They accept only scree's own variables (`SCREE_*`, `OPENROUTER_API_KEY`) and the proxy variables, and they refuse to start if the file is readable by group or others; `chmod 600` fixes that. Other variables from the Configure table can go in the same file. A value can't itself contain the quote character that wraps it.
 
 ### Claude Code
 
@@ -143,7 +144,7 @@ Stdio through the wrapper is the recommended setup. `serve -http` listens on loo
 
 ```sh
 printf 'SCREE_HTTP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.config/scree/env
-( set -a; . ~/.config/scree/env; set +a; scree serve -http 0.0.0.0:7077 -allow-remote )
+scree-run serve -http 0.0.0.0:7077 -allow-remote
 ```
 
 A client then needs the header. If you add it with `claude mcp add --transport http ... --header "Authorization: Bearer $SCREE_HTTP_TOKEN"`, expanding the variable at the shell keeps the token out of your shell history, but Claude Code still stores the expanded header in `~/.claude.json`.
