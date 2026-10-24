@@ -2,6 +2,8 @@ package index
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
+	"github.com/jrapakko/scree/internal/vocab"
 )
 
 // setupRepo is setup over a git work tree, with a recording embedder.
@@ -162,6 +165,7 @@ func TestResolveVocab(t *testing.T) {
 		want  Mode
 	}{
 		{Auto, "how does the PageFetcher retry?", Hybrid},
+		{Auto, "when does PageFetcher's retry give up", Hybrid},
 		{Auto, "which version of psycopg do we pin", Hybrid},
 		{"", "is `zustand` used for state", Hybrid},
 		{Auto, "upgrade golang.org/x/sync", Hybrid},
@@ -200,9 +204,225 @@ func TestResolveVocab(t *testing.T) {
 }
 
 func TestQueryWords(t *testing.T) {
-	got := queryWords(`How does "PageFetcher" work? (psycopg, PageFetcher) ...`)
-	want := []string{"how", "does", "pagefetcher", "work", "psycopg"}
+	got := queryWords(`How does "PageFetcher" work? (psycopg, PageFetcher's) ... ChunkStore’s`)
+	want := []string{"how", "does", "pagefetcher", "work", "psycopg", "chunkstore"}
 	if !slices.Equal(got, want) {
 		t.Errorf("queryWords = %q, want %q", got, want)
+	}
+}
+
+// TestSyncSymlinkClass: a symlink is read only as its own class. A note
+// linked to code is neither embedded nor indexed, a source file linked to a
+// note adds no names, and a source file linked to another in the folder is
+// read like one.
+func TestSyncSymlinkClass(t *testing.T) {
+	ctx := context.Background()
+	ix, re := setupRepo(t)
+	root := ix.Root()
+	write(t, root, "README.md", "# Demo\nPlain words.\n")
+	write(t, root, "secret.py", "API_TOKEN = 'leakedValue'\nclass SecretKeeper: pass\n")
+	write(t, root, "doc.md", "# Doc\ndef markdownTrick(): pass\n")
+	write(t, root, ".claude/hooks/hook.py", "class HiddenHook: pass\n")
+	write(t, root, "app/engine.py", "class PageFetcher: pass\n")
+	symlink(t, "secret.py", filepath.Join(root, "notes.md"))
+	symlink(t, "doc.md", filepath.Join(root, "trick.py"))
+	symlink(t, "app/engine.py", filepath.Join(root, "inner.py"))
+	symlink(t, ".claude/hooks/hook.py", filepath.Join(root, "hooklink.py"))
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range re.inputs {
+		if strings.Contains(in, "leakedValue") || strings.Contains(in, "SecretKeeper") {
+			t.Errorf("embedded code through a link: %q", in)
+		}
+	}
+	if got := paths(t, ix); !slices.Equal(got, []string{"README.md", "doc.md"}) {
+		t.Errorf("indexed %v", got)
+	}
+	files, err := ix.Store.VocabFiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := files["inner.py"]; !ok {
+		t.Errorf("in-folder .py link not read: %v", files)
+	}
+	for _, p := range []string{"trick.py", "hooklink.py", "notes.md", ".claude/hooks/hook.py"} {
+		if _, ok := files[p]; ok {
+			t.Errorf("%s read for the vocabulary", p)
+		}
+	}
+	got := vocabNames(t, ix)
+	if want := []string{"pagefetcher", "secretkeeper"}; !slices.Equal(got, want) {
+		t.Errorf("vocab = %q, want %q", got, want)
+	}
+	// Defence in depth: nothing but markdown reaches the embedder.
+	n := len(re.inputs)
+	if _, err := ix.indexSrc(ctx, "secret.py", []byte("class SecretKeeper: pass\n"), nil); err == nil || len(re.inputs) != n {
+		t.Errorf("indexSrc(secret.py) = %v, %d inputs", err, len(re.inputs)-n)
+	}
+}
+
+// TestSyncHiddenSources: the hidden-folder allowlist is for markdown; code
+// under any hidden folder contributes nothing.
+func TestSyncHiddenSources(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	writeFixture(t, ix.Root(), map[string]string{
+		".claude/agents/a.md":       "# Agent\n",
+		".claude/hooks/hook.py":     "class HookRunner: pass\n",
+		".github/x.py":              "class CiHelper: pass\n",
+		".github/package.json":      `{"dependencies": {"zustand": "1"}}`,
+		".github/workflows/ci.md":   "# CI\n",
+		"app/engine.py":             "class PageFetcher: pass\n",
+		"app/.cache/stale.py":       "class StaleThing: pass\n",
+		".claude/worktrees/w/a.py":  "class WorktreeThing: pass\n",
+		".claude/worktrees/w/b.md":  "# copy\n",
+		".claude/skills/s/SKILL.md": "# Skill\n",
+	})
+	st, err := ix.Sync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Sources != 1 {
+		t.Errorf("sources: %+v", st)
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"pagefetcher"}) {
+		t.Errorf("vocab = %q", got)
+	}
+	if got := paths(t, ix); !slices.Equal(got, []string{".claude/agents/a.md", ".claude/skills/s/SKILL.md", ".github/workflows/ci.md"}) {
+		t.Errorf("indexed %v", got)
+	}
+}
+
+// TestSyncSourceCap: files past the cap are never opened, and Sources
+// counts at most the cap.
+func TestSyncSourceCap(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	defer func(n int) { sourceCap = n }(sourceCap)
+	sourceCap = 3
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		write(t, ix.Root(), "src/"+n+".py", "class "+n+"Thing: pass\n")
+	}
+	write(t, ix.Root(), "z.md", "# Z\n")
+	var opened []string
+	policy.TestHooks.BeforeOpen = func(rel string) { opened = append(opened, rel) }
+	defer func() { policy.TestHooks.BeforeOpen = nil }()
+	st, err := ix.Sync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"src/a.py", "src/b.py", "src/c.py", "z.md"}; !slices.Equal(opened, want) {
+		t.Errorf("opened %q, want %q", opened, want)
+	}
+	if st.Sources != 3 || st.SourcesChanged != 3 || st.Indexed != 1 {
+		t.Errorf("stats: %+v", st)
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"athing", "bthing", "cthing"}) {
+		t.Errorf("vocab = %q", got)
+	}
+}
+
+// TestSyncNameCap: names past the total cap are dropped, and the file cut
+// short is read again until there is room.
+func TestSyncNameCap(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	defer func(n int) { nameCap = n }(nameCap)
+	nameCap = 3
+	write(t, ix.Root(), "a.py", "class OneThing: pass\nclass TwoThing: pass\n")
+	write(t, ix.Root(), "b.py", "class RedThing: pass\nclass BlueThing: pass\n")
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"bluething", "onething", "twothing"}) {
+		t.Errorf("capped vocab = %q", got)
+	}
+	nameCap = 10
+	st, err := ix.Sync(ctx)
+	if err != nil || st.SourcesChanged != 1 {
+		t.Fatalf("sync = %+v, %v", st, err)
+	}
+	if got := vocabNames(t, ix); len(got) != 4 {
+		t.Errorf("vocab with room = %q", got)
+	}
+	if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 0 {
+		t.Errorf("third sync = %+v, %v", st, err)
+	}
+}
+
+// TestSyncVocabVersion: names read by another extractor version are all
+// read again.
+func TestSyncVocabVersion(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	writeFixture(t, ix.Root(), codeFixture)
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := ix.Store.Meta(store.VocabVersionKey); v != vocab.Version {
+		t.Fatalf("vocab version = %q", v)
+	}
+	// Stand in for names an older extractor read: same hash, other names.
+	src, _ := os.ReadFile(filepath.Join(ix.Root(), "app", "engine.py"))
+	sum := sha256.Sum256(src)
+	old := store.VocabFile{Path: "app/engine.py", Hash: hex.EncodeToString(sum[:]), Names: []string{"oldname"}}
+	if err := ix.Store.UpdateVocab(ctx, []store.VocabFile{old}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := ix.Sync(ctx); err != nil || st.SourcesChanged != 0 || !slices.Contains(vocabNames(t, ix), "oldname") {
+		t.Fatalf("same version: %+v, %v", st, err)
+	}
+	if err := ix.Store.SetMeta(store.VocabVersionKey, "0"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ix.Sync(ctx)
+	if err != nil || st.SourcesChanged != st.Sources || st.Sources != 6 {
+		t.Fatalf("new version: %+v, %v", st, err)
+	}
+	if got := vocabNames(t, ix); slices.Contains(got, "oldname") || !slices.Contains(got, "pagefetcher") {
+		t.Errorf("vocab = %q", got)
+	}
+	if v, _ := ix.Store.Meta(store.VocabVersionKey); v != vocab.Version {
+		t.Errorf("vocab version = %q", v)
+	}
+}
+
+// TestSyncVocabReadErrors: a transient read failure keeps a file's names;
+// a file that is gone or unreadable loses them.
+func TestSyncVocabReadErrors(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setupRepo(t)
+	root := ix.Root()
+	writeFixture(t, root, map[string]string{
+		"a/changing.py": "class ChangingThing: pass\n",
+		"b/dangling.py": "class DanglingThing: pass\n",
+		"c/locked.py":   "class LockedThing: pass\n",
+	})
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The file is replaced between the checks and the open: ErrChanged.
+	policy.TestHooks.BeforeOpen = func(rel string) {
+		if rel == "a/changing.py" {
+			p := filepath.Join(root, "a", "changing.py")
+			os.Remove(p)
+			os.WriteFile(p, []byte("class ChangingThing: pass\n"), 0o644)
+		}
+	}
+	defer func() { policy.TestHooks.BeforeOpen = nil }()
+	os.Remove(filepath.Join(root, "b", "dangling.py"))
+	symlink(t, "missing.py", filepath.Join(root, "b", "dangling.py"))
+	locked := filepath.Join(root, "c", "locked.py")
+	os.Chmod(locked, 0)
+	defer os.Chmod(locked, 0o644)
+	if _, err := os.ReadFile(locked); err == nil {
+		os.Remove(locked) // running as root: gone stands in for unreadable
+	}
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := vocabNames(t, ix); !slices.Equal(got, []string{"changingthing"}) {
+		t.Errorf("vocab = %q", got)
 	}
 }

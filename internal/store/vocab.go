@@ -17,23 +17,54 @@ type VocabFile struct {
 	Names      []string
 }
 
-// VocabHashes returns the stored hash of every file the vocabulary was read
-// from, by path.
-func (s *Store) VocabHashes(ctx context.Context) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path, hash FROM vocab_files`)
+// VocabVersionKey is the meta key holding the vocab.Version the stored
+// names were read with.
+const VocabVersionKey = "vocab_version"
+
+// VocabStored is what the index holds for one vocabulary file: its hash and
+// how many names it gave.
+type VocabStored struct {
+	Hash  string
+	Names int
+}
+
+// VocabFiles returns the stored hash and name count of every file the
+// vocabulary was read from, by path.
+func (s *Store) VocabFiles(ctx context.Context) (map[string]VocabStored, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path, hash, json_array_length(names) FROM vocab_files`)
 	if err != nil {
 		return nil, fmt.Errorf("store: vocabulary: %w", err)
 	}
 	defer rows.Close()
-	out := map[string]string{}
+	out := map[string]VocabStored{}
 	for rows.Next() {
-		var p, h string
-		if err := rows.Scan(&p, &h); err != nil {
+		var p string
+		var v VocabStored
+		if err := rows.Scan(&p, &v.Hash, &v.Names); err != nil {
 			return nil, err
 		}
-		out[p] = h
+		out[p] = v
 	}
 	return out, rows.Err()
+}
+
+// ClearVocab empties the vocabulary tables and records version as the
+// extractor the next names are read with, in one transaction. Only the
+// writer calls it.
+func (s *Store) ClearVocab(ctx context.Context, version string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM vocab; DELETE FROM vocab_files`); err != nil {
+		return fmt.Errorf("store: clearing vocabulary: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, VocabVersionKey, version); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateVocab replaces the rows of the files in put, removes those of the

@@ -34,8 +34,20 @@ func TestVocab(t *testing.T) {
 	if err := s.UpdateVocab(ctx, []VocabFile{{Path: "a.py", Hash: "4", Names: []string{"fetchpage"}}}, []string{"go.mod"}); err != nil {
 		t.Fatal(err)
 	}
-	if h, err := s.VocabHashes(ctx); err != nil || len(h) != 2 || h["a.py"] != "4" || h["empty.go"] != "3" {
-		t.Errorf("VocabHashes = %v, %v", h, err)
+	if h, err := s.VocabFiles(ctx); err != nil || len(h) != 2 || h["a.py"] != (VocabStored{"4", 1}) || h["empty.go"] != (VocabStored{"3", 0}) {
+		t.Errorf("VocabFiles = %v, %v", h, err)
+	}
+	if err := s.ClearVocab(ctx, "9"); err != nil {
+		t.Fatal(err)
+	}
+	if n, files, _, _ := s.VocabStats(ctx, 10); n != 0 || files != 0 {
+		t.Errorf("after ClearVocab: %d names, %d files", n, files)
+	}
+	if v, _ := s.Meta(VocabVersionKey); v != "9" {
+		t.Errorf("vocab version = %q", v)
+	}
+	if err := s.UpdateVocab(ctx, []VocabFile{{Path: "a.py", Hash: "4", Names: []string{"fetchpage"}}}, nil); err != nil {
+		t.Fatal(err)
 	}
 	if _, _, some, _ := s.VocabStats(ctx, 10); !slices.Equal(some, []string{"fetchpage"}) {
 		t.Errorf("after update = %q", some)

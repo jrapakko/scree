@@ -1,6 +1,7 @@
 package vocab
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -33,8 +34,8 @@ https://example.com/pkg.tar.gz
 ./local/path
 torch @ https://example.com/torch.whl
 uvicorn
-`, []string{"psycopg", "flask", "requests", "pydantic", "torch", "uvicorn"},
-		[]string{"binary", "pool", "base.txt", "editable", "https", "local", "2.3.0"})
+`, []string{"psycopg", "flask", "pydantic", "torch", "uvicorn"},
+		[]string{"requests", "binary", "pool", "base.txt", "editable", "https", "local", "2.3.0"})
 	if KindOf("requirements/dev.txt") != None || KindOf("sub/requirements.txt") != Requirements {
 		t.Error("requirements file kinds")
 	}
@@ -153,9 +154,105 @@ fancyMode = []
 func TestStoplist(t *testing.T) {
 	check(t, "package.json", `{"dependencies": {"common": "1", "core": "1", "lodash": "4", "io": "1", "api": "1"}}`,
 		[]string{"lodash"}, []string{"common", "core", "io", "api"})
-	if n := len(stop); n < 40 || n > 80 {
+	if n := len(stop); n < 250 || n > 500 {
 		t.Errorf("stoplist has %d words", n)
 	}
+	// Function and question words, words that are also packages, and plain
+	// words written as mixed case.
+	check(t, "package.json", `{"dependencies": {"requests": "1", "markdown": "1", "next": "1", "debug": "1",
+		"async": "1", "moment": "1", "got": "1", "marked": "1", "sharp": "1", "express": "1", "tracing": "1",
+		"futures": "1", "storage": "1", "cli": "1", "sdk": "1", "docker": "1", "config": "1", "utils": "1",
+		"how": "1", "what": "1", "where": "1", "the": "1", "and": "1", "for": "1", "with": "1", "from": "1",
+		"does": "1", "zustand": "1"}}`, []string{"zustand"},
+		[]string{"requests", "markdown", "next", "debug", "async", "moment", "got", "marked", "sharp", "express",
+			"tracing", "futures", "storage", "cli", "sdk", "docker", "config", "utils",
+			"how", "what", "where", "the", "and", "for", "with", "from", "does"})
+	check(t, "a.py", `def setUp(self): pass
+def tearDown(self): pass
+def logIn(): pass
+def logOut(): pass
+def signUp(): pass
+def signIn(): pass
+class FileName: pass
+class TimeOut: pass
+class MetaData: pass
+class DataBase: pass
+def hostName(): pass
+def userName(): pass
+def passWord(): pass
+def keyWord(): pass
+def fetchPage(): pass
+`, []string{"fetchpage"}, []string{"setup", "teardown", "login", "logout", "signup", "signin", "filename",
+		"timeout", "metadata", "database", "hostname", "username", "password", "keyword"})
+}
+
+// TestNormalizeASCII: only printable ASCII names are kept, so no C1 control,
+// bidi override or invalid UTF-8 reaches the index.
+func TestNormalizeASCII(t *testing.T) {
+	got := normalize([]string{"okName", "bad\u0085Name", "evil\u202eName", "inv\xffalid", "caf\u00e9Name", "tab\tName", "fineToo"})
+	if want := []string{"finetoo", "okname"}; !slices.Equal(got, want) {
+		t.Errorf("normalize = %q, want %q", got, want)
+	}
+}
+
+// TestMaxFileNames: a file keeps at most MaxFileNames names, the first in
+// sorted order.
+func TestMaxFileNames(t *testing.T) {
+	var b strings.Builder
+	for i := range MaxFileNames + 50 {
+		fmt.Fprintf(&b, "func fnName%05d() {}\n", i)
+	}
+	got := Extract("gen.go", []byte(b.String()))
+	if len(got) != MaxFileNames || got[0] != "fnname00000" || got[len(got)-1] != fmt.Sprintf("fnname%05d", MaxFileNames-1) {
+		t.Errorf("got %d names, %q .. %q", len(got), got[0], got[len(got)-1])
+	}
+}
+
+func TestTomlTable(t *testing.T) {
+	for l, want := range map[string]string{
+		"[project]":                      "project",
+		"  [tool.poetry.dependencies]  ": "tool.poetry.dependencies",
+		"[[bin]]":                        "bin",
+		`[dependencies."my.crate"]`:      "dependencies.my.crate",
+		"[ tool . ruff ] # lint":         "tool.ruff",
+		`['quoted key']`:                 "quoted key",
+	} {
+		if got, ok := tomlTable(l); !ok || got != want {
+			t.Errorf("tomlTable(%q) = %q, %v, want %q", l, got, ok, want)
+		}
+	}
+	for _, l := range []string{`["E", "F"]`, `[1, 2],`, `["x"],`, "[a]]", "[[a]", "[]", "[a b]", `x = ["y"]`} {
+		if got, ok := tomlTable(l); ok {
+			t.Errorf("tomlTable(%q) = %q, want no header", l, got)
+		}
+	}
+}
+
+// TestPyProjectArrays: a line inside another multi-line array that looks
+// like a header does not end [project] or a dependency table.
+func TestPyProjectArrays(t *testing.T) {
+	check(t, "pyproject.toml", `[project]
+classifiers = [
+    "Programming Language :: Python",
+]
+keywords = [
+    ["nested"],
+    ["dependencies"]
+]
+dependencies = ["rapidfuzz"]
+
+[tool.poetry.dependencies]
+extrasThing = { version = "1", extras = [
+    "a",
+] }
+orjson = "^3"
+`, []string{"rapidfuzz", "orjson"}, []string{"nested", "a"})
+	check(t, "Cargo.toml", `[dependencies]
+serde = { version = "1", features = [
+    ["derive"]
+] }
+tokio = "1"
+`, []string{"serde", "tokio"}, []string{"derive"})
 }
 
 func TestPython(t *testing.T) {

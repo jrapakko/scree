@@ -429,8 +429,9 @@ func TestReasonStrings(t *testing.T) {
 }
 
 // TestWalkStatWith: the files extra accepts are walked under every other
-// rule, a symlink to outside the folder included, while Read, Check and
-// CheckName still refuse them.
+// rule, a symlink to outside the folder included, and under any hidden
+// folder, allowlisted or not, are refused; a symlink is read only as its
+// own class; Read, Check and CheckName still refuse them.
 func TestWalkStatWith(t *testing.T) {
 	dir := fixture(t)
 	notes := filepath.Join(dir, "notes")
@@ -441,7 +442,14 @@ func TestWalkStatWith(t *testing.T) {
 	write(t, filepath.Join(notes, "skip", "s.go"), "package s")
 	write(t, filepath.Join(notes, "a.txt"), "not accepted")
 	write(t, filepath.Join(notes, IgnoreFileName), "skip/\n")
+	write(t, filepath.Join(notes, ".github", "ci.go"), "package ci")
+	write(t, filepath.Join(notes, ".github", "ci.md"), "# ci")
 	link(t, filepath.Join(dir, "outside", "out.go"), filepath.Join(notes, "link.go"))
+	// A link is read only as its own class.
+	link(t, filepath.Join(notes, "a.go"), filepath.Join(notes, "note.md"))
+	link(t, filepath.Join(notes, "n.md"), filepath.Join(notes, "fake.go"))
+	link(t, filepath.Join(notes, "a.go"), filepath.Join(notes, "same.go"))
+	link(t, filepath.Join(notes, ".github", "ci.go"), filepath.Join(notes, "hidden.go"))
 	p, err := Open(notes, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -458,7 +466,7 @@ func TestWalkStatWith(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"a.go=package a", "n.md=# n"}; !slices.Equal(got, want) {
+	if want := []string{".github/ci.md=# ci", "a.go=package a", "n.md=# n", "same.go=package a"}; !slices.Equal(got, want) {
 		t.Errorf("walked %q, want %q", got, want)
 	}
 	if _, err := p.Read("a.go"); !errors.Is(err, ErrIgnored) {

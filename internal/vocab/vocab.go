@@ -16,8 +16,21 @@ import (
 	"strings"
 )
 
+// Version names the extraction rules. An index whose names were read under
+// another version reads every file again; bump it whenever a change to this
+// package would give different names for the same file.
+const Version = "2"
+
 // MaxNameBytes is the longest name kept; longer ones are dropped.
 const MaxNameBytes = 128
+
+// MaxFileNames caps the names kept from one file: the first ones in sorted
+// order. A generated file with more is mostly noise.
+const MaxFileNames = 2000
+
+// MaxNames caps the names one index keeps across all files, about 5 MB of
+// names at most (see index.Sync).
+const MaxNames = 100000
 
 // minNameBytes is the shortest bare name kept: two-letter names such as
 // "go" or "ms" are too often ordinary words.
@@ -83,7 +96,9 @@ func KindOf(rel string) Kind {
 func IsSource(rel string) bool { return KindOf(rel) != None }
 
 // Extract returns the vocabulary names in src, read as the file rel:
-// lowercased, at most MaxNameBytes each, sorted and without duplicates.
+// lowercased, printable ASCII, at most MaxNameBytes each, sorted, without
+// duplicates and at most MaxFileNames of them. Each is a copy, so none
+// keeps src alive.
 func Extract(rel string, src []byte) []string {
 	var names []string
 	switch KindOf(rel) {
@@ -107,44 +122,93 @@ func Extract(rel string, src []byte) []string {
 	return normalize(names)
 }
 
-// normalize lowercases names and drops empty, too short, too long and
-// stoplisted ones, and duplicates.
+// normalize lowercases names and drops empty, too short, too long,
+// non-ASCII and stoplisted ones, and duplicates. It keeps the first
+// MaxFileNames, each copied out of the source text.
 func normalize(names []string) []string {
 	out := names[:0]
 	for _, n := range names {
 		n = strings.ToLower(strings.TrimSpace(n))
-		if len(n) < minNameBytes || len(n) > MaxNameBytes || stop[n] || !printable(n) {
+		if len(n) < minNameBytes || len(n) > MaxNameBytes || !printable(n) || stop[n] {
 			continue
 		}
 		out = append(out, n)
 	}
 	slices.Sort(out)
-	return slices.Compact(out)
+	out = slices.Compact(out)
+	if len(out) > MaxFileNames {
+		out = out[:MaxFileNames]
+	}
+	for i, n := range out {
+		out[i] = strings.Clone(n)
+	}
+	return out
 }
 
+// printable reports whether s is printable ASCII without spaces (0x21 to
+// 0x7e), so no control, bidi or invalid UTF-8 byte reaches the index or
+// doctor's output.
 func printable(s string) bool {
 	for i := 0; i < len(s); i++ {
-		if s[i] <= ' ' || s[i] == 0x7f {
+		if s[i] < 0x21 || s[i] > 0x7e {
 			return false
 		}
 	}
 	return true
 }
 
-// stop lists common English words that are also short package names, such
-// as Go's x/sync or a dependency called "common". A name in it is never
-// vocabulary, so plain questions using the word stay semantic.
+// stop lists words that are never vocabulary, so plain questions using them
+// stay semantic: English function and question words, common words that are
+// also package names (Go's x/sync, npm's got or marked, Python's requests),
+// and plain words that code writes as mixed case (setUp, fileName). Each
+// list is sorted.
 var stop = map[string]bool{}
 
 func init() {
-	for _, w := range strings.Fields(`
-		sync text sys net crypto time encoding errors io os log http json
-		test tests testing util utils core common api client server context
-		config types math path image mod tools term exp run new data base
-		lib internal cmd main app web file files string strings sort bytes
-		hash html xml yaml url color build cache event events flag check
-		pretty mock rich click black`) {
-		stop[w] = true
+	for _, list := range []string{
+		// English function, question and common verbs.
+		`about above after again all also and any are because been before
+		being below between both but can cannot could did does doing done
+		down during each else even every few for from get gets had has have
+		having her here hers him his how into its just let like make many
+		may might more most much must need not now off once one only other
+		our out over own per put same set shall she should show some such
+		than that the their them then there these they this those through
+		too two under until upon use used uses using very via want was way
+		were what when where which while who whom why will with work works
+		would yes yet you your yours`,
+		// Common words that are also package names.
+		`abc ansi api app args array assert async attrs auth base black
+		build bytes cache chart check cli click client clone cmd color
+		colors commander common compress config context cookie cookies core
+		cron crypto csv dash data date debug decimal deep defaults diff
+		docker email encoding enum errors event events exp express extend
+		fetch file files filter flag format forms futures glob got graph
+		hash history html http image ini internal invariant json lib log
+		logger logging main markdown marked math memo merge mime mock mod
+		moment net next node open optional parse parser path pretty
+		process progress promise prompt queue random regex request requests
+		retry rich router run sdk server sharp shell signal six slug sort
+		sql storage stream string strings styled sync sys table tar temp
+		term test testing tests text thread time timer toml tools tracing
+		types typing url util utils validator warning warnings web wrap xml
+		yaml`,
+		// Plain words written as mixed case: setUp, fileName, timeOut.
+		`backend background blacklist callback checkbox checkout checkpoint
+		cleanup dashboard database datetime download dropdown endpoint
+		feedback filename filepath framework frontend fullscreen healthcheck
+		homepage hostname hotfix keyboard keyword keywords layout lifecycle
+		login logout lookup markup metadata namespace network newline
+		notebook offline online overflow override overview password pathname
+		placeholder playground popup readme readonly runtime screenshot
+		setup shutdown sidebar signin signout signup snapshot startup
+		stylesheet subdomain teardown textbox timeout timestamp toolbar
+		upload username viewport webhook webpage website whitelist
+		whitespace wildcard workflow workload workspace`,
+	} {
+		for _, w := range strings.Fields(list) {
+			stop[w] = true
+		}
 	}
 }
 
@@ -205,22 +269,51 @@ func requirements(src []byte) []string {
 	return out
 }
 
+// tomlKeyPart is one bare or quoted part of a TOML key.
+const tomlKeyPart = `(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')`
+
+var (
+	tomlHeader = regexp.MustCompile(`^\s*(\[\[?)\s*(` + tomlKeyPart + `(?:\s*\.\s*` + tomlKeyPart + `)*)\s*(\]\]?)\s*(?:#.*)?$`)
+	tomlPart   = regexp.MustCompile(tomlKeyPart)
+)
+
 // tomlTable returns the table name of a [table] or [[array]] header line,
-// and whether the line is one.
+// its dotted key with quotes dropped, and whether the line is one. Only a
+// whole header counts, so a line such as ["E", "F"] inside a multi-line
+// array is not one.
 func tomlTable(l string) (string, bool) {
-	l = strings.TrimSpace(l)
-	if i := strings.Index(l, "#"); i > 0 && !strings.ContainsAny(l[:i], `"'`) {
-		l = strings.TrimSpace(l[:i])
-	}
-	if !strings.HasPrefix(l, "[") || !strings.HasSuffix(l, "]") {
+	m := tomlHeader.FindStringSubmatch(l)
+	if m == nil || len(m[1]) != len(m[3]) {
 		return "", false
 	}
-	l = strings.Trim(l, "[]")
-	parts := strings.Split(l, ".")
+	parts := tomlPart.FindAllString(m[2], -1)
 	for i, p := range parts {
-		parts[i] = strings.Trim(strings.TrimSpace(p), `"'`)
+		parts[i] = strings.Trim(p, `"'`)
 	}
 	return strings.Join(parts, "."), true
+}
+
+// bracketDepth returns the [ minus ] outside quotes and comments in l: how
+// far a line opens (or closes) a multi-line array.
+func bracketDepth(l string) int {
+	d := 0
+	quote := byte(0)
+	l = stripComment(l)
+	for i := 0; i < len(l); i++ {
+		switch c := l[i]; {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '[':
+			d++
+		case c == ']':
+			d--
+		}
+	}
+	return d
 }
 
 // tomlKey returns the bare or quoted key of a "key = value" line, and the
@@ -255,7 +348,12 @@ func pyproject(src []byte) []string {
 	var out []string
 	table := ""
 	inDeps := false // inside a multi-line [project] dependencies array
+	skip := 0       // depth inside another multi-line array
 	lines(src, func(l string) {
+		if skip > 0 {
+			skip = max(skip+bracketDepth(l), 0)
+			return
+		}
 		if inDeps {
 			body, closed := cutArray(stripComment(l))
 			for _, s := range tomlStrings(body) {
@@ -289,6 +387,9 @@ func pyproject(src []byte) []string {
 			inDeps = !closed
 		case table == "tool.poetry.dependencies" && key != "python":
 			out = append(out, key)
+			skip = max(bracketDepth(val), 0)
+		default:
+			skip = max(bracketDepth(val), 0)
 		}
 	})
 	return out
@@ -337,7 +438,12 @@ func stripComment(s string) string {
 func cargo(src []byte) []string {
 	var out []string
 	table := ""
+	skip := 0 // depth inside a multi-line array
 	lines(src, func(l string) {
+		if skip > 0 {
+			skip = max(skip+bracketDepth(l), 0)
+			return
+		}
 		if t, ok := tomlTable(l); ok {
 			table = t
 			if name, ok := strings.CutPrefix(t, "dependencies."); ok && !strings.Contains(name, ".") {
@@ -345,10 +451,12 @@ func cargo(src []byte) []string {
 			}
 			return
 		}
-		if table != "dependencies" {
+		key, val, ok := tomlKey(l)
+		if !ok {
 			return
 		}
-		if key, _, ok := tomlKey(l); ok && !strings.ContainsAny(key, " .[{") {
+		skip = max(bracketDepth(val), 0)
+		if table == "dependencies" && !strings.ContainsAny(key, " .[{") {
 			out = append(out, key)
 		}
 	})

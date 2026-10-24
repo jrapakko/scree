@@ -150,6 +150,9 @@ func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel stri
 // changed. fi is the file as opened; its mtime and size are recorded so
 // search can tell when the file changed since.
 func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.FileInfo) (bool, error) {
+	if !policy.IsMarkdown(rel) {
+		return false, fmt.Errorf("%q: not markdown; never embedded", rel)
+	}
 	sum := sha256.Sum256(src)
 	hash := hex.EncodeToString(sum[:])
 	st := &store.FileStat{Mtime: fi.ModTime().UnixNano(), Size: fi.Size()}
@@ -257,9 +260,14 @@ type SyncStats struct {
 	Sources, SourcesChanged                     int
 }
 
-// MaxSourceFiles caps the manifests and source files one Sync reads for the
-// code vocabulary; files past it keep the names stored for them, if any.
+// MaxSourceFiles caps the manifests and source files one Sync opens for the
+// code vocabulary, in walk order; files past it are not opened and
+// contribute nothing.
 const MaxSourceFiles = 20000
+
+// sourceCap and nameCap are MaxSourceFiles and vocab.MaxNames; tests lower
+// them.
+var sourceCap, nameCap = MaxSourceFiles, vocab.MaxNames
 
 // Sync indexes every new or changed note the policy allows and drops notes
 // that no longer exist or are now ignored. Files are processed one at a
@@ -268,9 +276,10 @@ const MaxSourceFiles = 20000
 // cannot be read or has a bad line.
 //
 // The same walk rebuilds the code vocabulary (see package vocab) from the
-// manifests and source files the policy would allow if they were markdown.
-// A file whose hash is unchanged is not parsed again. Only names are kept;
-// code is never embedded or sent anywhere.
+// manifests and source files the policy allows outside hidden folders. A
+// file whose hash is unchanged is not parsed again, unless the names were
+// read by another vocab.Version. Only names are kept, at most
+// vocab.MaxNames in all; code is never embedded or sent anywhere.
 func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	ix.writeMu.Lock()
 	defer ix.writeMu.Unlock()
@@ -284,12 +293,38 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 
 		codeSeen = map[string]bool{}
 		put      []store.VocabFile
+		opened   int  // source files opened, at most sourceCap
+		capped   bool // a source file was refused for the cap
+		names    int  // names kept so far, at most nameCap
+		full     bool // a file's names were cut for nameCap
 	)
-	codeHave, err := ix.Store.VocabHashes(ctx)
+	if v, err := ix.Store.Meta(store.VocabVersionKey); err != nil {
+		return st, err
+	} else if v != vocab.Version {
+		if err := ix.Store.ClearVocab(ctx, vocab.Version); err != nil {
+			return st, err
+		}
+	}
+	codeHave, err := ix.Store.VocabFiles(ctx)
 	if err != nil {
 		return st, err
 	}
-	err = ix.Policy.WalkStatWith(ctx, vocab.IsSource, func(rel string, src []byte, fi fs.FileInfo, err error) error {
+	// The walk asks before opening each file, so files past the cap are
+	// never opened.
+	isSource := func(rel string) bool {
+		if !vocab.IsSource(rel) {
+			return false
+		}
+		if opened < sourceCap {
+			return true
+		}
+		if !capped {
+			capped = true
+			ix.logf("vocabulary: over %d source files; not reading the rest", sourceCap)
+		}
+		return false
+	}
+	err = ix.Policy.WalkStatWith(ctx, isSource, func(rel string, src []byte, fi fs.FileInfo, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -297,21 +332,44 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 			return nil
 		}
 		if vocab.IsSource(rel) {
-			// A read failure, or a file past the cap, keeps its stored names.
-			codeSeen[rel] = true
-			if err != nil || st.Sources >= MaxSourceFiles {
-				if err == nil && st.Sources == MaxSourceFiles {
-					ix.logf("vocabulary: over %d source files; not reading the rest", MaxSourceFiles)
-					st.Sources++
+			opened++
+			if err != nil {
+				// A transient failure keeps the stored names; a file that is
+				// gone, unreadable or not a regular file loses them.
+				if !permanent(err) {
+					codeSeen[rel] = true
+					names += codeHave[rel].Names
 				}
 				return nil
 			}
+			codeSeen[rel] = true
 			st.Sources++
 			sum := sha256.Sum256(src)
-			if hash := hex.EncodeToString(sum[:]); codeHave[rel] != hash {
-				put = append(put, store.VocabFile{Path: rel, Hash: hash, Names: vocab.Extract(rel, src)})
-				st.SourcesChanged++
+			hash := hex.EncodeToString(sum[:])
+			have, ok := codeHave[rel]
+			if ok && have.Hash == hash && names+have.Names <= nameCap {
+				names += have.Names
+				return nil
 			}
+			found := vocab.Extract(rel, src)
+			if room := max(nameCap-names, 0); len(found) > room {
+				// Cut, with no hash, so the file is read again next sync.
+				found, hash = found[:room], ""
+				if !full {
+					full = true
+					ix.logf("vocabulary: over %d names; keeping the first", nameCap)
+				}
+			}
+			names += len(found)
+			if ok && have.Hash == "" && hash == "" && have.Names == 0 && len(found) == 0 {
+				return nil // still no room
+			}
+			put = append(put, store.VocabFile{Path: rel, Hash: hash, Names: found})
+			st.SourcesChanged++
+			return nil
+		}
+		// Only markdown is chunked and embedded, whatever the walk passed.
+		if !policy.IsMarkdown(rel) && !strings.HasSuffix(rel, "/") {
 			return nil
 		}
 		st.Scanned++
@@ -376,6 +434,12 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	return st, nil
 }
 
+// permanent reports whether a read error will recur: the file is gone,
+// unreadable or not a regular file.
+func permanent(err error) bool {
+	return errors.Is(err, policy.ErrNotRegular) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission)
+}
+
 // Mode selects how Search finds chunks.
 type Mode string
 
@@ -434,16 +498,20 @@ func (ix *Indexer) Resolve(ctx context.Context, mode Mode, query string) Mode {
 	return Semantic
 }
 
-// maxVocabWords caps the query words looked up in the vocabulary.
+// maxVocabWords caps the query words looked up in the vocabulary: the
+// first 32 distinct ones.
 const maxVocabWords = 32
 
 // queryWords returns the distinct words of query as the vocabulary stores
-// names: trimmed as HasIdentifier trims them, lowercased, at most
-// vocab.MaxNameBytes each.
+// names: trimmed as HasIdentifier trims them, lowercased, without a
+// trailing possessive 's (PageFetcher's), at most vocab.MaxNameBytes each.
 func queryWords(query string) []string {
 	var out []string
 	for _, w := range strings.Fields(query) {
 		w = strings.ToLower(strings.Trim(w, "\"'`()[]{}<>.,;:?!"))
+		for _, s := range []string{"'s", "\u2019s"} {
+			w = strings.TrimSuffix(w, s)
+		}
 		if w == "" || len(w) > vocab.MaxNameBytes || slices.Contains(out, w) {
 			continue
 		}

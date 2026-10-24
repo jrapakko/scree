@@ -387,18 +387,25 @@ type rules struct {
 	m *ignore.Matcher
 	g *gitView // nil when the git layer does not apply
 	// extra, when set, accepts files the markdown rule refuses (see
-	// WalkStatWith); every other rule still applies to them.
+	// WalkStatWith); every other rule still applies to them, and the
+	// hidden rule more strictly.
 	extra func(rel string) bool
 }
 
-// nameReason is Policy.nameReason, with the files rs.extra accepts allowed
-// despite not being markdown.
-func (rs rules) nameReason(p *Policy, rel string) Reason {
-	r := p.nameReason(rel)
-	if r == NotMarkdown && rs.extra != nil && rs.extra(rel) {
-		return Allowed
+// nameReason applies the name rules to rel, the file a walk listed as name
+// or the target of that symlink. A name rs.extra accepts is read as an extra
+// file: rel must be one too, and no hidden segment is allowed, not even an
+// allowlisted root folder, which is for markdown. Any other name is read as
+// a note: rel must pass Policy.nameReason. A link is never read as the other
+// class, so notes.md linked to secret.py is refused, never embedded.
+func (rs rules) nameReason(p *Policy, name, rel string) Reason {
+	if rs.extra == nil || IsMarkdown(name) || !rs.extra(name) {
+		return p.nameReason(rel)
 	}
-	return r
+	if IsMarkdown(rel) || !rs.extra(rel) {
+		return NotMarkdown
+	}
+	return hiddenReason(strings.Split(rel, "/"), false, nil)
 }
 
 // load loads .screeignore and the git rules. Either failing is an error, so
@@ -477,7 +484,7 @@ func (p *Policy) check(rel string, resolve bool, rs rules) (string, fs.FileInfo,
 			if unsafeName(realRel) {
 				return "", nil, ignored(rel, UnsafeName)
 			}
-			if r := rs.nameReason(p, realRel); r != Allowed {
+			if r := rs.nameReason(p, rel, realRel); r != Allowed {
 				return "", nil, ignored(rel, r)
 			}
 		}
@@ -551,10 +558,15 @@ func (p *Policy) WalkStat(ctx context.Context, fn func(rel string, src []byte, f
 
 // WalkStatWith is WalkStat that also reads the files extra accepts although
 // they are not markdown, such as dependency manifests and source files for
-// the code vocabulary. Every other rule (hidden folders, git's ignore rules,
-// .screeignore, size, symlinks) applies to them as to notes. Only the walk
-// is widened: Read, Check and CheckName still refuse such files, so they
-// can never be searched, read with read_doc or embedded through those.
+// the code vocabulary. Every other rule (git's ignore rules, .screeignore,
+// size, symlinks) applies to them as to notes, and stricter hidden rules:
+// none is read under any hidden folder, allowlisted ones included. A
+// symlink is read only as its own class: one extra accepts must point to
+// another such file, and a markdown name to markdown. extra is consulted
+// before a file is opened, so it can also stop reads, such as past a cap.
+// Only the walk is widened: Read, Check and CheckName still refuse such
+// files, so they can never be searched, read with read_doc or embedded
+// through those.
 func (p *Policy) WalkStatWith(ctx context.Context, extra func(rel string) bool, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) error {
 	_, err := p.walk(ctx, true, extra, fn)
 	return err
@@ -627,7 +639,7 @@ func (p *Policy) walk(ctx context.Context, read bool, extra func(string) bool, f
 				}
 			}
 		}
-		if r := rs.nameReason(p, rel); r != Allowed {
+		if r := rs.nameReason(p, rel, rel); r != Allowed {
 			return fn(rel, nil, nil, ignored(rel, r))
 		}
 		if !read {
@@ -865,11 +877,21 @@ func (p *Policy) nameReason(rel string) Reason {
 	if r := hiddenReason(strings.Split(rel, "/"), false, allow); r != Allowed {
 		return r
 	}
-	switch strings.ToLower(path.Ext(rel)) {
-	case ".md", ".markdown", ".mdc":
+	if IsMarkdown(rel) {
 		return Allowed
 	}
 	return NotMarkdown
+}
+
+// IsMarkdown reports whether rel has a markdown extension (.md, .markdown or
+// .mdc, in any case). It is the only name rule for what may be chunked and
+// embedded; the other rules still apply.
+func IsMarkdown(rel string) bool {
+	switch strings.ToLower(path.Ext(rel)) {
+	case ".md", ".markdown", ".mdc":
+		return true
+	}
+	return false
 }
 
 // hiddenReason returns Hidden when a segment of the path segs starts with
