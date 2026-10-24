@@ -149,8 +149,14 @@ func TestUnsafeName(t *testing.T) {
 	dir := fixture(t)
 	root := filepath.Join(dir, "notes")
 	p := open(t, root, 0)
+	created := 0
 	for _, name := range []string{"a\nb.md", "a\x1b[31m.md", "\xff.md", "a\u009b.md", "a\x7f.md"} {
-		write(t, filepath.Join(root, name), "x")
+		// Some filesystems refuse some of these names (macOS APFS rejects
+		// invalid UTF-8). The name checks below need no file, so they still
+		// run; Scan can only count the files that exist.
+		if os.WriteFile(filepath.Join(root, name), []byte("x"), 0o644) == nil {
+			created++
+		}
 		_, err := p.Read(name)
 		wantReason(t, err, UnsafeName)
 		if r := p.CheckName(name); r != UnsafeName {
@@ -161,8 +167,8 @@ func TestUnsafeName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Ignored[UnsafeName]) != 5 || s.Allowed != 0 {
-		t.Errorf("Scan = %+v", s)
+	if len(s.Ignored[UnsafeName]) != created || s.Allowed != 0 {
+		t.Errorf("Scan = %+v, want %d unsafe names", s, created)
 	}
 }
 
