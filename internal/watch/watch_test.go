@@ -533,8 +533,16 @@ func TestEventsReadWhileEmbedding(t *testing.T) {
 			os.Remove(p)
 		}
 	}
-	// The event goroutine keeps reading while the worker is stuck.
-	waitFor(t, "events read during the embed", func() bool { return events.Load() >= before+500 })
+	// The event goroutine keeps reading while the worker is stuck. inotify
+	// reports every file; kqueue (macOS) rescans the folder and coalesces,
+	// so wait for events to arrive and settle rather than for an exact count.
+	var last int64
+	waitFor(t, "events read during the embed", func() bool {
+		n := events.Load()
+		settled := n > before && n == last
+		last = n
+		return settled
+	})
 	g.release()
 	var want []string
 	want = append(want, "first.md")
