@@ -6,6 +6,48 @@ Scree splits notes by heading, embeds the pieces through an API, and stores them
 
 See [docs/SPEC.md](docs/SPEC.md) for the design.
 
+## Quick start
+
+You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/keys. The commands run from the repo root.
+
+1. **Build** a static binary (no CGO):
+
+   ```sh
+   CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/scree ./cmd/scree
+   ```
+
+2. **Write the settings file.** This prompts for the key without echoing it, so it never lands in your shell history or on screen. Change `$HOME/notes` if your notes are elsewhere.
+
+   ```sh
+   mkdir -p ~/.config/scree
+   printf 'OpenRouter API key: '; stty -echo; IFS= read -r key; stty echo; echo
+   ( umask 077; printf 'SCREE_NOTES=%s\nOPENROUTER_API_KEY=%s\n' "$HOME/notes" "$key" > ~/.config/scree/env )
+   unset key
+   ```
+
+3. **Install** the binary and the Claude Code wrapper:
+
+   ```sh
+   mkdir -p ~/.local/bin
+   install -m 755 bin/scree contrib/scree-mcp ~/.local/bin/
+   ```
+
+4. **Check and build the index.** The CLI reads its settings from the environment, so load the file into a subshell:
+
+   ```sh
+   ( set -a; . ~/.config/scree/env; set +a; scree doctor -v && scree reindex )
+   ```
+
+   `doctor -v` lists every file that will be ignored. Add a [`.screeignore`](#ignoring-files) before indexing if anything private shows up as indexable.
+
+5. **Connect Claude Code.** Only the wrapper's path is stored, so the key stays out of `~/.claude.json`:
+
+   ```sh
+   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp
+   ```
+
+6. **Optional: keep the index current** with the [systemd unit](#background-service-systemd), which runs `scree watch` in the background.
+
 ## Build
 
 Requires Go 1.26. No CGO.
@@ -16,10 +58,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/scree ./cmd/scree
 
 ## Configure
 
-```sh
-export SCREE_NOTES=~/notes
-export OPENROUTER_API_KEY=sk-or-...    # https://openrouter.ai/settings/keys
-```
+Settings come from environment variables. The [settings file](#settings-file) is the one place to keep them, including the API key. Don't `export` the key in a shell profile.
 
 | Variable | Default |
 | --- | --- |
@@ -79,15 +118,9 @@ After upgrading from an earlier version, run `scree reindex -all` once so existi
 
 ### Settings file
 
-Claude Code, the wrapper scripts and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600:
+Claude Code, the wrapper scripts and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. Step 2 of the [Quick start](#quick-start) creates it. For the CLI, load it into a subshell: `( set -a; . ~/.config/scree/env; set +a; scree search "…" )`.
 
-```sh
-mkdir -p ~/.config/scree
-( umask 077; printf 'SCREE_NOTES=%s\nOPENROUTER_API_KEY=%s\n' "$HOME/notes" "$OPENROUTER_API_KEY" > ~/.config/scree/env )
-chmod 600 ~/.config/scree/env
-```
-
-Use plain `NAME=value` lines without quotes, since systemd reads the file too. Other variables from the Configure table can go in the same file.
+Use plain `NAME=value` lines without quotes, since systemd reads the file too. Other variables from the Configure table can go in the same file. If you made the file another way, run `chmod 600 ~/.config/scree/env`, or the wrappers refuse to start.
 
 ### Claude Code
 
