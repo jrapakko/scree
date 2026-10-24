@@ -144,6 +144,10 @@ Cost is negligible: a 10 MB folder of notes is about 2.5M tokens, a fraction of 
 
 ## Open items
 
-- Pick an embedding model by running two or three on real notes.
-- Decide how the human view works: plain files in an editor, or a small local search page over the same index.
+- **Local and LAN embedding models.** Test scree against an OpenAI-compatible server on this machine (Ollama, llama.cpp) and on another machine on the LAN, through `SCREE_EMBED_URL` with `SCREE_ZDR=0`. Compare retrieval with the current default on the same real-notes question set, and measure the model server's memory. A LAN server should only be reached over TLS or a VPN such as WireGuard, since embedding requests carry note text in the clear.
+- **Human view.** Decide between plain files in an editor and a small local search page over the same index.
+- **MCP registry.** The license, CI, release workflow and OCI label are done. Still to do: cut `v0.1.0`, build an MCPB bundle, write `server.json` for `io.github.jrapakko/scree`, and publish with `mcp-publisher`.
+- **Base image pinning.** The Dockerfile's `golang` and distroless images are referenced by tag. Pin them by digest once something like Dependabot keeps the digests current.
+- **Wrapper portability.** `contrib/scree-mcp*` are tested only under bash as `/bin/sh`. Check them under `dash` and with `shellcheck`.
+- Resolved: embedding model `openai/text-embedding-3-small` at 512 dimensions. It beat `perplexity/pplx-embed-v1-0.6b` on 16 questions over 75 real notes (file-level MRR 0.89 vs 0.78).
 - Resolved: the SQLite driver plus vector extension builds without CGO, using vec1 instead of `sqlite-vec` (see Go stack).
