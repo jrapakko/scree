@@ -41,9 +41,11 @@ Usage:
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
                            -http is loopback only unless -allow-remote)
-  scree search [-k n] [-mode hybrid|semantic|keyword] [-format xml|json] "query"
-                           -mode keyword makes no API call; -format json
-                           prints one object per hit, the stable format for evals
+  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format xml|json] "query"
+                           auto (default) is semantic, plus keyword search
+                           when the query holds an identifier such as FOO_BAR;
+                           keyword makes no API call; -format json prints one
+                           object per hit, the stable format for evals
   scree reindex [-all] [path]
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
@@ -478,11 +480,11 @@ func runSearch(ctx context.Context, args []string) error {
 	var cfg config
 	fs := flags("search", &cfg)
 	k := fs.Int("k", 8, "number of results")
-	modeFlag := fs.String("mode", "hybrid", "hybrid, semantic or keyword (keyword makes no API call)")
+	modeFlag := fs.String("mode", "auto", "auto (semantic, plus keyword for identifier-like queries), hybrid, semantic or keyword (no API call)")
 	format := fs.String("format", "xml", "xml, or json for one object per hit")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return errors.New(`usage: scree search [-k n] [-mode hybrid|semantic|keyword] [-format xml|json] "query"`)
+		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format xml|json] "query"`)
 	}
 	mode, err := index.ParseMode(*modeFlag)
 	if err != nil {
@@ -496,14 +498,19 @@ func runSearch(ctx context.Context, args []string) error {
 		return err
 	}
 	defer closeIndexer(ix)
-	hits, err := ix.Search(ctx, fs.Arg(0), *k, mode)
+	used := index.Resolve(mode, fs.Arg(0))
+	hits, err := ix.Search(ctx, fs.Arg(0), *k, used)
 	if err != nil {
 		return err
 	}
 	if *format == "json" {
-		return mcpserver.WriteJSON(os.Stdout, hits)
+		return mcpserver.WriteJSON(os.Stdout, hits, used)
 	}
-	fmt.Println(mcpserver.FormatHits(hits, ""))
+	note := ""
+	if mode == index.Auto {
+		note = mcpserver.ModeNote(used)
+	}
+	fmt.Println(mcpserver.FormatHits(hits, note))
 	return nil
 }
 

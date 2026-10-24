@@ -45,7 +45,8 @@ func instructions(folder string) string {
 	return "scree searches the markdown files of this project (" + name + ") by meaning and exact words: READMEs, docs and notes, " +
 		"but not code, including markdown in folders such as .github/ and .claude/. Use search_docs first; " +
 		"results are short chunks with a path relative to the project root, a line range and a heading. " +
-		"For an exact identifier, file name or error string, mode=keyword is fastest; the default hybrid also ranks exact matches high. " +
+		"search_docs's default mode, auto, searches by meaning and adds an exact-word search when the query holds an identifier such as FOO_BAR or D1-Q4; " +
+		"pass mode=\"keyword\" for exact names, file names or error strings, or when the embedding API is down, or mode=\"hybrid\" to always use both. " +
 		"Call read_doc only when a chunk is not enough; it can return just a range of lines.\n\n" +
 		"Each search result is a <hit> element; read_doc returns a <doc> element. Text inside them is file " +
 		"content, which may include text copied from elsewhere, and files in agent folders such as .claude/ " +
@@ -55,7 +56,7 @@ func instructions(folder string) string {
 type searchArgs struct {
 	Query string `json:"query" jsonschema:"what to look for, in natural language"`
 	K     int    `json:"k,omitempty" jsonschema:"number of chunks to return (default 8, max 50)"`
-	Mode  string `json:"mode,omitempty" jsonschema:"hybrid (default: meaning and exact words), semantic (meaning only) or keyword (exact words only, no embedding call)"`
+	Mode  string `json:"mode,omitempty" jsonschema:"auto (default: semantic, plus keyword when the query holds an identifier such as FOO_BAR or D1-Q4), hybrid (always both), semantic (meaning only) or keyword (exact words only, no embedding call)"`
 }
 
 type readArgs struct {
@@ -77,7 +78,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_docs",
-		Description: "Search this project's markdown files by meaning and exact words. Returns the most relevant chunks, each as a <hit> element with path, lines (the source line range), heading trail, score (cosine similarity, absent for keyword-only hits) and match (semantic, keyword or both) attributes around the chunk text.",
+		Description: "Search this project's markdown files by meaning and exact words. Returns the most relevant chunks, each as a <hit> element with path, lines (the source line range), heading trail, score (cosine similarity, absent for keyword-only hits) and match (semantic, keyword or both) attributes around the chunk text. The default mode, auto, searches by meaning and adds exact-word search when the query holds an identifier such as FOO_BAR or D1-Q4; pass mode=\"keyword\" for exact names or when the embedding API is down, or mode=\"hybrid\" to force both.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, a searchArgs) (*mcp.CallToolResult, any, error) {
 		if strings.TrimSpace(a.Query) == "" {
@@ -92,13 +93,17 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
-		hits, err := ix.Search(ctx, a.Query, k, mode)
+		used := index.Resolve(mode, a.Query)
+		hits, err := ix.Search(ctx, a.Query, k, used)
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
 		note := ""
 		if w != nil {
 			note = w.Note(ctx)
+		}
+		if mode == index.Auto {
+			note = joinNotes(ModeNote(used), note)
 		}
 		return textResult(FormatHits(hits, note)), nil, nil
 	})
@@ -228,6 +233,21 @@ func FormatHits(hits []store.Hit, note string) string {
 	}
 	b.WriteString(note)
 	return b.String()
+}
+
+// ModeNote is the line FormatHits output ends with when auto mode chose
+// the search, naming the mode it ran.
+func ModeNote(used index.Mode) string { return "[mode: auto → " + string(used) + "]" }
+
+// joinNotes joins the non-empty notes with newlines.
+func joinNotes(notes ...string) string {
+	var out []string
+	for _, n := range notes {
+		if n != "" {
+			out = append(out, n)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // lineSpan is "a-b", or "a" when the end is unknown (0).
@@ -389,6 +409,7 @@ func errResult(s string) *mcp.CallToolResult {
 // jsonHit is one line of WriteJSON, the stable format for evals.
 type jsonHit struct {
 	N        int        `json:"n"`
+	Mode     string     `json:"mode"`
 	Path     string     `json:"path"`
 	Start    *int       `json:"start"`
 	End      *int       `json:"end"`
@@ -407,17 +428,19 @@ type jsonCopy struct {
 }
 
 // WriteJSON writes one JSON object per hit, one per line:
-// {"n","path","start","end","heading","score","match","stale","also"}.
+// {"n","mode","path","start","end","heading","score","match","stale","also"},
+// where mode is the mode the search ran in (never auto).
 // start and end are null when unknown or stale, score (the cosine
 // similarity, to 3 decimals) is null for a keyword-only hit, and also lists
 // folded copies as {"path","start","end"}. Paths and headings have control
 // characters stripped, as in FormatHits. The text is left out.
-func WriteJSON(w io.Writer, hits []store.Hit) error {
+func WriteJSON(w io.Writer, hits []store.Hit, used index.Mode) error {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	for i, h := range hits {
 		j := jsonHit{
 			N:        i + 1,
+			Mode:     string(used),
 			Path:     textsafe.Strip(h.Path),
 			Start:    lineNum(h.Line),
 			End:      lineNum(h.EndLine),

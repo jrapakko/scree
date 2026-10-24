@@ -22,7 +22,7 @@ import (
 )
 
 func TestParseMode(t *testing.T) {
-	for in, want := range map[string]Mode{"": Hybrid, "hybrid": Hybrid, "Semantic": Semantic, " keyword ": Keyword} {
+	for in, want := range map[string]Mode{"": Auto, "auto": Auto, "hybrid": Hybrid, "Semantic": Semantic, " keyword ": Keyword} {
 		if got, err := ParseMode(in); err != nil || got != want {
 			t.Errorf("ParseMode(%q) = %q, %v", in, got, err)
 		}
@@ -423,4 +423,114 @@ func TestRepoDocsIdentifiers(t *testing.T) {
 		t.Fatalf("only %d queries", n)
 	}
 	t.Logf("keyword identifier MRR over %d queries: %.3f", n, rr/float64(n))
+}
+
+func TestHasIdentifier(t *testing.T) {
+	for q, want := range map[string]bool{
+		"DELETE_STALE_INTAKE": true,
+		"psycopg_pool":        true,
+		"D1-Q4":               true,
+		"S3-CI":               true,
+		"RT2-13":              true,
+		"v2":                  true,
+		"what sets `IDLE_IN_TRANSACTION_TIMEOUT_MS`?": true,
+		"is (D1-Q4) done?":                            true,
+		`"psycopg_pool",`:                             true,
+		"ID":                                          false,
+		"ORM":                                         false,
+		"API":                                         false,
+		"2026":                                        false,
+		"well-known":                                  false,
+		"psycopg":                                     false,
+		"how do I rotate the backup keys?":            false,
+		"what changed in 2026, and why?":              false,
+		"":                                            false,
+		"_ __ 42":                                     false,
+	} {
+		if got := HasIdentifier(q); got != want {
+			t.Errorf("HasIdentifier(%q) = %v, want %v", q, got, want)
+		}
+	}
+}
+
+func TestResolve(t *testing.T) {
+	for _, c := range []struct {
+		mode  Mode
+		query string
+		want  Mode
+	}{
+		{Auto, "how do backups work", Semantic},
+		{"", "how do backups work", Semantic},
+		{Auto, "what is D1-Q4", Hybrid},
+		{"", "psycopg_pool sizing", Hybrid},
+		{Hybrid, "how do backups work", Hybrid},
+		{Semantic, "D1-Q4", Semantic},
+		{Keyword, "how do backups work", Keyword},
+	} {
+		if got := Resolve(c.mode, c.query); got != c.want {
+			t.Errorf("Resolve(%q, %q) = %q, want %q", c.mode, c.query, got, c.want)
+		}
+	}
+}
+
+// TestAutoMode: auto runs no keyword query for a plain question and gives
+// semantic's results; for an identifier it gives hybrid's.
+func TestAutoMode(t *testing.T) {
+	ix, _ := setup(t)
+	ix.Embedder = &decoyEmbedder{}
+	write(t, ix.Root(), "decoy.md", "# Decoy\nthe decoy talks about rotation\n")
+	write(t, ix.Root(), "id.md", "# Ops\nrun DELETE_STALE_INTAKE when needed\n")
+	write(t, ix.Root(), "plain.md", "# Plain\nrotate the backup keys\n")
+	if _, err := ix.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	keyword := 0
+	TestHooks.Keyword = func(string) { keyword++ }
+	defer func() { TestHooks.Keyword = nil }()
+	paths := func(q string, mode Mode) []string {
+		hits, err := ix.Search(context.Background(), q, 8, mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, h := range hits {
+			out = append(out, h.Path+":"+string(h.Match))
+		}
+		return out
+	}
+	plain := "how do I rotate the backup keys"
+	got := paths(plain, Auto)
+	if keyword != 0 {
+		t.Errorf("auto ran %d keyword queries for a plain question", keyword)
+	}
+	if want := paths(plain, Semantic); !slices.Equal(got, want) {
+		t.Errorf("auto plain = %v, semantic %v", got, want)
+	}
+	id := "when does DELETE_STALE_INTAKE run"
+	got = paths(id, Auto)
+	if keyword != 1 {
+		t.Errorf("auto ran %d keyword queries for an identifier", keyword)
+	}
+	if want := paths(id, Hybrid); !slices.Equal(got, want) || !strings.HasPrefix(got[0], "id.md:") {
+		t.Errorf("auto identifier = %v, hybrid %v", got, want)
+	}
+	// Explicit modes are untouched by the rule.
+	keyword = 0
+	if got := paths(plain, Hybrid); keyword != 1 || len(got) == 0 {
+		t.Errorf("hybrid plain: %d keyword queries, %v", keyword, got)
+	}
+	if got := paths(id, Keyword); len(got) != 1 || got[0] != "id.md:keyword" {
+		t.Errorf("keyword = %v", got)
+	}
+}
+
+func TestAutoKeepsKeywordHint(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\nset SCREE_DB first\n"})
+	ix.QueryEmbedder = &failingEmbedder{}
+	for _, q := range []string{"where is the database", "SCREE_DB"} {
+		_, err := ix.Search(context.Background(), q, 8, Auto)
+		if !errors.Is(err, embed.ErrUnavailable) || !strings.Contains(err.Error(), `mode="keyword" still works`) {
+			t.Errorf("auto %q with the API down: %v", q, err)
+		}
+	}
 }

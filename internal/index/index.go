@@ -319,6 +319,9 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 type Mode string
 
 const (
+	// Auto, the default, is Hybrid when the query holds an identifier-like
+	// word (see HasIdentifier) and Semantic otherwise.
+	Auto Mode = "auto"
 	// Hybrid merges vector and keyword search by reciprocal rank fusion.
 	Hybrid Mode = "hybrid"
 	// Semantic is vector search only.
@@ -327,15 +330,53 @@ const (
 	Keyword Mode = "keyword"
 )
 
-// ParseMode returns the Mode named s; "" is Hybrid.
+// ParseMode returns the Mode named s; "" is Auto.
 func ParseMode(s string) (Mode, error) {
 	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
 	case "":
-		return Hybrid, nil
-	case Hybrid, Semantic, Keyword:
+		return Auto, nil
+	case Auto, Hybrid, Semantic, Keyword:
 		return m, nil
 	}
-	return "", fmt.Errorf("mode must be hybrid, semantic or keyword, not %q", s)
+	return "", fmt.Errorf("mode must be auto, hybrid, semantic or keyword, not %q", s)
+}
+
+// Resolve returns the mode a search for query runs in: for Auto (or ""),
+// Hybrid if HasIdentifier(query) and Semantic otherwise; any other mode as
+// it is.
+func Resolve(mode Mode, query string) Mode {
+	if mode != "" && mode != Auto {
+		return mode
+	}
+	if HasIdentifier(query) {
+		return Hybrid
+	}
+	return Semantic
+}
+
+// HasIdentifier reports whether query holds an identifier-like word, which
+// makes auto mode add keyword search. The query is split on whitespace and
+// each word trimmed of surrounding quotes, brackets, backticks and
+// .,;:?!; a word qualifies if it has at least one ASCII letter and at least
+// one "_" or ASCII digit: DELETE_STALE_INTAKE, psycopg_pool, D1-Q4, v2
+// qualify; ID, API, 2026, well-known, psycopg do not.
+func HasIdentifier(query string) bool {
+	for _, w := range strings.Fields(query) {
+		w = strings.Trim(w, "\"'`()[]{}<>.,;:?!")
+		letter, mark := false, false
+		for i := 0; i < len(w); i++ {
+			switch c := w[i]; {
+			case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+				letter = true
+			case c == '_', '0' <= c && c <= '9':
+				mark = true
+			}
+		}
+		if letter && mark {
+			return true
+		}
+	}
+	return false
 }
 
 // Fusion weights for the two sides of a hybrid search, and the rank offset
@@ -349,9 +390,10 @@ const (
 // keywordHint is added to a failed embedding call's error.
 const keywordHint = `; mode="keyword" still works without the embedding API`
 
-// Search returns the k chunks that best match query, by mode: vector
-// search (which embeds query), keyword search over chunk text, heading and
-// path (no API call), or both merged by reciprocal rank fusion. Each hit's
+// Search returns the k chunks that best match query, by mode (see
+// Resolve for Auto): vector search (which embeds query), keyword search
+// over chunk text, heading and path (no API call), or both merged by
+// reciprocal rank fusion. Each hit's
 // Match says which side found it. An empty index returns no hits without
 // calling the API.
 //
@@ -362,9 +404,7 @@ const keywordHint = `; mode="keyword" still works without the embedding API`
 // with identical text in several files are folded into one hit, with the
 // other copies in Also. Paths dropped or changed are passed to OnStale.
 func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) ([]store.Hit, error) {
-	if mode == "" {
-		mode = Hybrid
-	}
+	mode = Resolve(mode, query)
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
 	}
@@ -386,6 +426,9 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) (
 	}
 	if mode != Semantic {
 		if q, ok := ftsQuery(query); ok {
+			if TestHooks.Keyword != nil {
+				TestHooks.Keyword(q)
+			}
 			var err error
 			if kw, err = ix.Store.Keyword(ctx, q, fetch); err != nil {
 				return nil, err
@@ -529,7 +572,8 @@ func runeCut(s string, n int) int {
 
 // TestHooks lets tests observe Search. Nil outside tests.
 var TestHooks struct {
-	SearchRead func(path string) // Search reads a changed file
+	SearchRead func(path string)  // Search reads a changed file
+	Keyword    func(match string) // Search runs a keyword query
 }
 
 // fileView is what Search learned about one hit file.

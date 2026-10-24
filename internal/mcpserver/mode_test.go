@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jrapakko/scree/internal/embed"
+	"github.com/jrapakko/scree/internal/index"
 	"github.com/jrapakko/scree/internal/store"
 )
 
@@ -60,12 +61,36 @@ func TestWriteJSON(t *testing.T) {
 	kw := hit("a<b>.md", 0, "H\x1b[31m", "t")
 	kw.Match, kw.Stale = store.MatchKeyword, true
 	var b strings.Builder
-	if err := WriteJSON(&b, []store.Hit{sem, kw}); err != nil {
+	if err := WriteJSON(&b, []store.Hit{sem, kw}, index.Hybrid); err != nil {
 		t.Fatal(err)
 	}
-	want := `{"n":1,"path":"docs/x.md","start":12,"end":18,"heading":"Setup > Keys","score":0.912,"match":"both","stale":false,"also":[{"path":"print/x.md","start":12,"end":18},{"path":"old.md","start":3,"end":null}],"also_more":2}` + "\n" +
-		`{"n":2,"path":"a<b>.md","start":null,"end":null,"heading":"H[31m","score":null,"match":"keyword","stale":true,"also":[]}` + "\n"
+	want := `{"n":1,"mode":"hybrid","path":"docs/x.md","start":12,"end":18,"heading":"Setup > Keys","score":0.912,"match":"both","stale":false,"also":[{"path":"print/x.md","start":12,"end":18},{"path":"old.md","start":3,"end":null}],"also_more":2}` + "\n" +
+		`{"n":2,"mode":"hybrid","path":"a<b>.md","start":null,"end":null,"heading":"H[31m","score":null,"match":"keyword","stale":true,"also":[]}` + "\n"
 	if b.String() != want {
 		t.Errorf("got\n%s\nwant\n%s", b.String(), want)
+	}
+}
+
+// TestSearchDefaultsToAuto: with no mode, search_docs runs auto and says
+// which mode it chose; an explicit mode adds no note.
+func TestSearchDefaultsToAuto(t *testing.T) {
+	cs, _, _ := connect(t)
+	if _, isErr := call(t, cs, "reindex", nil); isErr {
+		t.Fatal("reindex failed")
+	}
+	for _, c := range []struct {
+		args map[string]any
+		want string // the suffix after the last hit
+	}{
+		{map[string]any{"query": "zebra"}, "</hit>\n[mode: auto → semantic]"},
+		{map[string]any{"query": "zebra_2 zebra"}, "</hit>\n[mode: auto → hybrid]"},
+		{map[string]any{"query": "zebra", "mode": "auto"}, "</hit>\n[mode: auto → semantic]"},
+		{map[string]any{"query": "zebra", "mode": "hybrid"}, "</hit>"},
+		{map[string]any{"query": "zebra", "mode": "semantic"}, "</hit>"},
+	} {
+		text, isErr := call(t, cs, "search_docs", c.args)
+		if isErr || !strings.HasSuffix(text, c.want) {
+			t.Errorf("%v = %q, want suffix %q", c.args, text, c.want)
+		}
 	}
 }

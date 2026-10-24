@@ -97,14 +97,14 @@ func call(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any)
 func TestTools(t *testing.T) {
 	cs, _, _ := connect(t)
 
-	if text, _ := call(t, cs, "search_docs", map[string]any{"query": "zebra"}); text != "No matching documents." {
+	if text, _ := call(t, cs, "search_docs", map[string]any{"query": "zebra"}); text != "No matching documents.\n[mode: auto → semantic]" {
 		t.Errorf("search before index = %q", text)
 	}
 	if text, isErr := call(t, cs, "reindex", nil); isErr || !strings.Contains(text, "1 indexed") {
 		t.Errorf("reindex = %q", text)
 	}
 	text, _ := call(t, cs, "search_docs", map[string]any{"query": "zebra", "k": 3})
-	if !strings.HasPrefix(text, `<hit n="1" path="z.md" lines="1-2" heading="Zoo"`) || !strings.HasSuffix(text, "</hit>") {
+	if !strings.HasPrefix(text, `<hit n="1" path="z.md" lines="1-2" heading="Zoo"`) || !strings.HasSuffix(text, "</hit>\n[mode: auto → semantic]") {
 		t.Errorf("search = %q", text)
 	}
 	if text, isErr := call(t, cs, "read_doc", map[string]any{"path": "z.md"}); isErr ||
@@ -331,7 +331,7 @@ func TestSearchAppendsNote(t *testing.T) {
 	cs, _, _, w := connectWith(t, lenEmbedder{}, heldElsewhere(t))
 	waitPhase(t, w, writer.Waiting)
 	text, isErr := call(t, cs, "search_docs", map[string]any{"query": "zebra"})
-	want := fmt.Sprintf("No matching documents.\n[index incomplete: another scree process (pid %d) is building it]", os.Getpid())
+	want := fmt.Sprintf("No matching documents.\n[mode: auto → semantic]\n[index incomplete: another scree process (pid %d) is building it]", os.Getpid())
 	if isErr || text != want {
 		t.Errorf("search = %q, want %q", text, want)
 	}
