@@ -94,6 +94,8 @@ for v in SCREE_HTTP_TOKEN SCREE_EMBED_URL SCREE_MAX_FILE_BYTES SCREE_ZDR SCREE_D
 		set -- -e "$v" "$@"
 	fi
 done
-set -- run -i --rm "$@"
+# --pull=never: a missing local image must never be pulled from a registry,
+# since the container receives the API key.
+set -- run -i --rm --pull=never "$@"
 
 exec "${SCREE_DOCKER:-docker}" "$@"

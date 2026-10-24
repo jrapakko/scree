@@ -190,7 +190,7 @@ docker compose logs -f watch
 
 `compose.yaml` passes through `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_ZDR` and `SCREE_EMBED_URL` too, and `SCREE_HTTP_TOKEN` to `serve`. The `serve` service sits behind the `mcp` profile, so `up` doesn't start it.
 
-For Claude Code, the MCP server runs one container per session over stdio. `contrib/scree-mcp-docker` loads the settings file and runs `docker run -i --rm` with the notes folder (`SCREE_NOTES`), the `scree-data` volume, and only the variables that are set, passed by name so the key never appears on the command line. As with the native wrapper, the key stays out of `~/.claude.json`:
+For Claude Code, the MCP server runs one container per session over stdio. `contrib/scree-mcp-docker` loads the settings file and runs `docker run -i --rm --pull=never` (a missing image is never pulled from a registry, since the container gets the key) with the notes folder (`SCREE_NOTES`), the `scree-data` volume, and only the variables that are set, passed by name so the key never appears on the command line. As with the native wrapper, the key stays out of `~/.claude.json`:
 
 ```sh
 install -m 755 contrib/scree-mcp-docker ~/.local/bin/

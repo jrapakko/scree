@@ -145,7 +145,7 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 		}
 	}
 	want := []string{
-		"run", "-i", "--rm",
+		"run", "-i", "--rm", "--pull=never",
 		"-e", "OPENROUTER_API_KEY", "-e", "SCREE_MODEL", "-e", "SCREE_ZDR",
 		"-v", "/home/u/notes:/notes:ro,z", "-v", "scree-data:/data",
 		"scree:latest", "serve", "-extra",
