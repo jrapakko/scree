@@ -1,7 +1,7 @@
 # Keeps the index of one folder current. The folder mounts at /notes and
 # both services pass -notes /notes; the index lives in the scree-data volume
-# under /data/scree/indexes. Claude Code talks to `scree serve`, which runs
-# per session with `docker compose run` (see README).
+# under /data/scree/indexes. For Claude Code, use `scree mcp -docker` instead
+# (see the README's Docker section); compose is for a long-running watcher.
 #
 #   SCREE_NOTES_DIR=$HOME/notes docker compose up -d
 #

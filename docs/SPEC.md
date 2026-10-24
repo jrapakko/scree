@@ -31,7 +31,7 @@ External: the markdown files (source of truth), embedding API (OpenRouter), Clau
 | Language | Go | One small static binary, low idle memory, no runtime to install. |
 | File watching | `fsnotify` | Native events when run directly on the laptop. Containers on Docker Desktop lose these events on bind mounts. |
 | Vector storage | SQLite with [vec1](https://sqlite.org/vec1) | Disk-backed, so memory stays flat. `ncruces/go-sqlite3` ships vec1 compiled to WebAssembly, so the binary stays CGO-free. Flat (exact) cosine index. `sqlite-vec` was the first choice, but its Go bindings pin driver v0.17.1, far behind current releases. Keyword search uses the FTS5 extension from the same driver (unicode61 tokenizer, with `_` and `-` as token characters so identifiers stay whole). |
-| Embeddings | API through OpenRouter | No local model. Default `openai/text-embedding-3-small` (~$0.02/M tokens) at 512 dimensions, chosen over pplx-embed-v1-0.6b on real notes (see Open items). Requests ask for zero-data-retention endpoints with `data_collection: deny` by default (`SCREE_ZDR=0` turns this off); a model with no such endpoint fails with a clear error. Timeouts: 10 s per query with no retry on timeout; 30 s per indexing attempt, and after an outage indexing pauses for 30 s, doubling up to 5 min, then resyncs. |
+| Embeddings | API through OpenRouter | No local model. Default `openai/text-embedding-3-small` (~$0.02/M tokens) at 512 dimensions, chosen over pplx-embed-v1-0.6b on real notes (see Open items). Requests ask for zero-data-retention endpoints with `data_collection: deny` by default (`SCREE_ZDR=0` turns this off); a model with no such endpoint fails with a clear error. Timeouts: 10 s per query and 30 s per indexing attempt, and a timed-out attempt is never retried; and after an outage indexing pauses for 30 s, doubling up to 5 min, then resyncs. |
 | MCP | Official Go MCP SDK | stdio for Claude Code; optional HTTP. |
 | Chunking | By heading | Each chunk keeps its file path and heading trail, and records its first and last source line and a hash of its text. |
 | Running it | Per session, plus an optional service | `scree serve` per Claude Code session keeps its own folder current. A systemd user unit running `scree watch` covers a folder outside any session. A Dockerfile ships for reproducibility. |
@@ -68,7 +68,7 @@ Shutdown waits at most 5 s for the writer, so a stuck file read cannot keep `ser
 
 ## What gets indexed
 
-Markdown files (`.md`, `.markdown`) anywhere in the indexed folder, including the root forge, CI and agent folders listed under Ignoring files (pull-request templates, `.claude/agents`, Cursor and Codex rules written in markdown), minus whatever the ignore layers exclude. Nothing else: no code, no YAML, no JSON.
+Markdown files (`.md`, `.markdown`, `.mdc`) anywhere in the indexed folder, including the root forge, CI and agent folders listed under Ignoring files (pull-request templates, `.claude/agents`, Cursor and Codex rules written in markdown), minus whatever the ignore layers exclude. Nothing else: no code, no YAML, no JSON.
 
 ## Ignoring files
 
@@ -78,7 +78,7 @@ Four layers, checked in this order:
 
 1. **Built-in rules, always on:**
    - Hidden files and folders, meaning any path segment starting with `.` (`.git`, `.obsidian`, `.trash`), with two exceptions. `.screeignore` itself is watched but never indexed. And these folders **at the root** of the indexed folder are searched like any other: `.claude/` (except `.claude/worktrees/`, which holds full copies of the repo), `.github/`, `.gitlab/`, `.gitea/`, `.forgejo/`, `.cursor/`, `.codex/`, `.gemini/`, `.windsurf/`, `.circleci/` and `.buildkite/`. The same name deeper in the tree, and any hidden segment inside them, stays hidden. Every other rule applies inside them.
-   - Anything that isn't `.md` or `.markdown`.
+   - Anything that isn't `.md`, `.markdown` or `.mdc`.
    - Symlinks whose target resolves outside the indexed folder. A symlink inside it is followed like a normal file, and every rule here, including the extension and `.screeignore`, applies to both the link path and the resolved target. Symlinked folders are never descended.
    - Files larger than 1 MB, which are usually exports or logs rather than notes. `SCREE_MAX_FILE_BYTES` changes the limit.
    - File names containing control characters or invalid UTF-8 (unsafe name).
