@@ -24,9 +24,11 @@ type Chunk struct {
 	// Heading is the trail of headings above the chunk, joined with " > ".
 	// Empty for text before the first heading.
 	Heading string
-	// Line is the 1-based line in the source file where the chunk starts.
-	Line int
-	Text string
+	// Line and EndLine are the 1-based numbers of the first and last
+	// non-blank source lines whose text is in Text. A piece cut from an
+	// overlong line has Line == EndLine, the line it came from.
+	Line, EndLine int
+	Text          string
 }
 
 type section struct {
@@ -87,17 +89,28 @@ func Split(src string) []Chunk {
 
 func splitSection(s section) []Chunk {
 	var (
-		out   []Chunk
-		buf   []string
-		size  int
-		first = s.line
+		out  []Chunk
+		buf  []string
+		nums []int // the source line number of each buf entry
+		size int
 	)
-	flush := func(next int) {
+	flush := func() {
 		text := strings.TrimSpace(strings.Join(buf, "\n"))
 		if text != "" && !isOnlyHeading(text) {
-			out = append(out, Chunk{Heading: s.heading, Line: first, Text: text})
+			// The range is taken from the line numbers kept with buf, never
+			// by counting newlines in the trimmed text.
+			first, last := 0, 0
+			for i, ln := range buf {
+				if strings.TrimSpace(ln) != "" {
+					if first == 0 {
+						first = nums[i]
+					}
+					last = nums[i]
+				}
+			}
+			out = append(out, Chunk{Heading: s.heading, Line: first, EndLine: last, Text: text})
 		}
-		buf, size, first = nil, 0, next
+		buf, nums, size = nil, nil, 0
 	}
 	// Paragraph boundaries inside fences are not split points.
 	fence := ""
@@ -110,31 +123,31 @@ func splitSection(s section) []Chunk {
 		} else if f := fenceOpen(ln); f != "" {
 			fence = f
 		} else if strings.TrimSpace(ln) == "" && size >= TargetChars {
-			flush(lineNo + 1)
+			flush()
 			continue
 		}
 		if len(ln) > MaxChars {
 			// Cut an overlong line into pieces of its own; the last piece
 			// starts the next chunk.
 			if size > 0 {
-				flush(lineNo)
+				flush()
 			}
 			for len(ln) > MaxChars {
 				cut := runeCut(ln, MaxChars)
 				if piece := ln[:cut]; strings.TrimSpace(piece) != "" {
-					out = append(out, Chunk{Heading: s.heading, Line: lineNo, Text: piece})
+					out = append(out, Chunk{Heading: s.heading, Line: lineNo, EndLine: lineNo, Text: piece})
 				}
 				ln = ln[cut:]
 			}
-			first = lineNo
 		}
 		if size > 0 && size+len(ln)+1 > MaxChars {
-			flush(lineNo)
+			flush()
 		}
 		buf = append(buf, ln)
+		nums = append(nums, lineNo)
 		size += len(ln) + 1
 	}
-	flush(0)
+	flush()
 	return out
 }
 

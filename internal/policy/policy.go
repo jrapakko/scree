@@ -1,5 +1,5 @@
 // Package policy decides which files under the notes folder scree may read.
-// Every note read goes through a Policy, so indexing, search, read_note and
+// Every note read goes through a Policy, so indexing, search, read_doc and
 // reindex all apply the same built-in rules, git's ignore rules, .screeignore
 // patterns and front-matter opt-outs.
 package policy
@@ -71,7 +71,7 @@ func (r Reason) String() string {
 	case NotMarkdown:
 		return "not markdown"
 	case OutsideRoot:
-		return "outside notes folder"
+		return "outside the folder"
 	case TooLarge:
 		return "too large"
 	case GitIgnore:
@@ -214,6 +214,26 @@ func OpenOptions(root string, o Options) (*Policy, error) {
 		}
 	}
 	return p, nil
+}
+
+// HiddenFolders returns the root hidden folders that are searched and exist
+// as folders in the root: the defaults, and extra for those added by
+// "include-hidden" in .screeignore, as loaded by the last Scan, Walk or Read.
+func (p *Policy) HiddenFolders() (defaults, extra []string) {
+	p.mu.Lock()
+	allow := p.allow
+	p.mu.Unlock()
+	for _, name := range allow {
+		if fi, err := p.r.Lstat(name); err != nil || !fi.IsDir() {
+			continue
+		}
+		if slices.Contains(DefaultHiddenAllow, name) {
+			defaults = append(defaults, name)
+		} else if !slices.Contains(extra, name) {
+			extra = append(extra, name)
+		}
+	}
+	return defaults, extra
 }
 
 // Close releases the root folder handle.
@@ -505,18 +525,34 @@ func (p *Policy) resolve(rel string) (string, error) {
 // error, and fails before visiting anything if .screeignore or the git rules
 // that apply to the root cannot be read.
 func (p *Policy) Walk(ctx context.Context, fn func(rel string, src []byte, err error) error) error {
-	_, err := p.walk(ctx, func(rel string, src []byte, _ fs.FileInfo, err error) error { return fn(rel, src, err) })
+	_, err := p.walk(ctx, true, func(rel string, src []byte, _ fs.FileInfo, err error) error { return fn(rel, src, err) })
 	return err
 }
 
 // WalkStat is Walk that also passes the FileInfo of each allowed file as it
 // was opened, matching src.
 func (p *Policy) WalkStat(ctx context.Context, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) error {
-	_, err := p.walk(ctx, fn)
+	_, err := p.walk(ctx, true, fn)
 	return err
 }
 
-func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) (rules, error) {
+// Estimate counts the files a Walk would allow and their total size,
+// without opening any of them: every name, git, .screeignore and size rule
+// applies, but front matter is not checked, so it is an upper bound.
+func (p *Policy) Estimate(ctx context.Context) (files int, bytes int64, err error) {
+	_, err = p.walk(ctx, false, func(rel string, _ []byte, fi fs.FileInfo, err error) error {
+		if err == nil && fi != nil {
+			files++
+			bytes += fi.Size()
+		}
+		return nil
+	})
+	return files, bytes, err
+}
+
+// walk is Walk. With read false, files are only checked (Lstat, never
+// opened), and fn gets a nil src.
+func (p *Policy) walk(ctx context.Context, read bool, fn func(rel string, src []byte, fi fs.FileInfo, err error) error) (rules, error) {
 	rs, err := p.load()
 	if err != nil {
 		return rs, err
@@ -567,6 +603,10 @@ func (p *Policy) walk(ctx context.Context, fn func(rel string, src []byte, fi fs
 		}
 		if r := p.nameReason(rel); r != Allowed {
 			return fn(rel, nil, nil, ignored(rel, r))
+		}
+		if !read {
+			_, fi, err := p.check(rel, resolve, rs)
+			return fn(rel, nil, fi, err)
 		}
 		src, fi, err := p.read(rel, resolve, rs)
 		return fn(rel, src, fi, err)
@@ -626,7 +666,7 @@ type Summary struct {
 func (p *Policy) Scan(ctx context.Context) (Summary, error) {
 	s := Summary{Ignored: map[Reason][]string{}}
 	var allowed []string
-	rs, err := p.walk(ctx, func(rel string, src []byte, _ fs.FileInfo, err error) error {
+	rs, err := p.walk(ctx, true, func(rel string, src []byte, _ fs.FileInfo, err error) error {
 		var ie *IgnoredError
 		switch {
 		case err == nil:

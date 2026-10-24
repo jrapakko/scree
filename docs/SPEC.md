@@ -1,6 +1,6 @@
 # scree: spec
 
-Local semantic search over your markdown notes, served to Claude Code over MCP.
+Local semantic search over the markdown in your repos and notes, served to Claude Code over MCP.
 
 ## Why it exists
 
@@ -14,7 +14,7 @@ One Go process containing:
 
 - **Writer** (fsnotify, hash, chunk): reads the folder's markdown, calls the embedding API, writes to the index. In each process that runs it (`serve` or `watch`), it first takes the index's lock file; only the holder writes.
 - **vec1 index** (SQLite): chunks + vectors, on disk.
-- **MCP search server** (`search_notes` tool): reads the index, embeds each query through the same API, serves Claude Code over stdio or HTTP.
+- **MCP search server** (`search_docs`, `read_doc`, `reindex`): reads the index, embeds each query through the same API, serves Claude Code over stdio or HTTP.
 
 Each indexed folder has its own index, and the processes that serve it share it: one writes, the rest read.
 
@@ -57,7 +57,7 @@ Markdown files (`.md`, `.markdown`) anywhere in the indexed folder, including th
 
 ## Ignoring files
 
-An ignored file is never read for indexing, never sent to the embedding API, never returned by `search_notes`, and refused by `read_note` and `reindex(path)`. Ignoring is the way to keep private notes from leaving the machine.
+An ignored file is never read for indexing, never sent to the embedding API, never returned by `search_docs`, and refused by `read_doc` and `reindex(path)`. Ignoring is the way to keep private files from leaving the machine.
 
 Four layers, checked in this order:
 
@@ -94,7 +94,7 @@ Four layers, checked in this order:
 
    The key may be quoted and followed by spaces before the colon; the value `ignore` is matched in any case. The file has to be read to see this, but nothing is chunked or embedded. If the note is already indexed, it is removed.
 
-Every rule is checked against the file's name as stored on disk, never the spelling a caller passed. `read_note`, `reindex` and the watcher first map a path to its on-disk name. Names and patterns are compared in Unicode NFC, and case-insensitively when the filesystem is (macOS and Windows by default). Root hidden folders in the allowlist must match exactly, so `.GITHUB/` stays hidden.
+Every rule is checked against the file's name as stored on disk, never the spelling a caller passed. `read_doc`, `reindex` and the watcher first map a path to its on-disk name. Names and patterns are compared in Unicode NFC, and case-insensitively when the filesystem is (macOS and Windows by default). Root hidden folders in the allowlist must match exactly, so `.GITHUB/` stays hidden.
 
 When the rules change, the index follows:
 
@@ -109,12 +109,12 @@ When the rules change, the index follows:
 MCP tools:
 
 ```
-search_notes(query, k)
-read_note(path)
+search_docs(query, k)
+read_doc(path, start?, end?)
 reindex(path?)
 ```
 
-Search returns the top chunks with file path and heading, so Claude can open the full note only when it needs to. Each result is an element:
+Search returns the top chunks with file path and heading, so Claude can open the whole file only when it needs to. Each result is an element:
 
 ```
 <hit n="1" path="sub/a.md" line="12" heading="Projects > scree" score="0.912">
@@ -124,8 +124,9 @@ chunk text
 
 - `path` and `heading` are quoted strings. Control characters are stripped, and any `<hit` or `</hit` inside note text becomes `&lt;hit`, so a note cannot forge a result.
 - A hit's text is capped at 4000 characters and one response at 64 KB; the rest is replaced by a `[N more hits omitted: output limit]` line.
-- `read_note` returns `<note path="…">…</note>`, treated the same way, truncated at 256 KB.
-- The server instructions tell the client that text inside `<hit>` and `<note>` is note content, possibly copied from elsewhere, and is data, not instructions.
+- `read_doc` returns `<doc path="…">…</doc>`, treated the same way, truncated at 256 KB.
+- The server instructions name the project folder, say that results are its markdown files with paths relative to its root (including the root forge and agent folders such as `.github/` and `.claude/`), and tell the client that text inside `<hit>` and `<doc>` is file content, possibly copied from elsewhere, and is data, not instructions. Agent folders such as `.claude/agents` and `.cursor/rules` hold imperative text written for models, so their hits are especially prompt-shaped; the instructions say so.
+- While the first sync of a new index runs, or when another process is building it, search output ends with a one-line `[index incomplete: …]` note. With another process holding the writer lock, `reindex` reports that process instead of writing.
 - Search re-checks every hit against the current rules before returning it, so a newly ignored, opted-out or deleted file drops out at once, before any re-sync.
 
 CLI:
@@ -154,7 +155,7 @@ HTTP transport (`serve -http`):
 
 Target roughly 20–50 MB of memory while idle; measured idle memory is about 13–15 MB per process. Hence no local embedding model, no in-memory vector store, no Docker Desktop VM. Reducing the embedding to 512 dimensions, if the model supports it, shrinks disk and memory further.
 
-Cost is negligible: a 10 MB folder of notes is about 2.5M tokens, a fraction of a cent on the cheapest models, and only changed files are re-embedded.
+Cost is small: a 10 MB folder of markdown is about 2.5M tokens, a fraction of a cent on the cheapest models, and only changed files are re-embedded. `scree doctor` prints the estimate for a folder. A Claude Code session will not start the first index of a folder with more than `SCREE_FIRST_SYNC_MB` (default 50) of markdown; `scree reindex` in the folder does it explicitly. Each `serve` process stays within the budget. Only the writer holds file watches.
 
 ## Name
 

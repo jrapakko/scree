@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS chunks(
 	ord INTEGER NOT NULL,
 	heading TEXT NOT NULL,
 	line INTEGER NOT NULL,
-	text TEXT NOT NULL
+	text TEXT NOT NULL,
+	end_line INTEGER
 );
 CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 `
@@ -54,12 +55,23 @@ type Store struct {
 // ErrIndexGone means the index file was deleted or replaced while open.
 var ErrIndexGone = errors.New("index file was removed or replaced")
 
+// SchemaVersion is recorded as meta "schema" once the tables have every
+// column this version uses.
+const SchemaVersion = "2"
+
 // Chunk is a stored piece of a note.
 type Chunk struct {
 	Path    string
 	Heading string
-	Line    int
-	Text    string
+	// Line and EndLine are the first and last non-blank source lines of the
+	// chunk. EndLine is 0 for rows from before it was recorded.
+	Line, EndLine int
+	Text          string
+}
+
+// LineRange is a chunk's source line range, by its order in the file.
+type LineRange struct {
+	Line, EndLine int
 }
 
 // FileStat is the modification time (Unix nanoseconds) and size of a file's
@@ -214,34 +226,33 @@ func createVecs(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
-// migrate adds the files columns that indexes from older versions lack.
-// Their rows get NULL, which search treats as unknown.
+// migrate brings an index from an older version up to SchemaVersion. The
+// columns it adds are NULL in existing rows, which callers treat as
+// unknown: files.mtime and files.size (search re-reads the file), and
+// chunks.end_line (filled in by the next sync without re-embedding).
 func migrate(ctx context.Context, conn *sql.Conn) error {
-	rows, err := conn.QueryContext(ctx, `SELECT name FROM pragma_table_info('files')`)
-	if err != nil {
-		return err
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
+	for _, add := range []struct{ table, col string }{
+		{"files", "mtime"}, {"files", "size"}, {"chunks", "end_line"},
+	} {
+		ok, err := hasColumn(ctx, conn, add.table, add.col)
+		if err != nil {
 			return err
 		}
-		have[name] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, col := range []string{"mtime", "size"} {
-		if !have[col] {
-			if _, err := conn.ExecContext(ctx, `ALTER TABLE files ADD COLUMN `+col+` INTEGER`); err != nil {
+		if !ok {
+			if _, err := conn.ExecContext(ctx, `ALTER TABLE `+add.table+` ADD COLUMN `+add.col+` INTEGER`); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	_, err := conn.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES('schema', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value`, SchemaVersion)
+	return err
+}
+
+func hasColumn(ctx context.Context, conn *sql.Conn, table, col string) (bool, error) {
+	var n int
+	err := conn.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, col).Scan(&n)
+	return n > 0, err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -399,8 +410,8 @@ func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, 
 	}
 	for i, c := range chunks {
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO chunks(path, ord, heading, line, text) VALUES(?, ?, ?, ?, ?)`,
-			path, i, c.Heading, c.Line, c.Text)
+			`INSERT INTO chunks(path, ord, heading, line, end_line, text) VALUES(?, ?, ?, ?, ?, ?)`,
+			path, i, c.Heading, c.Line, nullInt(c.EndLine), c.Text)
 		if err != nil {
 			return err
 		}
@@ -420,6 +431,50 @@ func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO files(path, hash, indexed_at, mtime, size) VALUES(?, ?, ?, ?, ?)`, path, hash, unix, mtime, size); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+func nullInt(n int) sql.NullInt64 { return sql.NullInt64{Int64: int64(n), Valid: n > 0} }
+
+// MissingLines reports whether any chunk of path has no recorded end line.
+func (s *Store) MissingLines(ctx context.Context, path string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM chunks WHERE path = ? AND end_line IS NULL`, path).Scan(&n)
+	return n > 0, err
+}
+
+// ChunkTexts returns the stored text of path's chunks, in file order.
+func (s *Store) ChunkTexts(ctx context.Context, path string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT text FROM chunks WHERE path = ? ORDER BY ord`, path)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// SetLines records the line ranges of path's chunks, by order, without
+// touching their text or vectors. Only the writer calls it.
+func (s *Store) SetLines(ctx context.Context, path string, ranges []LineRange) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i, r := range ranges {
+		if _, err := tx.ExecContext(ctx, `UPDATE chunks SET line = ?, end_line = ? WHERE path = ? AND ord = ?`,
+			r.Line, nullInt(r.EndLine), path, i); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -461,7 +516,7 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.path, c.heading, c.line, c.text, v.distance, f.mtime, f.size
+		SELECT c.path, c.heading, c.line, c.end_line, c.text, v.distance, f.mtime, f.size
 		FROM (SELECT rowid, distance FROM vecs WHERE cmd = ? LIMIT ?) AS v
 		JOIN chunks c ON c.id = v.rowid
 		LEFT JOIN files f ON f.path = c.path
@@ -473,10 +528,11 @@ func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, erro
 	var hits []Hit
 	for rows.Next() {
 		var h Hit
-		var mtime, size sql.NullInt64
-		if err := rows.Scan(&h.Path, &h.Heading, &h.Line, &h.Text, &h.Distance, &mtime, &size); err != nil {
+		var mtime, size, end sql.NullInt64
+		if err := rows.Scan(&h.Path, &h.Heading, &h.Line, &end, &h.Text, &h.Distance, &mtime, &size); err != nil {
 			return nil, err
 		}
+		h.EndLine = int(end.Int64)
 		h.Stat = statOf(mtime, size)
 		hits = append(hits, h)
 	}

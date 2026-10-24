@@ -1,6 +1,6 @@
 # scree
 
-Local semantic search over your markdown notes, served to Claude Code over MCP.
+Local semantic search over the markdown in your repos and notes, served to Claude Code over MCP.
 
 Scree splits notes by heading, embeds the pieces through an API, and stores them in a SQLite file on disk. Claude Code asks for the few chunks that match a question instead of loading whole files. The markdown stays the source of truth; the index can be deleted and rebuilt at any time.
 
@@ -71,6 +71,7 @@ Settings come from environment variables. The [settings file](#settings-file) is
 | `SCREE_DIMENSIONS` | `512`; `0` uses the model's default size |
 | `SCREE_EMBED_URL` | `https://openrouter.ai/api/v1/embeddings` |
 | `SCREE_MAX_FILE_BYTES` | `1048576`; larger notes are skipped |
+| `SCREE_FIRST_SYNC_MB` | `50`; a Claude Code session won't start indexing a folder with more markdown than this (`0` = no limit) |
 | `SCREE_ZDR` | `1`; set `0` for endpoints other than OpenRouter |
 | `SCREE_HTTP_TOKEN` | none; required with `serve -allow-remote`, and enforced on loopback if set |
 
@@ -84,7 +85,7 @@ Every embedding request asks OpenRouter to route only to endpoints with zero dat
 
 ### Ignoring files
 
-An ignored file is never read for indexing, never sent to the embedding API, and refused by `read_note` and `reindex`. Four layers decide:
+An ignored file is never read for indexing, never sent to the embedding API, and refused by `read_doc` and `reindex`. Four layers decide:
 
 - **Built-in:** hidden files and folders, except the root `.claude/` (not `.claude/worktrees/`), `.github/`, `.gitlab/`, `.gitea/`, `.forgejo/`, `.cursor/`, `.codex/`, `.gemini/`, `.windsurf/`, `.circleci/` and `.buildkite/`; anything that isn't `.md` or `.markdown`; symlinks that lead outside the folder; files over `SCREE_MAX_FILE_BYTES`; and names with control characters.
 - **`.gitignore`:** in a git repo, everything git ignores (nested `.gitignore` files, `.git/info/exclude`, your global excludes file). Ignored folders such as `node_modules/` are never read. `-gitignore=false` turns this off.
@@ -146,7 +147,7 @@ The wrapper refuses to start if the settings file is missing, not owned by you, 
 
 The settings file is the wrapper's only source of configuration. A repo's committed `.mcp.json` can start `scree-mcp` with its own environment and arguments, so the wrapper resets `PATH`, ignores every inherited `SCREE_*`, `OPENROUTER_API_KEY` and proxy variable, and refuses arguments. A repo can't redirect your key to another endpoint, swap in another binary, or point scree at another folder.
 
-Tools: `search_notes(query, k)`, `read_note(path)`, `reindex(path?)`.
+Tools: `search_docs(query, k)`, `read_doc(path, start?, end?)`, `reindex(path?)`.
 
 Stdio through the wrapper is the recommended setup. `serve -http` listens on loopback only. A non-loopback address needs `-allow-remote` and a `SCREE_HTTP_TOKEN` of at least 16 characters, and every request must then send `Authorization: Bearer <token>`. Keep the token in the settings file rather than on a command line:
 
@@ -205,7 +206,7 @@ SCREE_NOTES_DIR=$HOME/notes docker compose up -d     # starts watch
 docker compose logs -f watch
 ```
 
-`compose.yaml` passes through `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_ZDR` and `SCREE_EMBED_URL` too, and `SCREE_HTTP_TOKEN` to `serve`. The `serve` service sits behind the `mcp` profile, so `up` doesn't start it.
+`compose.yaml` passes through `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_FIRST_SYNC_MB`, `SCREE_ZDR` and `SCREE_EMBED_URL` too, and `SCREE_HTTP_TOKEN` to `serve`. The `serve` service sits behind the `mcp` profile, so `up` doesn't start it.
 
 For Claude Code, the MCP server runs one container per session over stdio. `contrib/scree-mcp-docker` loads the settings file and runs `docker run -i --rm --pull=never` (a missing image is never pulled from a registry, since the container gets the key) with the project folder mounted read-only **at its own path** (so each repo gets its own index in the `scree-data` volume), the `scree-data` volume, and only the variables that are set, passed by name so the key never appears on the command line. It mounts the git root above `CLAUDE_PROJECT_DIR`, so `.gitignore` applies; your global git excludes file is not visible inside the container. A repo's committed `.mcp.json` names `scree-mcp`, so install the Docker wrapper under that name:
 
@@ -226,10 +227,10 @@ The `watch` and `serve` containers share the `scree-data` volume. SQLite's WAL m
 - Search waits at most 10 s for the API (2 attempts). Indexing waits up to 30 s per attempt (3 attempts). After an API outage, indexing pauses for 30 s, doubling up to 5 min, and then resyncs, so notes changed during the outage are picked up without another edit.
 - On shutdown, `serve` and `watch` wait at most 5 s for the writer, and a second Ctrl-C or SIGTERM exits at once.
 - `scree watch` exits with an error if the index file or the folder disappears or is replaced, so systemd or Docker restarts it. In `serve`, the writer stops and searches report it. Watches are re-added when a folder is renamed or an ignore file changes. The index directory is created 0700 and its files are 0600.
-- Search results are `<hit>` elements of at most 3500 characters each, and one response is at most 64 KB. `read_note` returns the note in a `<note>` element. The server tells the client to treat both as data, not instructions.
+- Search results are `<hit>` elements of at most 3500 characters each, and one response is at most 64 KB. `read_doc` returns the file, or a range of its lines, in a `<doc>` element. The server tells the client to treat both as data, not instructions.
 - Vectors live in [vec1](https://sqlite.org/vec1), SQLite's vector extension, with a flat (exact) cosine index. It is compiled to WebAssembly by [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3), which is what keeps the binary CGO-free.
 - scree only trusts a `.git` you own that is not a symlink, never looks for one in or above a sticky folder such as `/tmp`, never follows a symlink for git's ignore files (`.gitignore`, `.git/info/exclude`, a `.git` file) or `.screeignore`, never reads a repository's `.git/config`, and never prints the content of any of them: messages name the file and line only. A `.git` owned by someone else is an error; to index a folder below it anyway, pass `-notes <folder> -gitignore=false`.
-- One policy decides what may be read, and indexing, search, `read_note` and `reindex` all go through it. Symlinks are followed only inside the notes folder, and the rules are checked on their target too. Symlinked folders are not descended.
+- One policy decides what may be read, and indexing, search, `read_doc` and `reindex` all go through it. Symlinks are followed only inside the notes folder, and the rules are checked on their target too. Symlinked folders are not descended.
 
 Idle memory is about 13–15 MB per process.
 

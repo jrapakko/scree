@@ -170,7 +170,7 @@ func dockerArgs(t *testing.T, e env, project string, extra ...string) ([]string,
 }
 
 func TestScreeMCPDockerArgs(t *testing.T) {
-	e := setup(t, envFile+"SCREE_ZDR=0\n", 0o600)
+	e := setup(t, envFile+"SCREE_ZDR=0\nSCREE_FIRST_SYNC_MB=5\n", 0o600)
 	repo := filepath.Join(e.dir, "repo")
 	for _, d := range []string{".git", "sub"} {
 		if err := os.MkdirAll(filepath.Join(repo, d), 0o755); err != nil {
@@ -180,7 +180,7 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 	args, lines := dockerArgs(t, e, filepath.Join(repo, "sub"))
 	want := []string{
 		"run", "-i", "--rm", "--pull=never",
-		"-e", "OPENROUTER_API_KEY", "-e", "SCREE_MODEL", "-e", "SCREE_ZDR",
+		"-e", "OPENROUTER_API_KEY", "-e", "SCREE_MODEL", "-e", "SCREE_ZDR", "-e", "SCREE_FIRST_SYNC_MB",
 		"-v", repo + ":" + repo + ":ro", "-v", "scree-data:/data",
 		"scree:latest", "serve", "-notes", repo,
 	}

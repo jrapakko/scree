@@ -549,3 +549,84 @@ func TestSearchSkipsReadWhenUnchanged(t *testing.T) {
 		t.Errorf("search opened the file %d times; the stat matched", opened)
 	}
 }
+
+// legacyLines makes path's rows look like a schema 1 index: no end_line, and
+// a stale start line.
+func legacyLines(t *testing.T, ix *Indexer, path string, n int) {
+	t.Helper()
+	ranges := make([]store.LineRange, n)
+	for i := range ranges {
+		ranges[i] = store.LineRange{Line: 1}
+	}
+	if err := ix.Store.SetLines(context.Background(), path, ranges); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBackfillLinesWithoutEmbedding(t *testing.T) {
+	ix, fe := setup(t)
+	ctx := context.Background()
+	src := "# Apples\n\n\napple one\napple two\n\n# Bananas\n\nbanana\n"
+	write(t, ix.Root(), "a.md", src)
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	legacyLines(t, ix, "a.md", 2)
+	if missing, _ := ix.Store.MissingLines(ctx, "a.md"); !missing {
+		t.Fatal("setup: lines not cleared")
+	}
+	fe.calls = 0
+	st, err := ix.Sync(ctx)
+	if err != nil || st.Indexed != 0 {
+		t.Fatalf("Sync = %+v, %v", st, err)
+	}
+	if fe.calls != 0 {
+		t.Errorf("backfill called the embedder %d times", fe.calls)
+	}
+	if missing, _ := ix.Store.MissingLines(ctx, "a.md"); missing {
+		t.Error("end_line not filled")
+	}
+	hits, err := ix.Search(ctx, "banana", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][2]int{}
+	for _, h := range hits {
+		got[h.Heading] = [2]int{h.Line, h.EndLine}
+	}
+	if got["Apples"] != [2]int{1, 5} || got["Bananas"] != [2]int{7, 9} {
+		t.Errorf("ranges = %v", got)
+	}
+}
+
+func TestBackfillSkipsWhenChunkingDiffers(t *testing.T) {
+	ix, fe := setup(t)
+	ctx := context.Background()
+	src := "# Apples\napple\n"
+	write(t, ix.Root(), "a.md", src)
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Rows from an older chunker: same file hash, other chunk text.
+	hash, stat, err := ix.Store.FileInfo(ctx, "a.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := []store.Chunk{{Path: "a.md", Heading: "Apples", Line: 1, Text: "apple, chunked differently"}}
+	if err := ix.Store.ReplaceFile(ctx, "a.md", hash, 1, stat, old, [][]float32{{1, 0, 0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	fe.calls = 0
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fe.calls != 0 {
+		t.Errorf("embedder called %d times", fe.calls)
+	}
+	if missing, _ := ix.Store.MissingLines(ctx, "a.md"); !missing {
+		t.Error("lines were written for chunks that do not match")
+	}
+	if texts, _ := ix.Store.ChunkTexts(ctx, "a.md"); len(texts) != 1 || texts[0] != old[0].Text {
+		t.Errorf("rows changed: %q", texts)
+	}
+}

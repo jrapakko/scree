@@ -150,6 +150,9 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.F
 		return false, err
 	}
 	if have == hash {
+		if err := ix.backfillLines(ctx, rel, src); err != nil {
+			return false, err
+		}
 		if haveSt == nil || *haveSt != *st {
 			return false, ix.Store.SetFileStat(ctx, rel, *st)
 		}
@@ -160,7 +163,7 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.F
 	chunks := make([]store.Chunk, len(pieces))
 	inputs := make([]string, len(pieces))
 	for i, p := range pieces {
-		chunks[i] = store.Chunk{Path: rel, Heading: p.Heading, Line: p.Line, Text: p.Text}
+		chunks[i] = store.Chunk{Path: rel, Heading: p.Heading, Line: p.Line, EndLine: p.EndLine, Text: p.Text}
 		// The path and heading give the model context the text alone may lack.
 		inputs[i] = rel + "\n" + p.Heading + "\n\n" + p.Text
 	}
@@ -175,6 +178,34 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.F
 	}
 	ix.logf("indexed %q (%d chunks)", rel, len(chunks))
 	return true, nil
+}
+
+// backfillLines records line ranges for an unchanged file indexed before
+// they were stored, without re-embedding: it re-splits src and, if the
+// chunks are exactly the stored ones by order, writes their ranges. If the
+// chunking differs (an older chunker), the rows are left as they are until
+// the next real edit re-embeds the file.
+func (ix *Indexer) backfillLines(ctx context.Context, rel string, src []byte) error {
+	missing, err := ix.Store.MissingLines(ctx, rel)
+	if err != nil || !missing {
+		return err
+	}
+	texts, err := ix.Store.ChunkTexts(ctx, rel)
+	if err != nil {
+		return err
+	}
+	pieces := chunk.Split(string(src))
+	if len(pieces) != len(texts) {
+		return nil
+	}
+	ranges := make([]store.LineRange, len(pieces))
+	for i, p := range pieces {
+		if p.Text != texts[i] {
+			return nil
+		}
+		ranges[i] = store.LineRange{Line: p.Line, EndLine: p.EndLine}
+	}
+	return ix.Store.SetLines(ctx, rel, ranges)
 }
 
 func (ix *Indexer) remove(ctx context.Context, rel string) (bool, error) {

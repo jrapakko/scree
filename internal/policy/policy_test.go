@@ -405,7 +405,7 @@ func TestReasonStrings(t *testing.T) {
 			t.Errorf("%s.Layer() = %s", r, r.Layer())
 		}
 	}
-	if OutsideRoot.String() != "outside notes folder" {
+	if OutsideRoot.String() != "outside the folder" {
 		t.Error(OutsideRoot.String())
 	}
 	if GitIgnore.String() != ".gitignore" || NestedRepo.String() != "nested repository" {

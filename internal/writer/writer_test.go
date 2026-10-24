@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"github.com/jrapakko/scree/internal/lock"
 	"io"
 	"log"
 	"os"
@@ -72,6 +73,15 @@ func (e env) writer(t *testing.T, emb interface {
 	Model() string
 }) (*Writer, context.CancelFunc, chan error) {
 	t.Helper()
+	return e.writerWith(t, emb, nil)
+}
+
+// writerWith is writer with a hook to configure the Writer before Run.
+func (e env) writerWith(t *testing.T, emb interface {
+	Embed(context.Context, []string) ([][]float32, error)
+	Model() string
+}, configure func(*Writer)) (*Writer, context.CancelFunc, chan error) {
+	t.Helper()
 	p, err := policy.Open(e.root, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +93,9 @@ func (e env) writer(t *testing.T, emb interface {
 	ix := &index.Indexer{Policy: p, Store: s, Embedder: emb, Log: log.New(io.Discard, "", 0)}
 	w := &Writer{Indexer: ix, LockPath: e.lockPath, Retry: 200 * time.Millisecond, Log: log.New(io.Discard, "", 0)}
 	w.Attach()
+	if configure != nil {
+		configure(w)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
@@ -220,5 +233,60 @@ func TestStoppedNote(t *testing.T) {
 	}
 	if n := a.Note(context.Background()); !strings.HasPrefix(n, "[index not updating: ") {
 		t.Errorf("note = %q", n)
+	}
+}
+
+func TestFirstSyncCap(t *testing.T) {
+	e := newEnv(t, "a.md", "b.md")
+	writeBig(e.root)
+	w, _, done := e.writerWith(t, constEmbedder{}, func(w *Writer) { w.FirstSyncMax = 1 << 20 })
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+		done <- nil // for the cleanup
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after skipping")
+	}
+	if st := w.Status(); st.Phase != Skipped || st.Bytes < 1<<20 {
+		t.Fatalf("status = %+v", st)
+	}
+	if paths, _ := w.Indexer.Store.Paths(context.Background()); len(paths) != 0 {
+		t.Errorf("indexed %v despite the cap", paths)
+	}
+	note := w.Note(context.Background())
+	if !strings.Contains(note, "[not indexed: this folder has ") || !strings.Contains(note, "SCREE_FIRST_SYNC_MB=1") ||
+		!strings.Contains(note, `run "scree reindex"`) {
+		t.Errorf("note = %q", note)
+	}
+	// The lock was released: another writer can take it.
+	l, _, err := lock.TryLock(e.lockPath)
+	if err != nil {
+		t.Fatalf("lock still held: %v", err)
+	}
+	l.Release()
+}
+
+func TestCapOnlyFirstSync(t *testing.T) {
+	e := newEnv(t, "a.md")
+	a, cancel, done := e.writer(t, constEmbedder{})
+	waitPhase(t, a, Watching, 5*time.Second)
+	cancel()
+	<-done
+	done <- nil
+	writeBig(e.root)
+	b, _, _ := e.writerWith(t, constEmbedder{}, func(w *Writer) { w.FirstSyncMax = 1 << 20 })
+	waitPhase(t, b, Watching, 10*time.Second)
+	if paths, _ := b.Indexer.Store.Paths(context.Background()); len(paths) != 4 {
+		t.Errorf("paths = %v", paths)
+	}
+}
+
+// writeBig adds 1.8 MB of markdown in three files, each under the 1 MB
+// per-file limit.
+func writeBig(root string) {
+	for _, n := range []string{"big1.md", "big2.md", "big3.md"} {
+		os.WriteFile(filepath.Join(root, n), []byte(strings.Repeat("word ", 120<<10)), 0o644)
 	}
 }

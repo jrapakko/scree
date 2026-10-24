@@ -141,3 +141,52 @@ func TestDoctorNeverPrintsGitignoreContent(t *testing.T) {
 		})
 	}
 }
+
+func TestDoctorSizeHiddenAndCap(t *testing.T) {
+	serveEnv(t)
+	t.Setenv("SCREE_FIRST_SYNC_MB", "1")
+	notes := filepath.Join(tempDir(t), "notes")
+	for rel, src := range map[string]string{
+		".screeignore":                     "include-hidden .foo/\n",
+		".github/PULL_REQUEST_TEMPLATE.md": "x",
+		".foo/a.md":                        "x",
+		"big1.md":                          strings.Repeat("word ", 120<<10),
+		"big2.md":                          strings.Repeat("word ", 120<<10),
+	} {
+		p := filepath.Join(notes, filepath.FromSlash(rel))
+		mkdir(t, filepath.Dir(p))
+		if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := captureStdout(t, func() {
+		runDoctor(context.Background(), []string{"-offline", "-notes", notes})
+	})
+	for _, want := range []string{
+		"ok   files: 4 indexable",
+		"ok   size: 1.2 MB of markdown, about 307k tokens to embed in full (under $0.01 with openai/text-embedding-3-small)",
+		"warn over SCREE_FIRST_SYNC_MB: Claude Code sessions will not index this folder until you run scree reindex",
+		"ok   hidden folders indexed: .github/ (+ .foo/ from .screeignore)",
+		"outside the folder",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("doctor output lacks %q:\n%s", want, out)
+		}
+	}
+	t.Setenv("SCREE_FIRST_SYNC_MB", "0.5")
+	out = captureStdout(t, func() {
+		runDoctor(context.Background(), []string{"-offline", "-notes", notes})
+	})
+	if !strings.Contains(out, `SCREE_FIRST_SYNC_MB="0.5": want a whole number of megabytes`) {
+		t.Errorf("0.5 accepted:\n%s", out)
+	}
+}
+
+func TestSizeLine(t *testing.T) {
+	if got := sizeLine(10<<20, costModel); got != "size: 10.0 MB of markdown, about 2.6M tokens to embed in full (about $0.05 with openai/text-embedding-3-small)" {
+		t.Errorf("sizeLine = %q", got)
+	}
+	if got := sizeLine(400, "other/model"); got != "size: 0.0 MB of markdown, about 100 tokens to embed in full" {
+		t.Errorf("sizeLine = %q", got)
+	}
+}

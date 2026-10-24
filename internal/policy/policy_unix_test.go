@@ -330,3 +330,36 @@ func TestFIFOSwappedNoteDoesNotBlock(t *testing.T) {
 		}
 	})
 }
+
+// Estimate counts what Scan allows, plus front-matter opt-outs, and never
+// opens a file: a FIFO named like a note would block a read.
+func TestEstimateMatchesScan(t *testing.T) {
+	top := repoFixture(t)
+	write(t, filepath.Join(top, ".gitignore"), "build/\n")
+	write(t, filepath.Join(top, ".screeignore"), "private/\n")
+	write(t, filepath.Join(top, "a.md"), "aaaa")
+	write(t, filepath.Join(top, "docs", "b.md"), "bb")
+	write(t, filepath.Join(top, "opt.md"), "---\nscree: ignore\n---\nx\n")
+	write(t, filepath.Join(top, "build", "c.md"), "c")
+	write(t, filepath.Join(top, "private", "d.md"), "d")
+	write(t, filepath.Join(top, ".hidden", "e.md"), "e")
+	mkfifo(t, filepath.Join(top, "x.md"))
+	p := open(t, top, 0)
+	var files int
+	var bytes int64
+	within(t, 2*time.Second, "Estimate", func() {
+		var err error
+		files, bytes, err = p.Estimate(context.Background())
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	os.Remove(filepath.Join(top, "x.md"))
+	s := scan(t, p)
+	if files != s.Allowed+len(s.Ignored[FrontMatter]) || files != 3 {
+		t.Errorf("Estimate files = %d, Scan allowed %d + %d opted out", files, s.Allowed, len(s.Ignored[FrontMatter]))
+	}
+	if want := int64(4 + 2 + len("---\nscree: ignore\n---\nx\n")); bytes != want {
+		t.Errorf("Estimate bytes = %d, want %d", bytes, want)
+	}
+}

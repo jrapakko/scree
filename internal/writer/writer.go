@@ -67,8 +67,12 @@ type Status struct {
 	Phase     Phase
 	HolderPID int   // when Waiting
 	Indexed   int   // during Syncing: files indexed so far
+	Bytes     int64 // when Skipped: the folder's markdown, from Policy.Estimate
 	Err       error // when Stopped
 }
+
+// errSkipped ends hold when the first-sync cap applies.
+var errSkipped = errors.New("first sync skipped")
 
 // Writer runs the write role for one index.
 type Writer struct {
@@ -80,6 +84,10 @@ type Writer struct {
 	// sync, for writes only the holder may do (recording the folder and
 	// model). An error stops the writer.
 	OnAcquire func(context.Context) error
+	// FirstSyncMax caps, in bytes, the markdown a writer indexes on its
+	// own when the index is new: over it, the first sync is skipped (phase
+	// Skipped) until an explicit `scree reindex`. 0 means no cap.
+	FirstSyncMax int64
 
 	mu      sync.Mutex
 	status  Status
@@ -126,7 +134,7 @@ func (w *Writer) Run(ctx context.Context) error {
 		w.holding = false
 		w.mu.Unlock()
 		l.Release()
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, errSkipped) {
 			return nil
 		}
 		w.stop(err)
@@ -149,6 +157,14 @@ func (w *Writer) hold(ctx context.Context) error {
 			return err
 		}
 	}
+	if skip, bytes, err := w.overCap(ctx); err != nil {
+		return err
+	} else if skip {
+		w.set(Status{Phase: Skipped, Bytes: bytes})
+		w.logf("not indexing %s: %.1f MB of markdown is over SCREE_FIRST_SYNC_MB=%d; run `scree reindex` in it to index it anyway",
+			ix.Root(), mb(bytes), w.FirstSyncMax>>20)
+		return errSkipped
+	}
 	w.logf("syncing %s", ix.Root())
 	st, err := ix.Sync(ctx)
 	if err != nil {
@@ -169,6 +185,30 @@ func (w *Writer) hold(ctx context.Context) error {
 	w.logf("watching %s", ix.Root())
 	return watch.RunOptions(ctx, ix, watch.Options{Stale: stale})
 }
+
+// overCap reports whether the first sync of a new index would exceed
+// FirstSyncMax, and the estimated size. An index that has files, or has
+// finished a sync before, is never capped.
+func (w *Writer) overCap(ctx context.Context) (bool, int64, error) {
+	if w.FirstSyncMax <= 0 {
+		return false, 0, nil
+	}
+	ix := w.Indexer
+	st, err := ix.Store.Stats(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	if st.Files > 0 || w.syncedOnce(ctx) {
+		return false, 0, nil
+	}
+	_, bytes, err := ix.Policy.Estimate(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	return bytes > w.FirstSyncMax, bytes, nil
+}
+
+func mb(n int64) float64 { return float64(n) / (1 << 20) }
 
 // Progress records Sync progress for Note, for Indexer.Progress.
 func (w *Writer) Progress(st index.SyncStats) {
@@ -222,6 +262,10 @@ func (w *Writer) Note(ctx context.Context) string {
 	st := w.Status()
 	if st.Phase == Stopped {
 		return fmt.Sprintf("[index not updating: %s]", textsafe.Strip(st.Err.Error()))
+	}
+	if st.Phase == Skipped {
+		return fmt.Sprintf(`[not indexed: this folder has %.1f MB of markdown, over SCREE_FIRST_SYNC_MB=%d; run "scree reindex" in it to index it anyway]`,
+			mb(st.Bytes), w.FirstSyncMax>>20)
 	}
 	if st.Phase != Syncing && st.Phase != Waiting {
 		return ""

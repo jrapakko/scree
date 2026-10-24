@@ -185,7 +185,7 @@ case $vol in
 esac
 set -- -v "$dir:$dir:$opts" -v "$vol:/data" "$@"
 # Pass a variable only if it is set, so unset ones keep the image defaults.
-for v in SCREE_HTTP_TOKEN SCREE_EMBED_URL SCREE_MAX_FILE_BYTES SCREE_ZDR SCREE_DIMENSIONS SCREE_MODEL OPENROUTER_API_KEY; do
+for v in SCREE_HTTP_TOKEN SCREE_EMBED_URL SCREE_MAX_FILE_BYTES SCREE_FIRST_SYNC_MB SCREE_ZDR SCREE_DIMENSIONS SCREE_MODEL OPENROUTER_API_KEY; do
 	if eval "[ -n \"\${$v+x}\" ]"; then
 		set -- -e "$v" "$@"
 	fi

@@ -29,6 +29,7 @@ Go.
 Something else.
 `
 	got := Split(src)
+	checkLines(t, src, got)
 	want := []struct {
 		heading string
 		line    int
@@ -53,6 +54,7 @@ Something else.
 func TestSplitIgnoresHeadingsInFences(t *testing.T) {
 	src := "# A\n\n```sh\n# not a heading\n```\n\n# B\ntext\n"
 	got := Split(src)
+	checkLines(t, src, got)
 	if len(got) != 2 {
 		t.Fatalf("got %d chunks: %+v", len(got), got)
 	}
@@ -63,6 +65,7 @@ func TestSplitIgnoresHeadingsInFences(t *testing.T) {
 
 func TestSplitSkipsEmptySections(t *testing.T) {
 	got := Split("# Empty\n\n## Also empty\n\n## Full\nbody\n")
+	checkLines(t, "# Empty\n\n## Also empty\n\n## Full\nbody\n", got)
 	if len(got) != 1 || got[0].Heading != "Empty > Full" {
 		t.Fatalf("got %+v", got)
 	}
@@ -76,6 +79,7 @@ func TestSplitLongSection(t *testing.T) {
 		b.WriteString(para + "\n\n")
 	}
 	got := Split(b.String())
+	checkLines(t, b.String(), got)
 	if len(got) < 2 {
 		t.Fatalf("expected long section to split, got %d chunks", len(got))
 	}
@@ -126,6 +130,7 @@ func checkCap(t *testing.T, got []Chunk) {
 func TestSplitHardCapSingleLine(t *testing.T) {
 	line := strings.Repeat("abcdefghij", 500_000) // 5 MB, no blank lines
 	got := Split("# Big\n" + line)
+	checkLines(t, "# Big\n"+line, got)
 	checkCap(t, got)
 	// The heading-only chunk is dropped, so every chunk is a piece.
 	var b strings.Builder
@@ -149,6 +154,7 @@ func TestSplitHardCapUnclosedFence(t *testing.T) {
 		b.WriteString("x := 1\n\n")
 	}
 	got := Split(b.String())
+	checkLines(t, b.String(), got)
 	if len(got) < 10 {
 		t.Fatalf("unclosed fence not split: %d chunks", len(got))
 	}
@@ -163,6 +169,7 @@ func TestSplitHardCapUnclosedFence(t *testing.T) {
 func TestSplitRuneSafe(t *testing.T) {
 	line := strings.Repeat("€", 3000) // 3 bytes each; MaxChars is not a multiple of 3
 	got := Split(line + "\n\n" + strings.Repeat("語 ", 1500))
+	checkLines(t, line+"\n\n"+strings.Repeat("語 ", 1500), got)
 	checkCap(t, got)
 	var b strings.Builder
 	for _, c := range got {
@@ -182,6 +189,7 @@ func TestSplitTargetChars(t *testing.T) {
 	para := strings.Repeat("word ", 80) // 400 chars
 	src := strings.Repeat(para+"\n\n", 8)
 	got := Split(src)
+	checkLines(t, src, got)
 	if len(got) != 2 {
 		t.Fatalf("got %d chunks, want 2", len(got))
 	}
@@ -191,6 +199,7 @@ func TestSplitTargetChars(t *testing.T) {
 func TestSplitHeadingCapped(t *testing.T) {
 	long := strings.Repeat("é", 100) // 200 bytes
 	got := Split("# " + long + "\n## " + strings.Repeat("h", 300) + "\nbody\n")
+	checkLines(t, "# "+long+"\n## "+strings.Repeat("h", 300)+"\nbody\n", got)
 	if len(got) != 1 {
 		t.Fatalf("got %+v", got)
 	}
@@ -205,5 +214,114 @@ func TestSplitHeadingCapped(t *testing.T) {
 	}
 	if _, text, _ := atxHeading("# short"); text != "short" {
 		t.Errorf("short heading changed: %q", text)
+	}
+}
+
+// fuzzSeeds are extra sources for the line-range invariant.
+var fuzzSeeds = []string{
+	"",
+	"\n\n\n",
+	"# A\n\n\n  text  \n\n\n# B\n\n",
+	"---\ntitle: x\n---\n\n\nbody\n",
+	"# A\r\n\r\nline one\r\nline two\r\n\r\n",
+	"```\n# in fence\n\n\n```\n",
+	"   \n\t\n# H\n\u00a0\nx\n",
+	"# H\n" + strings.Repeat("y", MaxChars*2+17) + "\nafter\n",
+	strings.Repeat("para line\n", 400) + "\n" + strings.Repeat("more\n", 400),
+	"lone\rcarriage\n\nreturn\r\n",
+}
+
+// checkLines asserts the line-range invariant: 1 <= Line <= EndLine <= the
+// number of source lines, the edge lines are non-blank, and the source lines
+// Line..EndLine, trimmed, contain Text. A piece cut from an overlong line is
+// a substring of that one line.
+func checkLines(t *testing.T, src string, got []Chunk) {
+	t.Helper()
+	lines := strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n")
+	for i, c := range got {
+		if c.Line < 1 || c.Line > c.EndLine || c.EndLine > len(lines) {
+			t.Errorf("chunk %d: lines %d-%d of %d", i, c.Line, c.EndLine, len(lines))
+			continue
+		}
+		if strings.TrimSpace(lines[c.Line-1]) == "" || strings.TrimSpace(lines[c.EndLine-1]) == "" {
+			t.Errorf("chunk %d: range %d-%d starts or ends on a blank line", i, c.Line, c.EndLine)
+		}
+		span := strings.TrimSpace(strings.Join(lines[c.Line-1:c.EndLine], "\n"))
+		if !strings.Contains(span, c.Text) && !strings.Contains(span, strings.TrimSpace(c.Text)) {
+			t.Errorf("chunk %d: lines %d-%d do not contain its text %.60q", i, c.Line, c.EndLine, c.Text)
+		}
+	}
+}
+
+func TestLineRangesMatchSource(t *testing.T) {
+	for _, src := range fuzzSeeds {
+		checkLines(t, src, Split(src))
+	}
+}
+
+func FuzzSplit(f *testing.F) {
+	for _, src := range fuzzSeeds {
+		f.Add(src)
+	}
+	f.Fuzz(func(t *testing.T, src string) {
+		checkLines(t, src, Split(src))
+	})
+}
+
+func TestLineRangeSkipsBlankEdges(t *testing.T) {
+	src := "# H\n\n\nfirst\nsecond\n\n\n\n"
+	got := Split(src)
+	if len(got) != 1 || got[0].Line != 1 || got[0].EndLine != 5 {
+		t.Fatalf("got %+v, want one chunk at lines 1-5", got)
+	}
+	src = "intro\n\n\n\n"
+	if got := Split(src); len(got) != 1 || got[0].Line != 1 || got[0].EndLine != 1 {
+		t.Fatalf("got %+v, want lines 1-1", got)
+	}
+	// Text before the first heading starting after blank lines.
+	src = "\n\n\nbody\n# H\nx\n"
+	got = Split(src)
+	if len(got) != 2 || got[0].Line != 4 || got[0].EndLine != 4 || got[1].Line != 5 || got[1].EndLine != 6 {
+		t.Fatalf("got %+v", got)
+	}
+	// After front matter, Line points at the first text, not the blank line.
+	got = Split("---\na: b\n---\n\nbody\n")
+	if len(got) != 1 || got[0].Line != 5 || got[0].EndLine != 5 {
+		t.Fatalf("front matter: got %+v", got)
+	}
+}
+
+func TestLineRangeCutPieces(t *testing.T) {
+	long := strings.Repeat("z", MaxChars*2+10)
+	src := "# H\nintro\n" + long + "\nafter\n"
+	got := Split(src)
+	checkLines(t, src, got)
+	var cut int
+	for _, c := range got {
+		if c.Line == 3 && c.EndLine == 3 {
+			cut++
+			if !strings.Contains(long, c.Text) {
+				t.Errorf("cut piece is not a substring of line 3")
+			}
+		}
+	}
+	if cut < 2 {
+		t.Errorf("want at least 2 single-line pieces of line 3, got %+v", got)
+	}
+	last := got[len(got)-1]
+	if last.EndLine != 4 || !strings.HasSuffix(last.Text, "after") {
+		t.Errorf("last chunk %d-%d %.40q", last.Line, last.EndLine, last.Text)
+	}
+}
+
+func TestLineRangeCRLF(t *testing.T) {
+	src := "# A\r\n\r\none\r\ntwo\r\n\r\n# B\r\nthree\r\n"
+	got := Split(src)
+	checkLines(t, src, got)
+	if len(got) != 2 || got[0].Line != 1 || got[0].EndLine != 4 || got[1].Line != 6 || got[1].EndLine != 7 {
+		t.Fatalf("got %+v", got)
+	}
+	if strings.Contains(got[0].Text, "\r") {
+		t.Errorf("CR kept in %q", got[0].Text)
 	}
 }

@@ -342,3 +342,78 @@ func TestMatchModelAndRootNeverWrite(t *testing.T) {
 		t.Errorf("MatchRoot = %v", err)
 	}
 }
+
+func TestMigrateEndLine(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceFile(ctx, "old.md", "h", 1, nil, []Chunk{{Path: "old.md", Line: 3, EndLine: 5, Text: "x"}}, [][]float32{{1, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	// Make it look like a schema 1 index.
+	for _, q := range []string{`ALTER TABLE chunks DROP COLUMN end_line`, `DELETE FROM meta WHERE key = 'schema'`} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if v, err := s.Meta("schema"); err != nil || v != SchemaVersion {
+		t.Errorf("schema = %q, %v", v, err)
+	}
+	if missing, err := s.MissingLines(ctx, "old.md"); err != nil || !missing {
+		t.Errorf("MissingLines = %v, %v", missing, err)
+	}
+	hits, err := s.Search(ctx, []float32{1, 0}, 1)
+	if err != nil || len(hits) != 1 || hits[0].Line != 3 || hits[0].EndLine != 0 {
+		t.Fatalf("legacy hit = %+v, %v", hits, err)
+	}
+	if texts, err := s.ChunkTexts(ctx, "old.md"); err != nil || len(texts) != 1 || texts[0] != "x" {
+		t.Fatalf("ChunkTexts = %q, %v", texts, err)
+	}
+	if err := s.SetLines(ctx, "old.md", []LineRange{{Line: 4, EndLine: 6}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, _ = s.Search(ctx, []float32{1, 0}, 1)
+	if hits[0].Line != 4 || hits[0].EndLine != 6 {
+		t.Errorf("after SetLines: %+v", hits[0])
+	}
+	if missing, _ := s.MissingLines(ctx, "old.md"); missing {
+		t.Error("still missing lines")
+	}
+}
+
+func TestEndLineRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	chunks := []Chunk{{Path: "a.md", Line: 1, EndLine: 4, Text: "a"}, {Path: "a.md", Line: 7, EndLine: 7, Text: "b"}}
+	if err := s.ReplaceFile(ctx, "a.md", "h", 1, nil, chunks, [][]float32{{1, 0}, {0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.Search(ctx, []float32{1, 0}, 2)
+	if err != nil || len(hits) != 2 {
+		t.Fatal(hits, err)
+	}
+	got := map[string][2]int{}
+	for _, h := range hits {
+		got[h.Text] = [2]int{h.Line, h.EndLine}
+	}
+	if got["a"] != [2]int{1, 4} || got["b"] != [2]int{7, 7} {
+		t.Errorf("ranges = %v", got)
+	}
+	if missing, _ := s.MissingLines(ctx, "a.md"); missing {
+		t.Error("MissingLines on a new row")
+	}
+}

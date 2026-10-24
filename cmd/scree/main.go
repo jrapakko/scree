@@ -1,5 +1,5 @@
-// Command scree is local semantic search over markdown notes, served to
-// Claude Code over MCP.
+// Command scree is local semantic search over the markdown in your repos and
+// notes, served to Claude Code over MCP.
 package main
 
 import (
@@ -34,7 +34,7 @@ import (
 
 var version = "dev"
 
-const usage = `scree: semantic search over markdown notes
+const usage = `scree: semantic search over the markdown in a folder
 
 Usage:
   scree watch              index changed notes, then keep the index current
@@ -54,7 +54,10 @@ current directory, or the current directory outside git. Under Claude Code
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
   SCREE_EMBED_URL     embeddings endpoint (default OpenRouter)
-  SCREE_MAX_FILE_BYTES  largest note to index, in bytes (default 1048576)
+  SCREE_MAX_FILE_BYTES  largest file to index, in bytes (default 1048576)
+  SCREE_FIRST_SYNC_MB a Claude Code session or watch does not start the
+                      first index of a folder with more markdown than this
+                      (default 50; 0 for no limit); reindex always does
   SCREE_ZDR           1 asks OpenRouter for zero-data-retention endpoints
                       only; 0 for other endpoints (default 1)
   OPENROUTER_API_KEY  API key for the endpoint
@@ -66,6 +69,7 @@ type config struct {
 	notes, db, model, url, apiKey string
 	dims                          int
 	maxBytes                      int64
+	firstSyncMax                  int64 // SCREE_FIRST_SYNC_MB in bytes; 0 means no cap
 	zdr, gitignore                bool
 	serve                         bool         // the folder defaults to CLAUDE_PROJECT_DIR
 	doctor                        bool         // doctor reports the SCREE_NOTES warning itself
@@ -196,6 +200,23 @@ func maxFileBytes() (int64, error) {
 	return n, nil
 }
 
+// defaultFirstSyncMB is the default SCREE_FIRST_SYNC_MB.
+const defaultFirstSyncMB = 50
+
+// firstSyncMax reads SCREE_FIRST_SYNC_MB, in whole megabytes, and returns it
+// in bytes. 0 means no cap.
+func firstSyncMax() (int64, error) {
+	v := os.Getenv("SCREE_FIRST_SYNC_MB")
+	if v == "" {
+		return defaultFirstSyncMB << 20, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 || n > 1<<30 {
+		return 0, fmt.Errorf("SCREE_FIRST_SYNC_MB=%q: want a whole number of megabytes, 0 for no limit", v)
+	}
+	return n << 20, nil
+}
+
 // zdrSetting reads SCREE_ZDR.
 func zdrSetting() (bool, error) {
 	v := os.Getenv("SCREE_ZDR")
@@ -223,6 +244,9 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 		return nil, err
 	}
 	if cfg.zdr, err = zdrSetting(); err != nil {
+		return nil, err
+	}
+	if cfg.firstSyncMax, err = firstSyncMax(); err != nil {
 		return nil, err
 	}
 	root, src, err := resolveFolder(cfg.notes, cfg.serve)
@@ -293,9 +317,10 @@ func claim(cfg *config, ix *index.Indexer, model bool) error {
 // newWriter builds the writer role for serve and watch.
 func newWriter(cfg *config, ix *index.Indexer) *writer.Writer {
 	w := &writer.Writer{
-		Indexer:   ix,
-		LockPath:  lockPath(cfg),
-		OnAcquire: func(context.Context) error { return claim(cfg, ix, true) },
+		Indexer:      ix,
+		LockPath:     lockPath(cfg),
+		FirstSyncMax: cfg.firstSyncMax,
+		OnAcquire:    func(context.Context) error { return claim(cfg, ix, true) },
 	}
 	w.Attach()
 	return w
@@ -303,6 +328,41 @@ func newWriter(cfg *config, ix *index.Indexer) *writer.Writer {
 
 // notesWarning is shown when the environment still sets SCREE_NOTES.
 const notesWarning = "SCREE_NOTES is no longer read; remove it from the settings file (the folder is now -notes or the git root)"
+
+// sizeLine describes bytes of markdown and the cost to embed it in full, at
+// about four bytes per token. A price is given only for costModel.
+func sizeLine(bytes int64, model string) string {
+	tokens := float64(bytes) / 4
+	var t string
+	switch {
+	case tokens >= 1e6:
+		t = fmt.Sprintf("%.1fM", tokens/1e6)
+	case tokens >= 1e3:
+		t = fmt.Sprintf("%.0fk", tokens/1e3)
+	default:
+		t = fmt.Sprintf("%.0f", tokens)
+	}
+	line := fmt.Sprintf("size: %.1f MB of markdown, about %s tokens to embed in full", float64(bytes)/(1<<20), t)
+	if model == costModel {
+		cost := tokens / 1e6 * costPerMTokens
+		price := fmt.Sprintf("about $%.2f", cost)
+		if cost < 0.01 {
+			price = "under $0.01"
+		}
+		line += fmt.Sprintf(" (%s with %s)", price, costModel)
+	}
+	return line
+}
+
+// indexEmpty reports whether the index holds no files yet (or does not
+// exist).
+func indexEmpty(ctx context.Context, ix *index.Indexer) bool {
+	if ix.Store == nil {
+		return true
+	}
+	st, err := ix.Store.Stats(ctx)
+	return err == nil && st.Files == 0
+}
 
 func closeIndexer(ix *index.Indexer) {
 	if ix.Store != nil {
@@ -487,10 +547,10 @@ func runReindex(ctx context.Context, args []string) error {
 	if err := writer.MarkSynced(ix.Store); err != nil {
 		return err
 	}
-	fmt.Printf("%d notes: %d indexed, %d removed, %d failed, %d deferred\n",
+	fmt.Printf("%d files: %d indexed, %d removed, %d failed, %d deferred\n",
 		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
 	if st.Failed+st.Deferred > 0 {
-		return fmt.Errorf("%d notes failed and %d were deferred; run reindex again", st.Failed, st.Deferred)
+		return fmt.Errorf("%d files failed and %d were deferred; run reindex again", st.Failed, st.Deferred)
 	}
 	return nil
 }
@@ -556,7 +616,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	}
 	defer closeIndexer(ix)
 	report(true, "folder %s (from %s)", ix.Root(), cfg.source)
-	doctorScan(ctx, ix, cfg.gitignore, *verbose, report, warn)
+	doctorScan(ctx, ix, &cfg, *verbose, report, warn)
 
 	// doctor only reads: it never creates the index or records anything in
 	// it; the process holding the writer lock does that.
@@ -566,7 +626,7 @@ func runDoctor(ctx context.Context, args []string) error {
 		report(true, "index %s: not created yet (the first serve, watch or reindex builds it)", cfg.db)
 	} else {
 		st, err := ix.Store.Stats(ctx)
-		report(err == nil, "index %s: %d notes, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
+		report(err == nil, "index %s: %d files, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
 		have, _ = ix.Store.Model()
 		synced, _ := ix.Store.Meta(writer.SyncedAtKey)
 		if synced == "" {
@@ -617,16 +677,43 @@ func runDoctor(ctx context.Context, args []string) error {
 	return nil
 }
 
-// doctorScan reports what the ignore layers do to the notes folder.
-func doctorScan(ctx context.Context, ix *index.Indexer, gitignore, verbose bool, report func(bool, string, ...any), warn func(string, ...any)) {
+// costModel is the model doctor prices, at costPerMTokens dollars per
+// million tokens.
+const (
+	costModel      = "openai/text-embedding-3-small"
+	costPerMTokens = 0.02
+)
+
+// doctorScan reports what the ignore layers do to the folder, its size and
+// the cost to embed it.
+func doctorScan(ctx context.Context, ix *index.Indexer, cfg *config, verbose bool, report func(bool, string, ...any), warn func(string, ...any)) {
+	gitignore := cfg.gitignore
 	sum, err := ix.Policy.Scan(ctx)
 	if err != nil {
-		report(false, "notes: %v (nothing will be indexed)", err)
+		report(false, "files: %v (nothing will be indexed)", err)
 		return
 	}
 	n := func(r policy.Reason) int { return len(sum.Ignored[r]) }
-	report(true, "notes: %d indexable", sum.Allowed)
-	report(true, "built-in: %d hidden, %d not markdown, %d outside notes folder, %d too large, %d unsafe name",
+	report(true, "files: %d indexable", sum.Allowed)
+	report(true, "%s", sizeLine(sum.Bytes, cfg.model))
+	if cfg.firstSyncMax > 0 && sum.Bytes > cfg.firstSyncMax && indexEmpty(ctx, ix) {
+		warn("over SCREE_FIRST_SYNC_MB: Claude Code sessions will not index this folder until you run scree reindex")
+	}
+	defaults, extra := ix.Policy.HiddenFolders()
+	hidden := "none"
+	if len(defaults) > 0 {
+		hidden = strings.Join(defaults, "/ ") + "/"
+	}
+	if len(extra) > 0 {
+		more := "(+ " + strings.Join(extra, "/ ") + "/ from " + policy.IgnoreFileName + ")"
+		if hidden == "none" {
+			hidden = more
+		} else {
+			hidden += " " + more
+		}
+	}
+	report(true, "hidden folders indexed: %s", hidden)
+	report(true, "built-in: %d hidden, %d not markdown, %d outside the folder, %d too large, %d unsafe name",
 		n(policy.Hidden), n(policy.NotMarkdown), n(policy.OutsideRoot), n(policy.TooLarge), n(policy.UnsafeName))
 	switch {
 	case ix.Policy.GitTop() != "":

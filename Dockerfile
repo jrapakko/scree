@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 # as an unprivileged user (uid 65532).
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.title="scree" \
-      org.opencontainers.image.description="Local semantic search over markdown notes, served over MCP" \
+      org.opencontainers.image.description="Local semantic search over the markdown in your repos and notes, served to Claude Code over MCP" \
       org.opencontainers.image.source="https://github.com/jrapakko/scree" \
       org.opencontainers.image.licenses="MIT" \
       io.modelcontextprotocol.server.name="io.github.jrapakko/scree"
