@@ -6,8 +6,8 @@ title: How it works
 
 One Go binary. Under Claude Code, each session runs its own `scree serve` process, started through `scree mcp` by the repo's committed `.mcp.json`. Each process has three parts:
 
-- **Writer** (fsnotify, hash, chunk): reads the folder's markdown, calls the embedding API, writes the index. Only the process holding the index's `writer.lock` runs it.
-- **Index** (SQLite): chunks with their line ranges and text hashes, vectors in vec1, and an FTS5 keyword index, in one file on disk.
+- **Writer** (fsnotify, hash, chunk): reads the folder's markdown, calls the embedding API, writes the index. On a full sync it also reads names from the folder's code for the code vocabulary. Only the process holding the index's `writer.lock` runs it.
+- **Index** (SQLite): chunks with their line ranges and text hashes, vectors in vec1, an FTS5 keyword index and the code vocabulary, in one file on disk.
 - **MCP server** (`search_docs`, `read_doc`, `reindex`): reads the index, embeds each query through the same API when the search mode needs it, serves Claude Code over stdio, or HTTP if asked.
 
 ```
@@ -72,7 +72,7 @@ Network errors, 429 and 5xx are retried; a timed-out attempt is not. After an ou
 
 ## Storage
 
-One SQLite file per folder, in WAL mode, with a `meta` table (model, folder, last sync), a `files` table (path, content hash, mtime, size), a `chunks` table (text, heading, line range, text hash), a vec1 virtual table holding one vector per chunk, and an external-content FTS5 table over chunk text, heading and path, kept in sync by triggers in the same transaction. vec1 uses a flat, exact cosine index. At 512 dimensions a vector is 2 KB. The keyword index adds roughly half the size of the chunk text on disk, since it does not store the text twice.
+One SQLite file per folder, in WAL mode, with a `meta` table (model, folder, last sync, schema and vocabulary versions), a `files` table (path, content hash, mtime, size), a `chunks` table (text, heading, line range, text hash), a vec1 virtual table holding one vector per chunk, an external-content FTS5 table over chunk text, heading and path, kept in sync by triggers in the same transaction, and two code-vocabulary tables (schema 4): `vocab(name)`, the lowercased names `auto` looks up, and `vocab_files(path, hash, names)`, each source file's hash and names, so a sync parses only new or changed files. vec1 uses a flat, exact cosine index. At 512 dimensions a vector is 2 KB. The keyword index adds roughly half the size of the chunk text on disk, since it does not store the text twice.
 
 FTS5 uses the `unicode61` tokenizer with diacritics removed and `_` and `-` as token characters, so identifiers such as `SCREE_FIRST_SYNC_MB` stay one token.
 
@@ -80,7 +80,7 @@ Index location: `$XDG_DATA_HOME/scree/indexes/<folder>-<hash>/`, holding `index.
 
 The index records the folder and the model. Opening it for another folder (through `-db` or `SCREE_DB`) is an error, since a sync would delete the other folder's rows. An index from the single-folder version with no recorded folder is adopted by the first folder that opens it.
 
-An index from an earlier version is upgraded in place when it is opened: line ranges are filled in on the next sync without re-embedding unchanged files, and text hashes and the keyword index are built from the stored chunks (about a second per 100,000 chunks). The first process to open it does this inside one transaction; others wait.
+An index from an earlier version is upgraded in place when it is opened: line ranges are filled in on the next sync without re-embedding unchanged files, text hashes and the keyword index are built from the stored chunks (about a second per 100,000 chunks), and the vocabulary tables start empty and are filled by the next sync. The first process to open it does this inside one transaction; others wait.
 
 ## The writer lock
 
@@ -91,6 +91,15 @@ The lock relies on the filesystem's locking, so on NFS and some network filesyst
 ## Background sync
 
 When the writer starts (the first session in a repo, a takeover, or `scree watch`), it compares every file's SHA-256 with the index, embeds only new and changed files, and removes rows for deleted or newly ignored ones. Files are indexed one at a time, so a large sync doesn't spike memory. Each file's old rows are replaced in one transaction.
+
+The same walk builds the code vocabulary:
+
+- **What is read.** Dependency names from `requirements*.txt`, `pyproject.toml`, `package.json`, `go.mod` and `Cargo.toml`, and mixed-case names (`PageFetcher`, `useState`) from imports and declarations in Python, JavaScript, TypeScript and Go files. The extractor is line-based heuristics, not a parser, and takes names only from name positions, never values or string contents. Names are lowercased, kept only if they are 3 to 128 bytes of printable ASCII, and dropped if on a stoplist of about 350 common words.
+- **Same rules, stricter.** The files go through the same policy as notes (git's rules, `.screeignore`, the size limit, symlinks), with two stricter rules: nothing under a hidden folder is read, not even under the root folders allowed for markdown, and a symlink must point to a file of its own class, so a note linked to code, or code linked to a note, is refused. Vendored folders (`vendor`, `node_modules`, `third_party`, `site-packages`, `bower_components`) and `.min.js` files contribute nothing.
+- **Caps.** At most 20,000 source files are read per sync, in walk order; the rest are not opened. A file keeps at most 2,000 names, and the vocabulary at most 100,000. A file cut short is parsed again only when it changes or the room left for it changes.
+- **Incremental.** An unchanged file is not parsed again; `vocab` is rebuilt from `vocab_files` in one transaction. When the extractor's version changes, both tables are cleared and every file is parsed again. The watcher does not re-read code between full syncs (start, takeover, `reindex`, resync).
+
+Code is never chunked, embedded, returned by `read_doc` or sent to the API; only the names are stored.
 
 In `serve` this runs in the background: the MCP handshake and searches never wait, and search output says the index is incomplete until the first sync finishes. For a new, empty index with more than `SCREE_FIRST_SYNC_MB` (default 50) of markdown, a session or `watch` skips the first sync and search says so; `scree reindex` indexes it on purpose.
 
@@ -109,7 +118,7 @@ Files are opened without blocking, so a FIFO is never waited on, and a file is u
 
 ## Search
 
-The mode decides which sides run (see [search modes](using-with-claude-code.md#search-modes)); `auto` picks `hybrid` for a query with an identifier-like word and `semantic` otherwise.
+The mode decides which sides run (see [search modes](using-with-claude-code.md#search-modes)); `auto` picks `hybrid` for a query with an identifier-like word or a word in the code vocabulary (one primary-key lookup for the query's first 32 distinct words; a failed lookup counts as no match), and `semantic` otherwise.
 
 1. **Fetch.** Each side fetches up to `min(max(4k, 40), 200)` chunks, over-fetching because some hits are dropped and duplicates folded. The vector side embeds the query (10 s timeout, 2 attempts) and ranks chunks by cosine distance. The keyword side runs an FTS5 query over chunk text, heading and path, ranked by BM25 with the text weighted twice as much as heading or path. The query is turned into quoted terms joined with `OR`: at most 32 words of at most 64 bytes, with control characters stripped and punctuation trimmed from their ends.
 2. **Merge.** In `hybrid`, the two lists are merged by reciprocal rank fusion: a chunk scores `Σ 1/(60 + rank)` over the lists it appears in, with equal weights. A chunk found by both is marked `match="both"`.

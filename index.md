@@ -11,7 +11,7 @@ Source: [github.com/jrapakko/scree](https://github.com/jrapakko/scree). License:
 
 ## Why
 
-The point is relevance and context, not speed. Long markdown files are unwieldy as context, and an agent that greps or reads whole files either misses the section that answers a question in different words, or pulls in thousands of lines to find it. scree returns the few sections that match the question, by meaning and, for identifiers such as `PURGE_OLD_RECORDS`, by exact words too. Each hit carries its path, heading trail and current line range, so Claude reads only those lines.
+The point is relevance and context, not speed. Long markdown files are unwieldy as context, and an agent that greps or reads whole files either misses the section that answers a question in different words, or pulls in thousands of lines to find it. scree returns the few sections that match the question, by meaning and, for identifiers such as `PURGE_OLD_RECORDS` or names from the repo's code such as `PageFetcher`, by exact words too. Each hit carries its path, heading trail and current line range, so Claude reads only those lines.
 
 ## Two-minute overview
 

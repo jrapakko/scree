@@ -7,7 +7,7 @@ An ignored file is never read for indexing, never sent to the embedding API, nev
 
 ## What gets indexed
 
-Files ending in `.md`, `.markdown` or `.mdc` (in any letter case), anywhere in the folder, minus what the four layers below exclude. Nothing else: no code, YAML or JSON.
+Files ending in `.md`, `.markdown` or `.mdc` (in any letter case), anywhere in the folder, minus what the four layers below exclude. Nothing else is chunked or embedded: no code, YAML or JSON. Sync also reads dependency manifests and Python, JavaScript, TypeScript and Go files for names only, to build the [code vocabulary](using-with-claude-code.md#the-code-vocabulary); the same rules apply to them, plus two stricter ones: nothing under a hidden folder is read, and a symlink must point to a file of its own class.
 
 The layers are checked in this order, and the first that matches wins:
 
@@ -22,7 +22,7 @@ Always on:
 
 - **Hidden paths:** any path segment starting with `.`, such as `.git/`, `.obsidian/`, `.trash/` or `.env.md`. Exceptions are listed below.
 - **Not markdown:** any other extension.
-- **Symlinks** whose target resolves outside the folder. A symlink inside the folder is followed, and every rule is checked against both the link and its target. Symlinked folders are never descended.
+- **Symlinks** whose target resolves outside the folder. A symlink inside the folder is followed, and every rule is checked against both the link and its target, so a note linked to a code file is refused. Symlinked folders are never descended. A hard link can't be told from a regular file, so it is indexed under its own name if that name passes the rules.
 - **Size:** files over `SCREE_MAX_FILE_BYTES` (1 MiB by default), which are usually exports or logs.
 - **Unsafe names:** names with control characters or invalid UTF-8.
 - **Non-regular files** such as FIFOs and devices, skipped without being opened.

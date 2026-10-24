@@ -59,9 +59,19 @@ Under Claude Code, `serve` indexes the git root of its working directory, which 
 Indexing, search, `read_doc` and `reindex` go through the same policy, checked against the name as stored on disk:
 
 - symlinks are followed only inside the folder, with the rules checked on the target too; symlinked folders are never descended;
+- a hard link can't be told from a regular file, so a hard link inside the folder, even to a file outside it, is treated as that file under its own name and passes the same rules;
 - non-regular files are skipped without being opened, and files are opened without blocking, so a FIFO can't hang a session;
 - a file is used only if what was opened is the regular file the policy checked, so swapping in a symlink mid-sync doesn't work;
 - files over `SCREE_MAX_FILE_BYTES` (1 MiB) and names with control characters are refused.
+
+## Code is read for names only
+
+To build the code vocabulary that `auto` routes on (see [Using with Claude Code](using-with-claude-code.md#the-code-vocabulary)), each full sync also reads dependency manifests and Python, JavaScript, TypeScript and Go source files. They go through the same policy walk as notes, with two stricter rules:
+
+- **No hidden folders.** Nothing under a hidden folder is read, not even under `.claude/`, `.github/` or the other root folders allowed for markdown, so a hook script in `.claude/hooks/` contributes nothing.
+- **A symlink must point to a file of its own class.** A source file linked to another source file in the folder is read; a note linked to code, or code linked to a note, is refused, so code is never embedded under a note's name.
+
+Only lowercased names are kept, in the local index. Code is never chunked, embedded, sent to the API, returned by search or `read_doc` (which refuse these files), or written whole into the index. `doctor` prints only names the notes also contain, so a name found only in code, which may be text the extractor misread from a string, is never shown. A misread name can at worst send a question to `hybrid`.
 
 ## The home guard
 
@@ -94,7 +104,7 @@ Keep the token in the settings file, not on a command line, for example `printf 
 
 ## Index files
 
-The index directory is created with mode 0700 and its files 0600. The index file, its `-wal` and `-shm` files and `writer.lock` are never opened through a symlink. The index stores chunk text in plain form so search can return it. `scree indexes -prune` removes only real directories directly inside the indexes folder and never follows a symlink out of it.
+The index directory is created with mode 0700 and its files 0600. The index file, its `-wal` and `-shm` files and `writer.lock` are never opened through a symlink. The index stores chunk text in plain form so search can return it, and the code vocabulary's lowercased names. `scree indexes -prune` removes only real directories directly inside the indexes folder and never follows a symlink out of it.
 
 ## Docker and SELinux
 

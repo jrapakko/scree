@@ -104,7 +104,7 @@ Fix the lines `doctor` names by number. Indexing resumes once the file parses.
 A typo in `-mode`, `mode` or `-format`.
 
 **Search returns nothing for a file you expect**
-Check `doctor -v` for the file's reason. An ignored, oversized or opted-out file never appears. For an exact name, try `-mode keyword`; for a name with no `_` or digit, `auto` runs only the vector search, so pass `-mode hybrid`.
+Check `doctor -v` for the file's reason. An ignored, oversized or opted-out file never appears. For an exact name, try `-mode keyword`. A name with no `_` or digit makes `auto` add keyword search only if it is in the folder's [code vocabulary](using-with-claude-code.md#the-code-vocabulary) (a dependency, or a mixed-case name from imports and declarations); other such names, a stoplisted word, or a name from code under a hidden folder get only the vector search, so pass `-mode hybrid` or `-mode keyword`. The vocabulary is rebuilt on each full sync, not as code changes, so a brand-new name routes after the next sync (`scree run reindex`).
 
 **A hit says `stale="true"`**
 The file changed and the chunk's text is no longer in it. The writer re-indexes the file within seconds; search again.

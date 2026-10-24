@@ -80,7 +80,7 @@ Prints the top hits in the same `<hit>` format the MCP tool returns (see [Using 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-k <n>` | `8` | Number of results. Not capped on the CLI; the MCP tool caps at 50. |
-| `-mode <m>` | `auto` | `auto`, `hybrid`, `semantic` or `keyword`; see [search modes](using-with-claude-code.md#search-modes). `keyword` makes no API call. |
+| `-mode <m>` | `auto` | `auto` (semantic, plus keyword search when the query holds an identifier such as `FOO_BAR` or a name from the folder's code), `hybrid`, `semantic` or `keyword`; see [search modes](using-with-claude-code.md#search-modes). `keyword` makes no API call. |
 | `-format <f>` | `xml` | `xml` for `<hit>` elements, or `json` for one object per line |
 
 ```sh
@@ -119,6 +119,7 @@ Checks the setup and prints one line per check, marked `ok`, `warn` or `FAIL`:
 - the root hidden folders that are indexed;
 - how many files each ignore layer excludes (built-in, `.gitignore` and nested repositories, `.screeignore` with its `!` re-includes, front matter), plus bad ignore-file lines by number;
 - the index file, its file and chunk counts, the keyword index, the last full sync;
+- the [code vocabulary](using-with-claude-code.md#the-code-vocabulary): how many names were read from how many manifests and source files, and how many of them the notes also contain;
 - whether a process holds the writer lock, and its pid;
 - the configured model, and whether the index was built with another;
 - whether `OPENROUTER_API_KEY` is set, and whether zero data retention is requested;
@@ -128,7 +129,7 @@ Checks the setup and prints one line per check, marked `ok`, `warn` or `FAIL`:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-v` | `false` | Also run FTS5's integrity check on the keyword index, and list every ignored path with its reason, unreadable paths, and every file a `!` rule re-included with the rule's line |
+| `-v` | `false` | Also run FTS5's integrity check on the keyword index, print up to 20 code-vocabulary names the notes also contain, and list every ignored path with its reason, unreadable paths, and every file a `!` rule re-included with the rule's line |
 | `-offline` | `false` | Skip the test call to the embeddings API |
 
 Sample of `doctor -v -offline` in a small repo with the key set and no index yet:
@@ -156,6 +157,18 @@ ok   zero data retention requested (provider.zdr=true, data_collection=deny)
 ```
 
 The real output prints absolute paths.
+
+Once the index exists, the index lines look like this, with `-v`:
+
+```
+ok   index ~/.local/share/scree/indexes/demo-b40ee07c8f619a6a/index.db: 3 files, 11 chunks (vec1 …)
+ok   keyword index: 11 chunks
+ok   keyword index integrity check
+ok   code vocabulary: 42 names from 9 manifests and source files, 3 also in the notes (names only; never embedded)
+  vocabulary sample (names also in the notes): "pagefetcher" "psycopg" "usestate"
+```
+
+A name counts as in the notes when keyword search would match it: `pagefetcher` matches `PageFetcher`, and a dotted or slashed name such as `golang.org/x/sync` must match as a phrase. A name found only in code is never printed, since it may be text the extractor misread from a string.
 
 ### `scree indexes [-prune]`
 

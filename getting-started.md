@@ -30,7 +30,7 @@ The release workflow (`.github/workflows/release.yml`) runs on a `v*` tag and pu
 - A **draft** GitHub release built by GoReleaser, with archives for Linux, macOS and Windows on amd64 and arm64, named `scree_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), plus `checksums.txt`. Each archive holds the binary, `LICENSE`, `README.md`, `docs/SPEC.md`, `contrib/scree-watch.service` and `THIRD_PARTY_LICENSES/`. The workflow runs `go test` before building.
 - A multi-arch (linux/amd64, linux/arm64) image at `ghcr.io/jrapakko/scree`, tagged `<version>` and `<major>.<minor>`. See [Docker](docker.md).
 
-The release is created as a draft and published by hand, so a tag alone does not make it public. No version has been tagged yet; cutting `v0.1.0` is on the [roadmap](roadmap.md#open-items).
+The release is created as a draft and published by hand, so a tag alone does not make the GitHub release public; the image is pushed when the tag is. Releases are listed on the [GitHub releases page](https://github.com/jrapakko/scree/releases); the latest is `v0.2.0`.
 
 ## The settings file
 

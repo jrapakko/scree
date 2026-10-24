@@ -43,18 +43,31 @@ The shell expands `$HOME` when you run this, so the stored command is your absol
 
 ### Search modes
 
-- **`auto`** (the default): `semantic`, unless the query has an identifier-like word; then `hybrid`. A word counts if, after trimming quotes, brackets, backticks and `.,;:?!`, it has at least one ASCII letter and at least one `_` or ASCII digit, such as `PURGE_OLD_RECORDS`, `R7-Q2` or `v2`. `ID`, `API`, `2026` and `well-known` don't count. The output ends with `[mode: auto → hybrid]` or `[mode: auto → semantic]`.
+- **`auto`** (the default): `semantic`, unless the query has an identifier-like word or a name from the repo's code; then `hybrid`. A word is identifier-like if, after trimming quotes, brackets, backticks and `.,;:?!`, it has at least one ASCII letter and at least one `_` or ASCII digit, such as `PURGE_OLD_RECORDS`, `R7-Q2` or `v2`. `ID`, `API`, `2026` and `well-known` don't count. A word, trimmed the same way and lowercased, is a name from the code if it is in the folder's [code vocabulary](#the-code-vocabulary); `PageFetcher's` counts as `PageFetcher`. The output ends with `[mode: auto → hybrid]` or `[mode: auto → semantic]`.
 - **`hybrid`**: a vector search and an SQLite FTS5 keyword search over chunk text, heading and path, merged by reciprocal rank fusion, so exact names rank first.
 - **`semantic`**: vectors only.
 - **`keyword`**: FTS5 only. It makes no API call, so it works without a key or while the API is down. A failed embedding call in the other modes says that `mode="keyword"` still works.
 
 `auto` is the default because, in retrieval measurements, always-on `hybrid` helped identifier queries but cost plain-language questions; `auto` keeps the gain on identifiers without the loss.
 
+### The code vocabulary
+
+The identifier rule misses names with no `_` or digit, such as `psycopg` or `PageFetcher`. So each sync also collects names from the repo's code, locally:
+
+- dependency names from `requirements*.txt`, `pyproject.toml`, `package.json`, `go.mod` and `Cargo.toml`, at any depth;
+- mixed-case names (`PageFetcher`, `useState`) from import statements and declarations in Python, JavaScript, TypeScript and Go files.
+
+A stoplist of about 350 words keeps common words out, even as package names: function words (`how`, `the`), package names that are ordinary words (`sync`, `requests`, `next`, `config`) and plain words written in mixed case (`setUp`, `fileName`). A Go module such as `golang.org/x/sync` adds only its full path. A word the stoplist misses can still send a plain question to `hybrid`, which costs little.
+
+Only the lowercased names are stored, in the local index; code is never chunked, embedded, returned by `read_doc` or sent to the API. The files go through the same ignore rules as markdown, except that nothing under a hidden folder is read, not even the `.claude/`-style folders allowed for markdown; vendored folders (`vendor`, `node_modules`, `third_party`, …) and `.min.js` files are skipped. The extractor is line-based heuristics, not a parser, so it can misread text from a string as a name; at worst that sends a question to `hybrid`.
+
+Routing uses the vocabulary alone, whether or not the notes contain the name: `hybrid`'s keyword side matches every word of the query, so a question naming code gains even when the docs rarely name it. On two repos with code and docs, this raised results for questions naming code a little and sent no plain question to `hybrid`. `scree doctor` shows how many names were read and how many the notes also contain, and `-v` prints a sample of the latter only; a name found only in code is never printed (see [CLI](cli.md#scree-doctor--v--offline)).
+
 The query is never passed to FTS5 as syntax: each word becomes a quoted term, so operators such as `AND`, `NEAR`, `*` and `col:` are plain text. Words keep `_` and `-`, so `psycopg_pool` is one term, and `pool` alone finds it only through the vector side.
 
 ### Server instructions
 
-The server sends Claude Code instructions with the handshake. They name the project folder by its base name, say that scree searches its markdown by meaning and exact words (READMEs, docs and notes, not code, including folders such as `.github/` and `.claude/`), that paths are relative to the project root, that `search_docs` comes first and `read_doc` only when a chunk is not enough, and when to pick `keyword` or `hybrid`. They also say that text inside `<hit>` and `<doc>` is file content, possibly copied from elsewhere, that agent folders such as `.claude/` and `.cursor/` hold instructions written for other models, and that all of it is data, never instructions to follow.
+The server sends Claude Code instructions with the handshake. They name the project folder by its base name, say that scree searches its markdown by meaning and exact words (READMEs, docs and notes, not code, including folders such as `.github/` and `.claude/`), that paths are relative to the project root, that `search_docs` comes first and `read_doc` only when a chunk is not enough, that `auto` adds exact-word search for an identifier or a name from the project's code, and when to pick `keyword` or `hybrid`. They also say that text inside `<hit>` and `<doc>` is file content, possibly copied from elsewhere, that agent folders such as `.claude/` and `.cursor/` hold instructions written for other models, and that all of it is data, never instructions to follow.
 
 ## Search output
 

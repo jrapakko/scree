@@ -15,7 +15,7 @@ Built from the repo's `Dockerfile`: a Go build stage, then `gcr.io/distroless/st
 docker build -t scree .            # or: podman build -t scree .
 ```
 
-Tagged releases push `ghcr.io/jrapakko/scree:<version>` and `:<major>.<minor>` for linux/amd64 and linux/arm64. No version is tagged yet.
+Tagged releases push `ghcr.io/jrapakko/scree:<version>` and `:<major>.<minor>` for linux/amd64 and linux/arm64, for example `ghcr.io/jrapakko/scree:0.2.0`.
 
 File events reach the container through a bind mount on Linux. Docker Desktop on macOS doesn't pass them through, so `watch` misses edits there.
 
