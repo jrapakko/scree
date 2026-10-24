@@ -9,74 +9,116 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
-	"path"
-	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jrapakko/scree/internal/chunk"
 	"github.com/jrapakko/scree/internal/embed"
+	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
 )
 
-// Indexer embeds notes under Root into Store.
+// Indexer embeds the notes its Policy allows into Store.
 type Indexer struct {
-	Root     string
+	Policy   *policy.Policy
 	Store    *store.Store
 	Embedder embed.Embedder
-	Log      *log.Logger
+	// QueryEmbedder embeds search queries; nil means Embedder.
+	QueryEmbedder embed.Embedder
+	Log           *log.Logger
+	// MinBackoff is the first pause after the embedding API is unavailable;
+	// each further failure doubles it, up to MaxBackoff. 0 means 30 s.
+	MinBackoff time.Duration
+
+	mu         sync.Mutex
+	pauseUntil time.Time
+	backoff    time.Duration
 }
 
-// IsNote reports whether a relative path should be indexed.
-func IsNote(rel string) bool {
-	for _, part := range strings.Split(rel, "/") {
-		if strings.HasPrefix(part, ".") {
-			return false
+// MaxBackoff caps the pause after repeated API outages.
+const MaxBackoff = 5 * time.Minute
+
+// ErrPaused is returned instead of calling the API while indexing is paused
+// after an outage.
+var ErrPaused = fmt.Errorf("%w: paused after a recent failure", embed.ErrUnavailable)
+
+// PausedUntil returns when indexing may call the API again, or the zero time
+// if it is not paused.
+func (ix *Indexer) PausedUntil() time.Time {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	return ix.pauseUntil
+}
+
+// embed calls the API unless paused, and updates the pause from the result.
+func (ix *Indexer) embed(ctx context.Context, inputs []string) ([][]float32, error) {
+	ix.mu.Lock()
+	paused := time.Now().Before(ix.pauseUntil)
+	ix.mu.Unlock()
+	if paused {
+		return nil, ErrPaused
+	}
+	vecs, err := ix.Embedder.Embed(ctx, inputs)
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	switch {
+	case err == nil:
+		ix.backoff, ix.pauseUntil = 0, time.Time{}
+	case errors.Is(err, embed.ErrUnavailable):
+		if ix.backoff == 0 {
+			ix.backoff = ix.MinBackoff
+			if ix.backoff <= 0 {
+				ix.backoff = 30 * time.Second
+			}
+		} else {
+			ix.backoff *= 2
 		}
+		ix.backoff = min(ix.backoff, MaxBackoff)
+		ix.pauseUntil = time.Now().Add(ix.backoff)
 	}
-	ext := strings.ToLower(path.Ext(rel))
-	return ext == ".md" || ext == ".markdown"
+	return vecs, err
 }
 
-// Rel converts an absolute path under Root to the slash-separated form used
-// as a key in the store. It fails for paths outside Root.
-func (ix *Indexer) Rel(abs string) (string, error) {
-	rel, err := filepath.Rel(ix.Root, abs)
-	if err != nil {
-		return "", err
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", fmt.Errorf("%s is outside %s", abs, ix.Root)
-	}
-	return rel, nil
-}
+// Root returns the notes folder, with symlinks resolved.
+func (ix *Indexer) Root() string { return ix.Policy.Root() }
 
-// Abs resolves a store key to a file path, refusing anything that would
-// escape Root.
-func (ix *Indexer) Abs(rel string) (string, error) {
-	clean := path.Clean("/" + filepath.ToSlash(rel))[1:]
-	if clean == "" || clean != strings.TrimPrefix(filepath.ToSlash(rel), "./") {
-		return "", fmt.Errorf("invalid note path %q", rel)
-	}
-	return filepath.Join(ix.Root, filepath.FromSlash(clean)), nil
-}
+// Rel converts an absolute path under the notes folder to the
+// slash-separated form used as a key in the store. It fails for paths
+// outside the folder.
+func (ix *Indexer) Rel(abs string) (string, error) { return ix.Policy.Rel(abs) }
 
 // IndexFile embeds rel if its content changed since it was last indexed. It
-// removes rel from the index if the file no longer exists.
+// removes rel from the index if the file no longer exists. If the policy
+// refuses rel, any rows for it are removed and the *policy.IgnoredError is
+// returned, with changed reporting whether rows were removed.
 func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err error) {
-	abs, err := ix.Abs(rel)
-	if err != nil {
-		return false, err
+	clean, err := ix.Policy.Clean(rel)
+	if err == nil {
+		var src []byte
+		src, err = ix.Policy.Read(clean)
+		switch {
+		case err == nil:
+			return ix.indexSrc(ctx, clean, src)
+		case errors.Is(err, fs.ErrNotExist):
+			return ix.remove(ctx, clean)
+		}
 	}
-	src, err := os.ReadFile(abs)
-	if errors.Is(err, fs.ErrNotExist) {
-		return ix.remove(ctx, rel)
+	var ie *policy.IgnoredError
+	if errors.As(err, &ie) && ie.Reason != policy.Invalid {
+		removed, rerr := ix.remove(ctx, ie.Path)
+		if rerr != nil {
+			return removed, rerr
+		}
+		return removed, err
 	}
-	if err != nil {
-		return false, err
-	}
+	return false, err
+}
+
+// indexSrc stores src as the content of rel, embedding it only if its hash
+// changed.
+func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte) (bool, error) {
 	sum := sha256.Sum256(src)
 	hash := hex.EncodeToString(sum[:])
 	have, err := ix.Store.FileHash(ctx, rel)
@@ -94,14 +136,14 @@ func (ix *Indexer) IndexFile(ctx context.Context, rel string) (changed bool, err
 	}
 	var vecs [][]float32
 	if len(inputs) > 0 {
-		if vecs, err = ix.Embedder.Embed(ctx, inputs); err != nil {
-			return false, fmt.Errorf("%s: %w", rel, err)
+		if vecs, err = ix.embed(ctx, inputs); err != nil {
+			return false, fmt.Errorf("%q: %w", rel, err)
 		}
 	}
 	if err := ix.Store.ReplaceFile(ctx, rel, hash, time.Now().Unix(), chunks, vecs); err != nil {
-		return false, fmt.Errorf("%s: %w", rel, err)
+		return false, fmt.Errorf("%q: %w", rel, err)
 	}
-	ix.logf("indexed %s (%d chunks)", rel, len(chunks))
+	ix.logf("indexed %q (%d chunks)", rel, len(chunks))
 	return true, nil
 }
 
@@ -113,7 +155,7 @@ func (ix *Indexer) remove(ctx context.Context, rel string) (bool, error) {
 	if err := ix.Store.RemoveFile(ctx, rel); err != nil {
 		return false, err
 	}
-	ix.logf("removed %s", rel)
+	ix.logf("removed %q", rel)
 	return true, nil
 }
 
@@ -134,39 +176,46 @@ func (ix *Indexer) RemovePrefix(ctx context.Context, rel string) error {
 	return nil
 }
 
-// SyncStats reports what a Sync did.
+// SyncStats reports what a Sync did. Deferred counts files left for later
+// because the embedding API was unavailable; their old rows are kept.
 type SyncStats struct {
-	Scanned, Indexed, Removed, Failed int
+	Scanned, Indexed, Removed, Failed, Deferred int
 }
 
-// Sync indexes every new or changed note under Root and drops notes that no
-// longer exist. Files are processed one at a time. A failure on one file is
-// logged and does not stop the rest.
+// Sync indexes every new or changed note the policy allows and drops notes
+// that no longer exist or are now ignored. Files are processed one at a
+// time. A failure on one file is logged and does not stop the rest, and its
+// existing rows are kept. Sync fails if .screeignore cannot be read.
 func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
-	var st SyncStats
-	seen := map[string]bool{}
-	err := filepath.WalkDir(ix.Root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			ix.logf("walk: %v", err)
-			return nil
-		}
+	var (
+		st   SyncStats
+		seen = map[string]bool{}
+		keep []string // folders that could not be read: keep their rows
+	)
+	err := ix.Policy.Walk(ctx, func(rel string, src []byte, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if p == ix.Root {
-			return nil
-		}
-		if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
-			return filepath.SkipDir
-		}
-		rel, err := ix.Rel(p)
-		if err != nil || d.IsDir() || !d.Type().IsRegular() || !IsNote(rel) {
+		if errors.Is(err, policy.ErrIgnored) {
 			return nil
 		}
 		st.Scanned++
 		seen[rel] = true
-		changed, err := ix.IndexFile(ctx, rel)
+		if err != nil {
+			if strings.HasSuffix(rel, "/") {
+				keep = append(keep, rel)
+			}
+			st.Failed++
+			ix.logf("error: %v", err)
+			return nil
+		}
+		changed, err := ix.indexSrc(ctx, rel, src)
 		switch {
+		case errors.Is(err, embed.ErrUnavailable):
+			if st.Deferred == 0 {
+				ix.logf("error: %v; deferring notes until the API is back", err)
+			}
+			st.Deferred++
 		case err != nil:
 			st.Failed++
 			ix.logf("error: %v", err)
@@ -183,19 +232,28 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 		return st, err
 	}
 	for _, p := range paths {
-		if !seen[p] {
-			if _, err := ix.remove(ctx, p); err != nil {
-				return st, err
-			}
-			st.Removed++
+		if seen[p] || slices.ContainsFunc(keep, func(dir string) bool { return strings.HasPrefix(p, dir) }) {
+			continue
 		}
+		if _, err := ix.remove(ctx, p); err != nil {
+			return st, err
+		}
+		st.Removed++
 	}
 	return st, nil
 }
 
-// Search embeds query and returns the k nearest chunks.
+// Search embeds query and returns the k nearest chunks. An empty index
+// returns no hits without calling the API.
 func (ix *Indexer) Search(ctx context.Context, query string, k int) ([]store.Hit, error) {
-	vecs, err := ix.Embedder.Embed(ctx, []string{query})
+	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
+		return nil, nil
+	}
+	e := ix.QueryEmbedder
+	if e == nil {
+		e = ix.Embedder
+	}
+	vecs, err := e.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, err
 	}

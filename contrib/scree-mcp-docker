@@ -1,0 +1,56 @@
+#!/bin/sh
+# scree-mcp-docker: run `scree serve` in a container for Claude Code with
+# settings from the scree env file, so the API key never has to be stored in
+# Claude Code's config. The key reaches the container through the
+# environment, never the command line.
+#
+#   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp-docker
+#
+# SCREE_ENV_FILE     env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
+# SCREE_DOCKER       container CLI (default docker; podman works too)
+# SCREE_IMAGE        image (default scree:latest)
+# SCREE_DATA_VOLUME  index volume (default scree-data)
+set -eu
+
+env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
+# "." searches PATH for a name without a slash.
+case $env_file in */*) ;; *) env_file=./$env_file ;; esac
+
+if [ ! -f "$env_file" ]; then
+	echo "scree-mcp-docker: $env_file not found; create it with SCREE_NOTES and OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
+	exit 1
+fi
+# GNU stat first, then BSD/macOS stat.
+mode=$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file" 2>/dev/null || true)
+case $mode in
+'' | *[!0-7]*)
+	echo "scree-mcp-docker: cannot read the mode of $env_file" >&2
+	exit 1
+	;;
+esac
+if [ $((0$mode & 077)) -ne 0 ]; then
+	echo "scree-mcp-docker: $env_file is open to group or others (mode $mode); fix with: chmod 600 $env_file" >&2
+	exit 1
+fi
+
+set -a
+. "$env_file"
+set +a
+
+if [ -z "${SCREE_NOTES:-}" ]; then
+	echo "scree-mcp-docker: SCREE_NOTES is not set in $env_file" >&2
+	exit 1
+fi
+
+# Build the argument list back to front, keeping the caller's arguments last.
+set -- "${SCREE_IMAGE:-scree:latest}" serve "$@"
+set -- -v "$SCREE_NOTES:/notes:ro,z" -v "${SCREE_DATA_VOLUME:-scree-data}:/data" "$@"
+# Pass a variable only if it is set, so unset ones keep the image defaults.
+for v in SCREE_HTTP_TOKEN SCREE_EMBED_URL SCREE_MAX_FILE_BYTES SCREE_ZDR SCREE_DIMENSIONS SCREE_MODEL OPENROUTER_API_KEY; do
+	if eval "[ -n \"\${$v+x}\" ]"; then
+		set -- -e "$v" "$@"
+	fi
+done
+set -- run -i --rm "$@"
+
+exec "${SCREE_DOCKER:-docker}" "$@"

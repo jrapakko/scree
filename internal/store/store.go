@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"net/url"
 	"os"
@@ -41,8 +42,13 @@ CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
 
 // Store is an open index database.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
+	fi   os.FileInfo // the database file as opened, for CheckFile
 }
+
+// ErrIndexGone means the index file was deleted or replaced while open.
+var ErrIndexGone = errors.New("index file was removed or replaced")
 
 // Chunk is a stored piece of a note.
 type Chunk struct {
@@ -59,10 +65,15 @@ type Hit struct {
 	Distance float64
 }
 
-// Open opens or creates the index at path.
+// Open opens or creates the index at path. A missing parent folder is
+// created with mode 0700; an existing one is left alone. The database and
+// its -wal and -shm files are made 0600.
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("store: %w", err)
+		}
 	}
 	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() +
 		"?_pragma=journal_mode(wal)&_pragma=busy_timeout(10000)&_pragma=synchronous(normal)"
@@ -72,12 +83,32 @@ func Open(path string) (*Store, error) {
 	}
 	// Each connection is a separate SQLite instance; one keeps memory flat.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, path: path}
 	if err := s.init(); err != nil {
 		db.Close()
 		return nil, err
 	}
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			db.Close()
+			return nil, fmt.Errorf("store: %w", err)
+		}
+	}
+	if s.fi, err = os.Stat(path); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: %w", err)
+	}
 	return s, nil
+}
+
+// CheckFile returns ErrIndexGone if the file at the index path is no longer
+// the one that was opened.
+func (s *Store) CheckFile() error {
+	fi, err := os.Stat(s.path)
+	if err != nil || !os.SameFile(fi, s.fi) {
+		return fmt.Errorf("%w: %s", ErrIndexGone, s.path)
+	}
+	return nil
 }
 
 func (s *Store) init() error {
@@ -262,6 +293,13 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		`SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM chunks), vec1_info()`).
 		Scan(&st.Files, &st.Chunks, &st.Vec1Info)
 	return st, err
+}
+
+// ChunkCount returns the number of chunks in the index.
+func (s *Store) ChunkCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM chunks`).Scan(&n)
+	return n, err
 }
 
 // Reset deletes everything, including the recorded model.

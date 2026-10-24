@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -91,5 +92,68 @@ func TestCheckModelAndReset(t *testing.T) {
 	// A different dimension works after reset.
 	if err := s.ReplaceFile(ctx, "a.md", "h", 1, []Chunk{{Text: "x"}}, [][]float32{{1, 2, 3}}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFilePermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	path := filepath.Join(dir, "index.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	err = s.ReplaceFile(context.Background(), "a.md", "h", 1, []Chunk{{Text: "x"}}, [][]float32{{1, 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("dir mode = %v, %v", fi.Mode().Perm(), err)
+	}
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("%s: %v", p, err)
+			continue
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode = %v", filepath.Base(p), fi.Mode().Perm())
+		}
+	}
+}
+
+func TestOpenLeavesExistingDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(dir, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o755 {
+		t.Errorf("existing dir mode changed to %v", fi.Mode().Perm())
+	}
+}
+
+func TestCheckFile(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "index.db")
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CheckFile(); err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(path)
+		if replace {
+			os.WriteFile(path, nil, 0o600)
+		}
+		if err := s.CheckFile(); !errors.Is(err, ErrIndexGone) {
+			t.Errorf("replace=%v: CheckFile = %v", replace, err)
+		}
+		s.Close()
 	}
 }

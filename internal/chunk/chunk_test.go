@@ -3,6 +3,7 @@ package chunk
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSplitHeadingTrail(t *testing.T) {
@@ -110,5 +111,99 @@ func TestAtxHeading(t *testing.T) {
 		if l != c.level || txt != c.text || ok != c.ok {
 			t.Errorf("atxHeading(%q) = %d %q %v", c.in, l, txt, ok)
 		}
+	}
+}
+
+func checkCap(t *testing.T, got []Chunk) {
+	t.Helper()
+	for i, c := range got {
+		if len(c.Text) > MaxChars {
+			t.Fatalf("chunk %d is %d bytes, over MaxChars", i, len(c.Text))
+		}
+	}
+}
+
+func TestSplitHardCapSingleLine(t *testing.T) {
+	line := strings.Repeat("abcdefghij", 500_000) // 5 MB, no blank lines
+	got := Split("# Big\n" + line)
+	checkCap(t, got)
+	// The heading-only chunk is dropped, so every chunk is a piece.
+	var b strings.Builder
+	for _, c := range got {
+		b.WriteString(c.Text)
+	}
+	if b.String() != line {
+		t.Fatalf("pieces do not restore the line (%d chunks)", len(got))
+	}
+	for _, c := range got {
+		if c.Line != 2 || c.Heading != "Big" {
+			t.Fatalf("piece has line %d heading %q, want 2 Big", c.Line, c.Heading)
+		}
+	}
+}
+
+func TestSplitHardCapUnclosedFence(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("# Code\n```\n")
+	for i := 0; i < 10_000; i++ {
+		b.WriteString("x := 1\n\n")
+	}
+	got := Split(b.String())
+	if len(got) < 10 {
+		t.Fatalf("unclosed fence not split: %d chunks", len(got))
+	}
+	checkCap(t, got)
+	for i := 1; i < len(got); i++ {
+		if got[i].Line <= got[i-1].Line {
+			t.Fatalf("line numbers not increasing at chunk %d: %d, %d", i, got[i-1].Line, got[i].Line)
+		}
+	}
+}
+
+func TestSplitRuneSafe(t *testing.T) {
+	line := strings.Repeat("€", 3000) // 3 bytes each; MaxChars is not a multiple of 3
+	got := Split(line + "\n\n" + strings.Repeat("語 ", 1500))
+	checkCap(t, got)
+	var b strings.Builder
+	for _, c := range got {
+		if !utf8.ValidString(c.Text) {
+			t.Fatalf("chunk at line %d is not valid UTF-8", c.Line)
+		}
+		if c.Line == 1 {
+			b.WriteString(c.Text)
+		}
+	}
+	if b.String() != line {
+		t.Fatal("pieces of the first line do not restore it")
+	}
+}
+
+func TestSplitTargetChars(t *testing.T) {
+	para := strings.Repeat("word ", 80) // 400 chars
+	src := strings.Repeat(para+"\n\n", 8)
+	got := Split(src)
+	if len(got) != 2 {
+		t.Fatalf("got %d chunks, want 2", len(got))
+	}
+	checkCap(t, got)
+}
+
+func TestSplitHeadingCapped(t *testing.T) {
+	long := strings.Repeat("é", 100) // 200 bytes
+	got := Split("# " + long + "\n## " + strings.Repeat("h", 300) + "\nbody\n")
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	parts := strings.Split(got[0].Heading, " > ")
+	if len(parts) != 2 {
+		t.Fatalf("heading = %q", got[0].Heading)
+	}
+	for _, p := range parts {
+		if !strings.HasSuffix(p, "…") || len(p) > MaxHeadingChars+len("…") || !utf8.ValidString(p) {
+			t.Errorf("heading part %q (%d bytes) not capped on a rune boundary", p, len(p))
+		}
+	}
+	if _, text, _ := atxHeading("# short"); text != "short" {
+		t.Errorf("short heading changed: %q", text)
 	}
 }

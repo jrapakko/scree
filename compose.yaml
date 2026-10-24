@@ -1,0 +1,43 @@
+# Keeps the index current. Claude Code talks to `scree serve`, which runs
+# per session with `docker compose run` (see README).
+#
+#   SCREE_NOTES_DIR=$HOME/notes docker compose up -d
+#
+# OPENROUTER_API_KEY is read from the environment or from .env next to this file.
+services:
+  watch:
+    build: .
+    image: scree:latest
+    command: ["watch"]
+    restart: unless-stopped
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}
+      SCREE_MODEL: ${SCREE_MODEL:-openai/text-embedding-3-small}
+      SCREE_DIMENSIONS: ${SCREE_DIMENSIONS:-512}
+      SCREE_MAX_FILE_BYTES: ${SCREE_MAX_FILE_BYTES:-1048576}
+      SCREE_ZDR: ${SCREE_ZDR:-1}
+      SCREE_EMBED_URL: ${SCREE_EMBED_URL:-https://openrouter.ai/api/v1/embeddings}
+    volumes:
+      # z relabels for SELinux (Fedora, RHEL); it is ignored elsewhere.
+      - ${SCREE_NOTES_DIR:?set SCREE_NOTES_DIR}:/notes:ro,z
+      - scree-data:/data
+
+  serve:
+    image: scree:latest
+    command: ["serve"]
+    profiles: ["mcp"]
+    stdin_open: true
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}
+      SCREE_MODEL: ${SCREE_MODEL:-openai/text-embedding-3-small}
+      SCREE_DIMENSIONS: ${SCREE_DIMENSIONS:-512}
+      SCREE_MAX_FILE_BYTES: ${SCREE_MAX_FILE_BYTES:-1048576}
+      SCREE_ZDR: ${SCREE_ZDR:-1}
+      SCREE_EMBED_URL: ${SCREE_EMBED_URL:-https://openrouter.ai/api/v1/embeddings}
+      SCREE_HTTP_TOKEN: ${SCREE_HTTP_TOKEN:-}
+    volumes:
+      - ${SCREE_NOTES_DIR:?set SCREE_NOTES_DIR}:/notes:ro,z
+      - scree-data:/data
+
+volumes:
+  scree-data:

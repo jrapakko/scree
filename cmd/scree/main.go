@@ -9,17 +9,23 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jrapakko/scree/internal/embed"
 	"github.com/jrapakko/scree/internal/index"
 	"github.com/jrapakko/scree/internal/mcpserver"
+	"github.com/jrapakko/scree/internal/policy"
 	"github.com/jrapakko/scree/internal/store"
+	"github.com/jrapakko/scree/internal/textsafe"
 	"github.com/jrapakko/scree/internal/watch"
 )
 
@@ -29,10 +35,13 @@ const usage = `scree: semantic search over markdown notes
 
 Usage:
   scree watch              index changed notes, then keep the index current
-  scree serve [-http addr] run the MCP server (stdio unless -http is given)
+  scree serve [-http addr [-allow-remote]]
+                           run the MCP server (stdio unless -http is given;
+                           -http is loopback only unless -allow-remote)
   scree search [-k n] "query"
   scree reindex [-all] [path]
-  scree doctor             check configuration and the index
+  scree doctor [-v] [-offline]
+                           check configuration, the index and ignore rules
 
 Every command takes -notes and -db. Environment:
   SCREE_NOTES         notes folder (required unless -notes is given)
@@ -40,16 +49,25 @@ Every command takes -notes and -db. Environment:
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
   SCREE_EMBED_URL     embeddings endpoint (default OpenRouter)
+  SCREE_MAX_FILE_BYTES  largest note to index, in bytes (default 1048576)
+  SCREE_ZDR           1 asks OpenRouter for zero-data-retention endpoints
+                      only; 0 for other endpoints (default 1)
   OPENROUTER_API_KEY  API key for the endpoint
+  SCREE_HTTP_TOKEN    bearer token for serve -http; required with
+                      -allow-remote, enforced on loopback when set
 `
 
 type config struct {
 	notes, db, model, url, apiKey string
 	dims                          int
+	maxBytes                      int64
+	zdr                           bool
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+	// Log lines can carry note paths and API messages; keep them terminal-safe.
+	log.SetOutput(textsafe.Writer(os.Stderr))
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -79,7 +97,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(os.Stderr, "scree:", err)
+		fmt.Fprintln(os.Stderr, "scree:", textsafe.Strip(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -116,11 +134,44 @@ func defaultDB() string {
 	return filepath.Join(base, "scree", "index.db")
 }
 
+// maxFileBytes reads SCREE_MAX_FILE_BYTES.
+func maxFileBytes() (int64, error) {
+	v := os.Getenv("SCREE_MAX_FILE_BYTES")
+	if v == "" {
+		return policy.DefaultMaxBytes, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("SCREE_MAX_FILE_BYTES=%q: want a positive number of bytes", v)
+	}
+	return n, nil
+}
+
+// zdrSetting reads SCREE_ZDR.
+func zdrSetting() (bool, error) {
+	v := os.Getenv("SCREE_ZDR")
+	if v == "" {
+		return true, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("SCREE_ZDR=%q: want 1 or 0", v)
+	}
+	return b, nil
+}
+
 // open builds an indexer from cfg. checkModel guards against mixing vectors
-// from different models.
+// from different models. Release it with closeIndexer.
 func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if cfg.notes == "" {
 		return nil, errors.New("no notes folder: set SCREE_NOTES or pass -notes")
+	}
+	var err error
+	if cfg.maxBytes, err = maxFileBytes(); err != nil {
+		return nil, err
+	}
+	if cfg.zdr, err = zdrSetting(); err != nil {
+		return nil, err
 	}
 	root, err := filepath.Abs(cfg.notes)
 	if err != nil {
@@ -129,18 +180,33 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
 		return nil, fmt.Errorf("notes folder %s is not a directory", root)
 	}
-	s, err := store.Open(cfg.db)
+	p, err := policy.Open(root, cfg.maxBytes)
 	if err != nil {
 		return nil, err
 	}
+	s, err := store.Open(cfg.db)
+	if err != nil {
+		p.Close()
+		return nil, err
+	}
 	e := embed.New(cfg.url, cfg.apiKey, cfg.model, cfg.dims)
+	e.ZDR = cfg.zdr
+	// Queries fail fast: someone is waiting on the answer.
+	q := *e
+	q.Timeout, q.MaxAttempts = 10*time.Second, 2
 	if checkModel {
 		if err := s.CheckModel(e.Model()); err != nil {
 			s.Close()
+			p.Close()
 			return nil, err
 		}
 	}
-	return &index.Indexer{Root: root, Store: s, Embedder: e, Log: log.Default()}, nil
+	return &index.Indexer{Policy: p, Store: s, Embedder: e, QueryEmbedder: &q, Log: log.Default()}, nil
+}
+
+func closeIndexer(ix *index.Indexer) {
+	ix.Store.Close()
+	ix.Policy.Close()
 }
 
 func runWatch(ctx context.Context, args []string) error {
@@ -150,14 +216,15 @@ func runWatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer ix.Store.Close()
-	log.Printf("syncing %s", ix.Root)
+	defer closeIndexer(ix)
+	log.Printf("syncing %s", ix.Root())
 	st, err := ix.Sync(ctx)
 	if err != nil {
 		return err
 	}
-	log.Printf("sync done: %d notes, %d indexed, %d removed, %d failed", st.Scanned, st.Indexed, st.Removed, st.Failed)
-	log.Printf("watching %s", ix.Root)
+	log.Printf("sync done: %d notes, %d indexed, %d removed, %d failed, %d deferred",
+		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
+	log.Printf("watching %s", ix.Root())
 	return watch.Run(ctx, ix)
 }
 
@@ -165,25 +232,35 @@ func runServe(ctx context.Context, args []string) error {
 	var cfg config
 	fs := flags("serve", &cfg)
 	addr := fs.String("http", "", "serve streamable HTTP on this address instead of stdio, e.g. 127.0.0.1:7077")
+	allowRemote := fs.Bool("allow-remote", false, "allow -http on a non-loopback address (needs SCREE_HTTP_TOKEN)")
 	fs.Parse(args)
 	// stdout belongs to the MCP protocol.
-	log.SetOutput(os.Stderr)
+	log.SetOutput(textsafe.Writer(os.Stderr))
+	token := os.Getenv("SCREE_HTTP_TOKEN")
+	if *addr != "" {
+		if err := mcpserver.CheckListenAddr(*addr, *allowRemote, token); err != nil {
+			return err
+		}
+	}
 	ix, err := open(&cfg, true)
 	if err != nil {
 		return err
 	}
-	defer ix.Store.Close()
+	defer closeIndexer(ix)
 	srv := mcpserver.New(ix, version)
 	if *addr == "" {
 		return srv.Run(ctx, &mcp.StdioTransport{})
 	}
-	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
-	hs := &http.Server{Addr: *addr, Handler: h}
+	hs := mcpserver.NewHTTPServer(*addr, mcpserver.HTTPHandler(srv, token))
 	go func() {
 		<-ctx.Done()
 		hs.Close()
 	}()
-	log.Printf("serving MCP on http://%s", *addr)
+	auth := "no token"
+	if token != "" {
+		auth = "bearer token required"
+	}
+	log.Printf("serving MCP on http://%s (%s)", *addr, auth)
 	if err := hs.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -202,7 +279,7 @@ func runSearch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer ix.Store.Close()
+	defer closeIndexer(ix)
 	hits, err := ix.Search(ctx, fs.Arg(0), *k)
 	if err != nil {
 		return err
@@ -220,7 +297,7 @@ func runReindex(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer ix.Store.Close()
+	defer closeIndexer(ix)
 	if *all {
 		if err := ix.Store.Reset(ctx); err != nil {
 			return err
@@ -230,16 +307,38 @@ func runReindex(ctx context.Context, args []string) error {
 		}
 	}
 	if fs.NArg() == 1 {
-		_, err := ix.IndexFile(ctx, fs.Arg(0))
-		return err
+		return reindexOne(ctx, ix, fs.Arg(0))
 	}
 	st, err := ix.Sync(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%d notes: %d indexed, %d removed, %d failed\n", st.Scanned, st.Indexed, st.Removed, st.Failed)
-	if st.Failed > 0 {
-		return fmt.Errorf("%d notes failed to index", st.Failed)
+	fmt.Printf("%d notes: %d indexed, %d removed, %d failed, %d deferred\n",
+		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
+	if st.Failed+st.Deferred > 0 {
+		return fmt.Errorf("%d notes failed and %d were deferred; run reindex again", st.Failed, st.Deferred)
+	}
+	return nil
+}
+
+// reindexOne indexes one note, given relative to the notes folder or as an
+// absolute path under it. A refusal is an error.
+func reindexOne(ctx context.Context, ix *index.Indexer, arg string) error {
+	rel := filepath.ToSlash(arg)
+	if filepath.IsAbs(arg) {
+		var err error
+		if rel, err = ix.Rel(arg); err != nil {
+			return err
+		}
+	}
+	changed, err := ix.IndexFile(ctx, rel)
+	if err != nil {
+		return err
+	}
+	if changed {
+		fmt.Printf("re-indexed %q\n", rel)
+	} else {
+		fmt.Printf("%q is already up to date\n", rel)
 	}
 	return nil
 }
@@ -248,6 +347,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	var cfg config
 	fs := flags("doctor", &cfg)
 	offline := fs.Bool("offline", false, "skip the test call to the embeddings API")
+	verbose := fs.Bool("v", false, "list every ignored or unreadable path")
 	fs.Parse(args)
 
 	ok := true
@@ -258,14 +358,18 @@ func runDoctor(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("%s %s\n", mark, fmt.Sprintf(format, a...))
 	}
+	warn := func(format string, a ...any) {
+		fmt.Printf("warn %s\n", fmt.Sprintf(format, a...))
+	}
 
 	ix, err := open(&cfg, false)
 	if err != nil {
 		report(false, "%v", err)
 		return errors.New("doctor found problems")
 	}
-	defer ix.Store.Close()
-	report(true, "notes folder %s", ix.Root)
+	defer closeIndexer(ix)
+	report(true, "notes folder %s", ix.Root())
+	doctorScan(ctx, ix, *verbose, report, warn)
 
 	st, err := ix.Store.Stats(ctx)
 	report(err == nil, "index %s: %d notes, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
@@ -282,11 +386,22 @@ func runDoctor(ctx context.Context, args []string) error {
 	}
 
 	report(cfg.apiKey != "", "OPENROUTER_API_KEY %s", map[bool]string{true: "set", false: "not set"}[cfg.apiKey != ""])
+	if cfg.zdr {
+		report(true, "zero data retention requested (provider.zdr=true, data_collection=deny)")
+		if u, err := url.Parse(cfg.url); err != nil || u.Hostname() != "openrouter.ai" {
+			warn("SCREE_EMBED_URL is not OpenRouter; set SCREE_ZDR=0 if it rejects the provider field")
+		}
+	} else {
+		warn("zero data retention off (SCREE_ZDR=0)")
+	}
 	if !*offline && cfg.apiKey != "" {
 		vecs, err := ix.Embedder.Embed(ctx, []string{"scree doctor"})
-		if err != nil {
+		switch {
+		case errors.Is(err, embed.ErrNoZDREndpoint):
+			report(false, "%v", err)
+		case err != nil:
 			report(false, "embeddings API: %v", err)
-		} else {
+		default:
 			report(true, "embeddings API returned %d dimensions", len(vecs[0]))
 		}
 	}
@@ -294,4 +409,41 @@ func runDoctor(ctx context.Context, args []string) error {
 		return errors.New("doctor found problems")
 	}
 	return nil
+}
+
+// doctorScan reports what the ignore layers do to the notes folder.
+func doctorScan(ctx context.Context, ix *index.Indexer, verbose bool, report func(bool, string, ...any), warn func(string, ...any)) {
+	sum, err := ix.Policy.Scan(ctx)
+	if err != nil {
+		report(false, "notes: %v (nothing will be indexed)", err)
+		return
+	}
+	n := func(r policy.Reason) int { return len(sum.Ignored[r]) }
+	report(true, "notes: %d indexable", sum.Allowed)
+	report(true, "built-in: %d hidden, %d not markdown, %d outside notes folder, %d too large, %d unsafe name",
+		n(policy.Hidden), n(policy.NotMarkdown), n(policy.OutsideRoot), n(policy.TooLarge), n(policy.UnsafeName))
+	report(true, "%s: %d", policy.IgnoreFile.Layer(), n(policy.IgnoreFile))
+	report(true, "%s: %d", policy.FrontMatter.Layer(), n(policy.FrontMatter))
+	for _, e := range sum.IgnoreErrors {
+		report(false, "%s %s", policy.IgnoreFileName, e)
+	}
+	if len(sum.ReadErrors) > 0 {
+		warn("unreadable: %d (doctor -v lists them)", len(sum.ReadErrors))
+	}
+	if !verbose {
+		return
+	}
+	reasons := make([]policy.Reason, 0, len(sum.Ignored))
+	for r := range sum.Ignored {
+		reasons = append(reasons, r)
+	}
+	slices.Sort(reasons)
+	for _, r := range reasons {
+		for _, p := range sum.Ignored[r] {
+			fmt.Printf("  ignored (%s): %s\n", r, strconv.Quote(p))
+		}
+	}
+	for _, e := range sum.ReadErrors {
+		fmt.Printf("  unreadable: %s\n", e)
+	}
 }

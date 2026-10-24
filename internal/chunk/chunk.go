@@ -3,11 +3,21 @@ package chunk
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
-// MaxChars is the soft upper bound on a chunk's text. Sections longer than
-// this are split at blank lines.
-const MaxChars = 2000
+const (
+	// TargetChars is the size at which a chunk is closed at the next blank
+	// line outside a code fence.
+	TargetChars = 2500
+	// MaxChars is the hard upper bound on a chunk's text in bytes. A chunk is
+	// closed before a line that would push it over, even inside a code fence,
+	// and longer lines are cut into pieces.
+	MaxChars = 3500
+	// MaxHeadingChars caps each heading's text in bytes, so the heading trail
+	// stays short. Longer headings are cut and end in "…".
+	MaxHeadingChars = 120
+)
 
 // Chunk is one piece of a note.
 type Chunk struct {
@@ -92,21 +102,53 @@ func splitSection(s section) []Chunk {
 	// Paragraph boundaries inside fences are not split points.
 	fence := ""
 	for i, ln := range s.lines {
+		lineNo := s.line + i
 		if fence != "" {
 			if isFenceClose(ln, fence) {
 				fence = ""
 			}
 		} else if f := fenceOpen(ln); f != "" {
 			fence = f
-		} else if strings.TrimSpace(ln) == "" && size >= MaxChars {
-			flush(s.line + i + 1)
+		} else if strings.TrimSpace(ln) == "" && size >= TargetChars {
+			flush(lineNo + 1)
 			continue
+		}
+		if len(ln) > MaxChars {
+			// Cut an overlong line into pieces of its own; the last piece
+			// starts the next chunk.
+			if size > 0 {
+				flush(lineNo)
+			}
+			for len(ln) > MaxChars {
+				cut := runeCut(ln, MaxChars)
+				if piece := ln[:cut]; strings.TrimSpace(piece) != "" {
+					out = append(out, Chunk{Heading: s.heading, Line: lineNo, Text: piece})
+				}
+				ln = ln[cut:]
+			}
+			first = lineNo
+		}
+		if size > 0 && size+len(ln)+1 > MaxChars {
+			flush(lineNo)
 		}
 		buf = append(buf, ln)
 		size += len(ln) + 1
 	}
 	flush(0)
 	return out
+}
+
+// runeCut returns the largest index <= n that starts a rune in s, so s[:cut]
+// does not end mid-rune. It falls back to n for input with no rune starts.
+func runeCut(s string, n int) int {
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	if cut == 0 {
+		return n
+	}
+	return cut
 }
 
 func isOnlyHeading(text string) bool {
@@ -147,6 +189,9 @@ func atxHeading(ln string) (level int, text string, ok bool) {
 	rest = strings.TrimSpace(rest)
 	if trimmed := strings.TrimRight(rest, "#"); trimmed != rest && (trimmed == "" || strings.HasSuffix(trimmed, " ")) {
 		rest = strings.TrimSpace(trimmed)
+	}
+	if len(rest) > MaxHeadingChars {
+		rest = rest[:runeCut(rest, MaxHeadingChars)] + "…"
 	}
 	return level, rest, true
 }

@@ -1,0 +1,206 @@
+package ignore
+
+import (
+	"strings"
+	"testing"
+)
+
+type check struct {
+	path  string
+	isDir bool
+	want  bool
+}
+
+func TestMatch(t *testing.T) {
+	cases := []struct {
+		name   string
+		file   string
+		checks []check
+	}{
+		{
+			name: "spec example",
+			file: "# journal stays local\njournal/\n**/private-*.md\n/inbox/scratch.md\n!journal/public.md\n",
+			checks: []check{
+				{"journal/x.md", false, true},
+				{"journal/public.md", false, false},
+				{"a/b/private-x.md", false, true},
+				{"private-y.md", false, true},
+				{"inbox/scratch.md", false, true},
+				{"x/inbox/scratch.md", false, false},
+				{"notes.md", false, false},
+			},
+		},
+		{
+			name: "comments and blank lines skipped",
+			file: "# a.md\n\n   \n#b.md\r\n",
+			checks: []check{
+				{"a.md", false, false},
+				{"b.md", false, false},
+				{"# a.md", false, false},
+			},
+		},
+		{
+			name: "escaped hash is literal",
+			file: `\#lit.md`,
+			checks: []check{
+				{"#lit.md", false, true},
+				{"lit.md", false, false},
+			},
+		},
+		{
+			name: "escaped bang is literal",
+			file: `\!bang.md`,
+			checks: []check{
+				{"!bang.md", false, true},
+				{"bang.md", false, false},
+			},
+		},
+		{
+			name: "trailing spaces trimmed",
+			file: "a.md   \r\nb.md\\ \n",
+			checks: []check{
+				{"a.md", false, true},
+				{"b.md ", false, true},
+				{"b.md", false, false},
+			},
+		},
+		{
+			name: "trailing slash matches folders only",
+			file: "journal/",
+			checks: []check{
+				{"journal", false, false},
+				{"journal", true, true},
+				{"journal/x.md", false, true},
+				{"a/journal/x.md", false, true},
+			},
+		},
+		{
+			name: "basename pattern matches at any depth",
+			file: "*.md",
+			checks: []check{
+				{"a.md", false, true},
+				{"x/y/a.md", false, true},
+				{"a.txt", false, false},
+			},
+		},
+		{
+			name: "pattern with slash is anchored and star stays in segment",
+			file: "a/*.md",
+			checks: []check{
+				{"a/b.md", false, true},
+				{"x/a/b.md", false, false},
+				{"a/b/c.md", false, false},
+			},
+		},
+		{
+			name: "double star",
+			file: "journal/**\n**/deep/*.md\na/**/z.md",
+			checks: []check{
+				{"journal/x.md", false, true},
+				{"journal/a/b/x.md", false, true},
+				{"journalx.md", false, false},
+				{"deep/a.md", false, true},
+				{"p/q/deep/a.md", false, true},
+				{"a/z.md", false, true},
+				{"a/b/c/z.md", false, true},
+				{"b/z.md", false, false},
+			},
+		},
+		{
+			name: "negated class",
+			file: "[!a]x.md",
+			checks: []check{
+				{"bx.md", false, true},
+				{"ax.md", false, false},
+				{"sub/cx.md", false, true},
+			},
+		},
+		{
+			name: "last match wins",
+			file: "!x.md\nx.md",
+			checks: []check{
+				{"x.md", false, true},
+			},
+		},
+		{
+			name: "negation after ignore re-includes",
+			file: "*.md\n!keep.md",
+			checks: []check{
+				{"x.md", false, true},
+				{"keep.md", false, false},
+				{"a/keep.md", false, false},
+			},
+		},
+		{
+			name: "case sensitive",
+			file: "Secret.md",
+			checks: []check{
+				{"Secret.md", false, true},
+				{"secret.md", false, false},
+			},
+		},
+		{
+			name: "crlf line endings",
+			file: "a.md\r\nb/\r\n",
+			checks: []check{
+				{"a.md", false, true},
+				{"b/x.md", false, true},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := Parse([]byte(c.file))
+			if errs := m.Errors(); len(errs) > 0 {
+				t.Fatalf("unexpected errors: %v", errs)
+			}
+			for _, ch := range c.checks {
+				if got := m.Match(ch.path, ch.isDir); got != ch.want {
+					t.Errorf("Match(%q, %v) = %v, want %v", ch.path, ch.isDir, got, ch.want)
+				}
+			}
+		})
+	}
+}
+
+func TestBadPattern(t *testing.T) {
+	m := Parse([]byte("ok.md\n[\n!\n"))
+	errs := m.Errors()
+	if len(errs) != 2 || !strings.HasPrefix(errs[0], "line 2: bad pattern") || !strings.HasPrefix(errs[1], "line 3:") {
+		t.Fatalf("Errors() = %q", errs)
+	}
+	for _, p := range []string{"[", "[.md", "a/["} {
+		if m.Match(p, false) {
+			t.Errorf("bad pattern matched %q", p)
+		}
+	}
+	if !m.Match("ok.md", false) {
+		t.Error("good pattern next to a bad one stopped matching")
+	}
+}
+
+func TestEmpty(t *testing.T) {
+	var nilM *Matcher
+	for _, m := range []*Matcher{Parse(nil), nilM} {
+		if m.Match("a.md", false) || m.Prunable("a") || len(m.Errors()) != 0 {
+			t.Error("empty matcher ignored something")
+		}
+	}
+}
+
+func TestPrunable(t *testing.T) {
+	m := Parse([]byte("journal/\n"))
+	if !m.Prunable("journal") {
+		t.Error("journal not prunable")
+	}
+	if m.Prunable("other") {
+		t.Error("other prunable")
+	}
+	m = Parse([]byte("journal/\n!elsewhere/keep.md\n"))
+	if m.Prunable("journal") {
+		t.Error("prunable despite a negation rule")
+	}
+	if !m.Match("journal", true) {
+		t.Error("journal no longer matched")
+	}
+}
