@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -189,7 +190,7 @@ func (c *Client) post(ctx context.Context, body []byte, n int) (vecs [][]float32
 		return nil, false, fmt.Errorf("embed: decoding response: %w", err)
 	}
 	if r.Error != nil {
-		return nil, false, fmt.Errorf("embed: %s", truncate([]byte(r.Error.Message), 300))
+		return nil, false, fmt.Errorf("embed: %s", truncate([]byte(c.scrub(r.Error.Message)), 300))
 	}
 	if len(r.Data) != n {
 		return nil, false, fmt.Errorf("embed: got %d embeddings for %d inputs", len(r.Data), n)
@@ -210,7 +211,7 @@ func retryable(status int) bool {
 
 // statusErr builds the error for a non-200 response.
 func (c *Client) statusErr(resp *http.Response, raw []byte) error {
-	msg := apiMessage(raw)
+	msg := c.apiMessage(raw)
 	if c.noEndpoint(resp.StatusCode, msg) {
 		hint := "choose another model or set SCREE_ZDR=0"
 		what := "meets zero data retention"
@@ -245,22 +246,47 @@ func (e *noEndpointError) Error() string { return e.msg }
 func (e *noEndpointError) Unwrap() error { return ErrNoZDREndpoint }
 
 // apiMessage returns error.message from a JSON error body, or the raw body,
-// cut to 300 bytes.
-func apiMessage(raw []byte) string {
+// with the key scrubbed and then cut to 300 bytes. Scrubbing first means a
+// cut can't leave part of the key behind.
+func (c *Client) apiMessage(raw []byte) string {
 	var r response
 	if json.Unmarshal(raw, &r) == nil && r.Error != nil && r.Error.Message != "" {
 		raw = []byte(r.Error.Message)
 	}
-	return truncate(bytes.TrimSpace(raw), 300)
+	return truncate([]byte(c.scrub(string(bytes.TrimSpace(raw)))), 300)
 }
 
-// redact replaces the API key in err's message, keeping err's chain for
+// scrub removes the API key from s. Invisible format characters (such as
+// U+200B) are dropped first so they can't split the key, and the key's last
+// 12 characters are removed on their own too, in case only part of it
+// survives.
+func (c *Client) scrub(s string) string {
+	if len(c.APIKey) < 8 {
+		return s
+	}
+	s = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.ReplaceAll(s, c.APIKey, "[redacted]")
+	if len(c.APIKey) >= 24 {
+		s = strings.ReplaceAll(s, c.APIKey[len(c.APIKey)-12:], "[redacted]")
+	}
+	return s
+}
+
+// redact scrubs the API key from err's message, keeping err's chain for
 // errors.Is.
 func (c *Client) redact(err error) error {
-	if err == nil || len(c.APIKey) < 8 || !strings.Contains(err.Error(), c.APIKey) {
+	if err == nil {
 		return err
 	}
-	return &redactedError{strings.ReplaceAll(err.Error(), c.APIKey, "[redacted]"), err}
+	if msg := c.scrub(err.Error()); msg != err.Error() {
+		return &redactedError{msg, err}
+	}
+	return err
 }
 
 type redactedError struct {

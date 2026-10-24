@@ -59,6 +59,8 @@ func (e env) run(t *testing.T, script string, args ...string) (string, []string,
 		t.Fatal(err)
 	}
 	cmd := exec.Command(path, args...)
+	// Run from the temp dir, which tests may fill with planted commands.
+	cmd.Dir = e.dir
 	cmd.Env = []string{
 		"PATH=/usr/bin:/bin",
 		"HOME=" + e.dir,
@@ -80,7 +82,7 @@ func (e env) run(t *testing.T, script string, args ...string) (string, []string,
 
 const envFile = "# scree settings\nSCREE_NOTES=/home/u/notes\nOPENROUTER_API_KEY=" + secret + "\nSCREE_MODEL=openai/text-embedding-3-small\n"
 
-var scripts = []string{"scree-mcp", "scree-mcp-docker"}
+var scripts = []string{"scree-mcp", "scree-mcp-docker", "scree-run"}
 
 func TestScriptsExecutable(t *testing.T) {
 	for _, s := range scripts {
@@ -167,5 +169,91 @@ func TestScreeMCPDockerNeedsNotes(t *testing.T) {
 	out, lines, err := e.run(t, "scree-mcp-docker")
 	if err == nil || lines != nil || !strings.Contains(out, "SCREE_NOTES is not set") {
 		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
+	}
+}
+
+// The env file is read as data. A value with spaces, $(...) or backquotes
+// must never run anything, even when the cwd holds a matching executable.
+func TestEnvFileIsData(t *testing.T) {
+	notes := "/Users/u/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault"
+	content := "SCREE_NOTES=" + notes + "\n" +
+		"OPENROUTER_API_KEY=" + secret + "\n" +
+		"SCREE_MODEL=$(touch pwned-subst)`touch pwned-tick`\n"
+	for _, s := range scripts {
+		e := setup(t, content, 0o600)
+		planted := filepath.Join(e.dir, "Documents", "iCloud~md~obsidian", "Documents", "Vault")
+		if err := os.MkdirAll(filepath.Dir(planted), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(planted, []byte("#!/bin/sh\ntouch \"$HOME/pwned-planted\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out, lines, err := e.run(t, s)
+		if err != nil {
+			t.Fatalf("%s: err %v, output %q", s, err, out)
+		}
+		for _, f := range []string{"pwned-subst", "pwned-tick", "pwned-planted"} {
+			if _, err := os.Stat(filepath.Join(e.dir, f)); err == nil {
+				t.Errorf("%s: %s ran", s, f)
+			}
+		}
+		if !slices.Contains(lines, "env=SCREE_NOTES="+notes) ||
+			!slices.Contains(lines, "env=SCREE_MODEL=$(touch pwned-subst)`touch pwned-tick`") {
+			t.Errorf("%s: values not kept literally: %q", s, lines)
+		}
+	}
+}
+
+func TestEnvFileSyntax(t *testing.T) {
+	content := "  # indented comment\n\n" +
+		"export OPENROUTER_API_KEY=\"" + secret + "\"\r\n" +
+		"SCREE_NOTES='/home/u/my notes'\n" +
+		"SCREE_MODEL=\"it's fine\"\n" +
+		"SCREE_DIMENSIONS=256" // no final newline
+	e := setup(t, content, 0o600)
+	_, lines, err := e.run(t, "scree-mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"env=OPENROUTER_API_KEY=" + secret,
+		"env=SCREE_NOTES=/home/u/my notes",
+		"env=SCREE_MODEL=it's fine",
+		"env=SCREE_DIMENSIONS=256",
+	} {
+		if !slices.Contains(lines, want) {
+			t.Errorf("missing %q in %q", want, lines)
+		}
+	}
+}
+
+func TestEnvFileRefusesOtherNames(t *testing.T) {
+	for _, line := range []string{"PATH=/tmp", "LD_PRELOAD=/tmp/x.so", "BASH_ENV=/tmp/x", "not a setting", "SCREE-X=1"} {
+		e := setup(t, envFile+line+"\n", 0o600)
+		for _, s := range scripts {
+			out, lines, err := e.run(t, s)
+			if err == nil || lines != nil || !strings.Contains(out, "line 5") {
+				t.Errorf("%s with %q: err %v, child ran %v, output %q", s, line, err, lines != nil, out)
+			}
+		}
+	}
+}
+
+func TestScreeMCPDockerNeedsAbsoluteNotes(t *testing.T) {
+	e := setup(t, "SCREE_NOTES=notes\nOPENROUTER_API_KEY="+secret+"\n", 0o600)
+	out, lines, err := e.run(t, "scree-mcp-docker")
+	if err == nil || lines != nil || !strings.Contains(out, "absolute path") {
+		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
+	}
+}
+
+func TestScreeRunPassesArgs(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	out, lines, err := e.run(t, "scree-run", "search", "a b")
+	if err != nil || out != "" {
+		t.Fatalf("err %v, output %q", err, out)
+	}
+	if len(lines) < 2 || lines[0] != "arg=search" || lines[1] != "arg=a b" || !slices.Contains(lines, "env=SCREE_NOTES=/home/u/notes") {
+		t.Errorf("child saw %q", lines)
 	}
 }

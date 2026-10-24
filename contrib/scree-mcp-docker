@@ -13,8 +13,6 @@
 set -eu
 
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
-# "." searches PATH for a name without a slash.
-case $env_file in */*) ;; *) env_file=./$env_file ;; esac
 
 if [ ! -f "$env_file" ]; then
 	echo "scree-mcp-docker: $env_file not found; create it with SCREE_NOTES and OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
@@ -33,14 +31,59 @@ if [ $((0$mode & 077)) -ne 0 ]; then
 	exit 1
 fi
 
-set -a
-. "$env_file"
-set +a
+prog=scree-mcp-docker
+# Read the env file as data, never as shell: each line is NAME=value, with an
+# optional "export " and optional matching quotes around the value. Nothing
+# in a value is expanded or run, so spaces, $(...) and backquotes are kept as
+# they are. Only scree's own variables and the proxy variables are accepted.
+cr=$(printf '\r')
+lineno=0
+while IFS= read -r line || [ -n "$line" ]; do
+	lineno=$((lineno + 1))
+	line=${line%"$cr"}
+	line=${line#"${line%%[![:space:]]*}"}
+	case $line in '' | '#'*) continue ;; esac
+	line=${line#export }
+	case $line in
+	*=*) ;;
+	*)
+		echo "$prog: $env_file line $lineno: expected NAME=value" >&2
+		exit 1
+		;;
+	esac
+	name=${line%%=*}
+	value=${line#*=}
+	case $name in
+	SCREE_[A-Z0-9_]* | OPENROUTER_API_KEY | HTTP_PROXY | HTTPS_PROXY | NO_PROXY | http_proxy | https_proxy | no_proxy) ;;
+	*)
+		echo "$prog: $env_file line $lineno: $name is not a scree setting" >&2
+		exit 1
+		;;
+	esac
+	case $name in *[!A-Za-z0-9_]*)
+		echo "$prog: $env_file line $lineno: invalid name" >&2
+		exit 1
+		;;
+	esac
+	case $value in
+	\"*\") value=${value#\"} value=${value%\"} ;;
+	\'*\') value=${value#\'} value=${value%\'} ;;
+	esac
+	export "$name=$value"
+done <"$env_file"
 
 if [ -z "${SCREE_NOTES:-}" ]; then
 	echo "scree-mcp-docker: SCREE_NOTES is not set in $env_file" >&2
 	exit 1
 fi
+case $SCREE_NOTES in
+/*) ;;
+*)
+	# A relative path would silently become a named volume.
+	echo "scree-mcp-docker: SCREE_NOTES must be an absolute path" >&2
+	exit 1
+	;;
+esac
 
 # Build the argument list back to front, keeping the caller's arguments last.
 set -- "${SCREE_IMAGE:-scree:latest}" serve "$@"

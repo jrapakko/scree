@@ -1,0 +1,72 @@
+#!/bin/sh
+# scree-run: run any scree command with settings from the scree env file,
+# read as data rather than sourced as shell.
+#
+#   scree-run doctor -v
+#   scree-run search "backup password"
+#
+# SCREE_ENV_FILE  env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
+# SCREE_BIN       scree binary (default: scree on PATH)
+set -eu
+
+env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
+
+if [ ! -f "$env_file" ]; then
+	echo "scree-run: $env_file not found; create it with SCREE_NOTES and OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
+	exit 1
+fi
+# GNU stat first, then BSD/macOS stat.
+mode=$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file" 2>/dev/null || true)
+case $mode in
+'' | *[!0-7]*)
+	echo "scree-run: cannot read the mode of $env_file" >&2
+	exit 1
+	;;
+esac
+if [ $((0$mode & 077)) -ne 0 ]; then
+	echo "scree-run: $env_file is open to group or others (mode $mode); fix with: chmod 600 $env_file" >&2
+	exit 1
+fi
+
+prog=scree-run
+# Read the env file as data, never as shell: each line is NAME=value, with an
+# optional "export " and optional matching quotes around the value. Nothing
+# in a value is expanded or run, so spaces, $(...) and backquotes are kept as
+# they are. Only scree's own variables and the proxy variables are accepted.
+cr=$(printf '\r')
+lineno=0
+while IFS= read -r line || [ -n "$line" ]; do
+	lineno=$((lineno + 1))
+	line=${line%"$cr"}
+	line=${line#"${line%%[![:space:]]*}"}
+	case $line in '' | '#'*) continue ;; esac
+	line=${line#export }
+	case $line in
+	*=*) ;;
+	*)
+		echo "$prog: $env_file line $lineno: expected NAME=value" >&2
+		exit 1
+		;;
+	esac
+	name=${line%%=*}
+	value=${line#*=}
+	case $name in
+	SCREE_[A-Z0-9_]* | OPENROUTER_API_KEY | HTTP_PROXY | HTTPS_PROXY | NO_PROXY | http_proxy | https_proxy | no_proxy) ;;
+	*)
+		echo "$prog: $env_file line $lineno: $name is not a scree setting" >&2
+		exit 1
+		;;
+	esac
+	case $name in *[!A-Za-z0-9_]*)
+		echo "$prog: $env_file line $lineno: invalid name" >&2
+		exit 1
+		;;
+	esac
+	case $value in
+	\"*\") value=${value#\"} value=${value%\"} ;;
+	\'*\') value=${value#\'} value=${value%\'} ;;
+	esac
+	export "$name=$value"
+done <"$env_file"
+
+exec "${SCREE_BIN:-scree}" "$@"
