@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 
@@ -130,11 +129,14 @@ func sameRepo(a, b string) bool {
 // password database's entry for the current user, so a HOME set by a
 // project's .mcp.json cannot move it; $HOME is used only when that lookup
 // fails. It is compared with its symlinks resolved.
-func isHomeOrAbove(dir string) bool {
+func isHomeOrAbove(dir string) bool { return homeOrAbove(dir, lookupHome()) }
+
+// homeOrAbove is isHomeOrAbove with the home directory given; "" means
+// unknown, and only filesystem roots are refused.
+func homeOrAbove(dir, home string) bool {
 	if filepath.Dir(dir) == dir {
 		return true
 	}
-	home := lookupHome()
 	if home == "" {
 		return false
 	}
@@ -150,10 +152,10 @@ func isHomeOrAbove(dir string) bool {
 }
 
 // lookupHome returns the current user's home directory from the password
-// database, or $HOME when that lookup fails. Tests replace it.
+// database (passwdHome), or $HOME when that lookup fails. Tests replace it.
 var lookupHome = func() string {
-	if u, err := user.Current(); err == nil && u.HomeDir != "" {
-		return u.HomeDir
+	if home, err := passwdHome(); err == nil {
+		return home
 	}
 	home, _ := os.UserHomeDir()
 	return home

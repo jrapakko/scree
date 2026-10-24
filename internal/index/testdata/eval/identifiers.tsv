@@ -4,7 +4,7 @@ SCREE_FIRST_SYNC_MB	README.md	Configure
 XDG_DATA_HOME	README.md	Configure
 SCREE_HTTP_TOKEN	README.md	Claude Code
 CLAUDE_PROJECT_DIR	README.md	Claude Code
-scree-mcp-docker	README.md	Docker
+SCREE_DATA_VOLUME	README.md	Docker
 include-hidden	docs/SPEC.md	Ignoring files
 core.excludesFile	docs/SPEC.md	Ignoring files
 writer.lock	docs/SPEC.md	How indexing works

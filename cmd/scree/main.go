@@ -37,6 +37,12 @@ var version = "dev"
 const usage = `scree: semantic search over the markdown in a folder
 
 Usage:
+  scree mcp [-docker]      run serve for Claude Code (what .mcp.json names),
+                           with settings from ~/.config/scree/env and nothing
+                           else from the environment; -docker runs it in a
+                           container
+  scree run <command> [args]
+                           run another command the same way, from a terminal
   scree watch              index changed files, then keep the index current
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
@@ -58,7 +64,9 @@ Every command but indexes takes -notes, -db and -gitignore. The folder is
 current directory outside git. serve needs -notes outside Claude Code. Under
 Claude Code (CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB,
 requires CLAUDE_PROJECT_DIR to be in the same repo as its working directory,
-and indexes only a repo whose .mcp.json names scree-mcp. Environment:
+and indexes only a repo whose .mcp.json names scree mcp. ~ in
+~/.config/scree/env is the home directory in the password database, not
+$HOME. Environment:
   SCREE_DB            index file (default $XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
@@ -113,6 +121,10 @@ func main() {
 		err = runDoctor(ctx, args)
 	case "indexes":
 		err = runIndexes(ctx, args)
+	case "mcp":
+		err = runMCP(args)
+	case "run":
+		err = runRun(args)
 	case "version", "-version", "--version":
 		fmt.Println("scree", version)
 	case "help", "-h", "-help", "--help":

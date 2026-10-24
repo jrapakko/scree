@@ -32,9 +32,6 @@ archives:
       - LICENSE
       - README.md
       - docs/SPEC.md
-      - contrib/scree-mcp
-      - contrib/scree-mcp-docker
-      - contrib/scree-run
       - contrib/scree-watch.service
       - THIRD_PARTY_LICENSES/**/*
 

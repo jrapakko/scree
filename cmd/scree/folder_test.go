@@ -369,7 +369,7 @@ func TestHomeGuardAdviceUnderClaude(t *testing.T) {
 }
 
 // TestServeRequiresOptIn: serve under Claude Code refuses a repo whose
-// .mcp.json does not name scree-mcp; the CLI is unaffected.
+// .mcp.json does not name scree mcp; the CLI is unaffected.
 func TestServeRequiresOptIn(t *testing.T) {
 	serveEnv(t)
 	repo := repoTree(t)

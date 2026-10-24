@@ -3,9 +3,11 @@ Description=scree: keep the markdown notes index current
 After=network-online.target
 
 [Service]
-EnvironmentFile=%h/.config/scree/env
+# scree run reads ~/.config/scree/env (the home directory from the password
+# database) as data and starts watch with only those settings, so systemd's
+# EnvironmentFile parser is not used.
 # Change -notes to the folder to keep current.
-ExecStart=%h/.local/bin/scree watch -notes %h/notes
+ExecStart=%h/.local/bin/scree run watch -notes %h/notes
 Restart=on-failure
 RestartSec=10
 
