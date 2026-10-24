@@ -139,9 +139,12 @@ scree search "query"
 scree reindex --all
 scree doctor
 scree doctor -v
+scree indexes [-prune]
 ```
 
-Every command takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent. `-notes`, `-db` and `SCREE_DB` are refused by `serve` when `CLAUDE_PROJECT_DIR` is set: under Claude Code, a session's folder and index follow from the repo alone. A folder outside any repo, such as `~/notes`, is searched from the CLI, or from a Claude Code session started in that folder.
+`scree indexes` lists every index with its folder, size and last sync; `-prune` deletes those whose folder is gone.
+
+Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent. `-notes`, `-db` and `SCREE_DB` are refused by `serve` when `CLAUDE_PROJECT_DIR` is set: under Claude Code, a session's folder and index follow from the repo alone. A folder outside any repo, such as `~/notes`, is searched from the CLI, or from a Claude Code session started in that folder.
 
 `reindex --all` rebuilds from scratch after a model or chunking change.
 

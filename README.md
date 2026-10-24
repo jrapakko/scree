@@ -121,6 +121,7 @@ scree watch              # keep the index current (run as a service)
 scree serve              # MCP over stdio
 scree serve -http 127.0.0.1:7077   # MCP over HTTP, loopback only
 scree reindex -all       # rebuild from scratch
+scree indexes            # list per-folder indexes; -prune deletes ones whose folder is gone
 ```
 
 After upgrading from an earlier version, run `scree reindex -all` once so existing notes are re-chunked with the current size limits.

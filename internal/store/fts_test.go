@@ -232,3 +232,67 @@ func TestMigrateFTSTiming(t *testing.T) {
 		t.Errorf("keyword rows = %d", rows)
 	}
 }
+
+// TestPeekNeverWrites: Peek reads an older index without migrating it,
+// and fails on a missing file instead of creating it.
+func TestPeekNeverWrites(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceFile(ctx, "a.md", "h", 1, nil, []Chunk{{Text: "x"}, {Text: "y"}}, [][]float32{{1, 0}, {0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	s.CheckModel("m")
+	s.CheckRoot("/r")
+	s.SetMeta("synced_at", "2026-10-24T00:00:00Z")
+	makeSchema2(t, s)
+	s.Close()
+	before, _ := os.ReadFile(path)
+	for _, p := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			t.Fatalf("setup: %s exists before Peek", filepath.Base(p))
+		}
+	}
+
+	sum, err := Peek(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Summary{Root: "/r", Model: "m", SyncedAt: "2026-10-24T00:00:00Z", Schema: "2", Files: 1, Chunks: 2}
+	if sum != want {
+		t.Errorf("Peek = %+v, want %+v", sum, want)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Error("Peek changed the index file")
+	}
+	for _, p := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("Peek created %s", filepath.Base(p))
+		}
+	}
+	missing := filepath.Join(t.TempDir(), "none.db")
+	if _, err := Peek(missing); err == nil {
+		t.Error("Peek of a missing file succeeded")
+	}
+	if _, err := os.Stat(missing); err == nil {
+		t.Error("Peek created a missing index")
+	}
+
+	// With a writer's connection open, Peek reads through the WAL and sees
+	// rows not yet checkpointed.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.ReplaceFile(ctx, "b.md", "h", 1, nil, []Chunk{{Text: "z"}}, [][]float32{{1, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if sum, err := Peek(path); err != nil || sum.Files != 2 || sum.Chunks != 3 || sum.Schema != SchemaVersion {
+		t.Errorf("Peek while open = %+v, %v", sum, err)
+	}
+}

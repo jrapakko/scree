@@ -806,3 +806,67 @@ func encode(v []float32) []byte {
 	}
 	return b
 }
+
+// Summary is what `scree indexes` shows about an index, read by Peek.
+type Summary struct {
+	Root, Model, SyncedAt, Schema string
+	Files, Chunks                 int
+}
+
+// Peek reads an index's summary over a read-only connection, without
+// init: it never creates the file, the tables or the vector and keyword
+// indexes, and never migrates an older schema. It reads only the meta,
+// files and chunks tables, which every version has, so it needs no
+// extension.
+//
+// With no -wal file beside it, the index has no open connection and is
+// fully checkpointed, so it is read as immutable, which creates no -wal or
+// -shm file. With one, a writer may be active, so it is read with mode=ro,
+// which uses the existing WAL.
+func Peek(path string) (Summary, error) {
+	var sum Summary
+	if _, err := os.Stat(path); err != nil {
+		return sum, fmt.Errorf("store: %w", err)
+	}
+	q := "?mode=ro&immutable=1"
+	if _, err := os.Lstat(path + "-wal"); err == nil {
+		q = "?mode=ro&_pragma=busy_timeout(10000)"
+	}
+	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() + q
+	db, err := driver.Open(dsn)
+	if err != nil {
+		return sum, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	rows, err := db.Query(`SELECT key, value FROM meta WHERE key IN ('root', 'model', 'synced_at', 'schema')`)
+	if err != nil {
+		return sum, fmt.Errorf("store: %w", err)
+	}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			rows.Close()
+			return sum, err
+		}
+		switch k {
+		case "root":
+			sum.Root = v
+		case "model":
+			sum.Model = v
+		case "synced_at":
+			sum.SyncedAt = v
+		case "schema":
+			sum.Schema = v
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return sum, err
+	}
+	err = db.QueryRow(`SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM chunks)`).Scan(&sum.Files, &sum.Chunks)
+	if err != nil {
+		return sum, fmt.Errorf("store: %w", err)
+	}
+	return sum, nil
+}

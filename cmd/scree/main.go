@@ -49,8 +49,11 @@ Usage:
   scree reindex [-all] [path]
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
+  scree indexes [-prune]   list every per-folder index with its folder, size
+                           and last sync; -prune deletes those whose folder
+                           is gone
 
-Every command takes -notes, -db and -gitignore. The folder is -notes if
+Every command but indexes takes -notes, -db and -gitignore. The folder is -notes if
 given; for serve, else $CLAUDE_PROJECT_DIR; otherwise the git root of the
 current directory, or the current directory outside git. Under Claude Code
 (CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB. Environment:
@@ -106,6 +109,8 @@ func main() {
 		err = runReindex(ctx, args)
 	case "doctor":
 		err = runDoctor(ctx, args)
+	case "indexes":
+		err = runIndexes(ctx, args)
 	case "version", "-version", "--version":
 		fmt.Println("scree", version)
 	case "help", "-h", "-help", "--help":
