@@ -7,10 +7,20 @@
 #   claude mcp add scree --scope project -- scree-mcp
 #
 # SCREE_ENV_FILE  env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
-# SCREE_BIN       scree binary (default: scree on PATH)
+# The scree binary must be installed next to this script.
 set -eu
 
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
+# Settings come only from the env file. A project's .mcp.json can launch this
+# wrapper with its own environment and arguments, so nothing inherited may
+# choose the binary, the endpoint or the key: PATH is reset and every SCREE_*,
+# key and proxy variable is cleared before the file is read.
+PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin
+export PATH
+for v in $(env | sed -n 's/^\(SCREE_[A-Za-z0-9_]*\)=.*/\1/p') OPENROUTER_API_KEY HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+	unset "$v" 2>/dev/null || true
+done
+here=$(cd "$(dirname "$0")" && pwd -P)
 
 if [ ! -f "$env_file" ]; then
 	echo "scree-mcp: $env_file not found; create it with OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
@@ -28,7 +38,17 @@ if [ $((0$mode & 077)) -ne 0 ]; then
 	echo "scree-mcp: $env_file is open to group or others (mode $mode); fix with: chmod 600 $env_file" >&2
 	exit 1
 fi
+uid=$(stat -c %u "$env_file" 2>/dev/null || stat -f %u "$env_file" 2>/dev/null || true)
+if [ "$uid" != "$(id -u)" ]; then
+	echo "$prog: $env_file is not owned by you" >&2
+	exit 1
+fi
 
+if [ $# -gt 0 ]; then
+	# Settings belong in the env file; arguments could come from a repo's .mcp.json.
+	echo "scree-mcp: takes no arguments; put settings in $env_file" >&2
+	exit 1
+fi
 prog=scree-mcp
 # Read the env file as data, never as shell: each line is NAME=value, with an
 # optional "export " and optional matching quotes around the value. Nothing
@@ -70,4 +90,4 @@ while IFS= read -r line || [ -n "$line" ]; do
 	export "$name=$value"
 done <"$env_file"
 
-exec "${SCREE_BIN:-scree}" serve "$@"
+exec "$here/scree" serve "$@"
