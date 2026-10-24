@@ -50,7 +50,7 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
 
 ## Build
 
-Requires Go 1.26. No CGO.
+Requires Go 1.26. No CGO. Tagged releases also publish prebuilt binaries for Linux, macOS and Windows (amd64 and arm64) on the GitHub releases page, and a `ghcr.io/jrapakko/scree` image.
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/scree ./cmd/scree
@@ -213,3 +213,7 @@ The `watch` and `serve` containers share the `scree-data` volume. SQLite's WAL m
 - One policy decides what may be read, and indexing, search, `read_note` and `reindex` all go through it. Symlinks are followed only inside the notes folder, and the rules are checked on their target too. Symlinked folders are not descended.
 
 Idle memory is about 13–15 MB per process.
+
+## License
+
+MIT; see [LICENSE](LICENSE). Release archives and the container image include the licenses of the bundled dependencies (`THIRD_PARTY_LICENSES/`, or `/usr/share/doc/scree` in the image).

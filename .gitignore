@@ -3,3 +3,5 @@ bin/
 *.db-wal
 *.db-shm
 .env
+THIRD_PARTY_LICENSES/
+dist/

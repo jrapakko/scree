@@ -5,3 +5,5 @@ bin
 *.db
 *.db-wal
 *.db-shm
+dist
+THIRD_PARTY_LICENSES

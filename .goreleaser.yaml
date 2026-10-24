@@ -1,0 +1,48 @@
+# GoReleaser v2. Release with: git tag v0.1.0 && git push origin v0.1.0
+# The release workflow runs this and publishes a draft GitHub release.
+version: 2
+
+project_name: scree
+
+before:
+  hooks:
+    - go mod verify
+    - scripts/third-party-licenses.sh THIRD_PARTY_LICENSES
+
+builds:
+  - main: ./cmd/scree
+    binary: scree
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - docs/SPEC.md
+      - contrib/scree-mcp
+      - contrib/scree-mcp-docker
+      - contrib/scree-watch.service
+      - THIRD_PARTY_LICENSES/**/*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+
+release:
+  # Review the notes and assets, then publish by hand.
+  draft: true
