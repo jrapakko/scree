@@ -1,4 +1,6 @@
-# Keeps the index current. Claude Code talks to `scree serve`, which runs
+# Keeps the index of one folder current. The folder mounts at /notes and
+# both services pass -notes /notes; the index lives in the scree-data volume
+# under /data/scree/indexes. Claude Code talks to `scree serve`, which runs
 # per session with `docker compose run` (see README).
 #
 #   SCREE_NOTES_DIR=$HOME/notes docker compose up -d
@@ -8,7 +10,7 @@ services:
   watch:
     build: .
     image: scree:latest
-    command: ["watch"]
+    command: ["watch", "-notes", "/notes"]
     restart: unless-stopped
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}
@@ -24,7 +26,7 @@ services:
 
   serve:
     image: scree:latest
-    command: ["serve"]
+    command: ["serve", "-notes", "/notes"]
     profiles: ["mcp"]
     stdin_open: true
     environment:

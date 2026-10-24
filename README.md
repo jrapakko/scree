@@ -16,12 +16,12 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/scree ./cmd/scree
    ```
 
-2. **Write the settings file.** This prompts for the key without echoing it, so it never lands in your shell history or on screen. Change `$HOME/notes` if your notes are elsewhere.
+2. **Write the settings file.** This prompts for the key without echoing it, so it never lands in your shell history or on screen.
 
    ```sh
    mkdir -p ~/.config/scree
    printf 'OpenRouter API key: '; stty -echo; IFS= read -r key; stty echo; echo
-   ( umask 077; printf "SCREE_NOTES='%s'\nOPENROUTER_API_KEY='%s'\n" "$HOME/notes" "$key" > ~/.config/scree/env )
+   ( umask 077; printf "OPENROUTER_API_KEY='%s'\n" "$key" > ~/.config/scree/env )
    chmod 600 ~/.config/scree/env
    unset key
    ```
@@ -33,10 +33,10 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
    install -m 755 bin/scree contrib/scree-mcp contrib/scree-run ~/.local/bin/
    ```
 
-4. **Check and build the index.** `scree-run` loads the settings file and runs a scree command:
+4. **Check and build the index.** `scree-run` loads the settings file and runs a scree command. Change `~/notes` if your notes are elsewhere:
 
    ```sh
-   scree-run doctor -v && scree-run reindex
+   scree-run doctor -v -notes ~/notes && scree-run reindex -notes ~/notes
    ```
 
    `doctor -v` lists every file that will be ignored. Add a [`.screeignore`](#ignoring-files) before indexing if anything private shows up as indexable.
@@ -44,7 +44,7 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
 5. **Connect Claude Code.** Only the wrapper's path is stored, so the key stays out of `~/.claude.json`:
 
    ```sh
-   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp
+   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp -notes ~/notes
    ```
 
 6. **Optional: keep the index current** with the [systemd unit](#background-service-systemd), which runs `scree watch` in the background.
@@ -63,14 +63,15 @@ Settings come from environment variables. The [settings file](#settings-file) is
 
 | Variable | Default |
 | --- | --- |
-| `SCREE_NOTES` | none, required (or `-notes`) |
-| `SCREE_DB` | `$XDG_DATA_HOME/scree/index.db` (or `-db`) |
+| `SCREE_DB` | `$XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db`, one per folder (or `-db`) |
 | `SCREE_MODEL` | `openai/text-embedding-3-small` |
 | `SCREE_DIMENSIONS` | `512`; `0` uses the model's default size |
 | `SCREE_EMBED_URL` | `https://openrouter.ai/api/v1/embeddings` |
 | `SCREE_MAX_FILE_BYTES` | `1048576`; larger notes are skipped |
 | `SCREE_ZDR` | `1`; set `0` for endpoints other than OpenRouter |
 | `SCREE_HTTP_TOKEN` | none; required with `serve -allow-remote`, and enforced on loopback if set |
+
+The folder comes from `-notes`. Without it, `serve` uses the project directory Claude Code passes in `CLAUDE_PROJECT_DIR`, and other commands use the git root of the current directory (or the current directory outside git). A folder found this way is refused if it is your home directory.
 
 Changing the model or dimensions requires `scree reindex -all`. The index records which model built it and refuses to mix them.
 
@@ -122,7 +123,7 @@ After upgrading from an earlier version, run `scree reindex -all` once so existi
 
 ### Settings file
 
-Claude Code, the wrapper scripts and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. Step 2 of the [Quick start](#quick-start) creates it. For the CLI, `scree-run <command>` loads it, for example `scree-run search "…"`.
+Claude Code, the wrapper scripts and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. Step 2 of the [Quick start](#quick-start) creates it. It holds the key and optional settings, not the folder. A leftover `SCREE_NOTES` line is ignored, and `doctor` warns about it. For the CLI, `scree-run <command>` loads it, for example `scree-run search "…"`.
 
 Write one `NAME=value` per line, and wrap values in single quotes, as step 2 does, so a path with spaces stays one value. systemd reads the same quotes. The wrapper scripts read the file as data and never run it as shell, so nothing in a value is expanded. They accept only scree's own variables (`SCREE_*`, `OPENROUTER_API_KEY`) and the proxy variables, and they refuse to start if the file is readable by group or others; `chmod 600` fixes that. Other variables from the Configure table can go in the same file. A value can't itself contain the quote character that wraps it.
 
@@ -133,7 +134,7 @@ Write one `NAME=value` per line, and wrap values in single quotes, as step 2 doe
 ```sh
 mkdir -p ~/.local/bin
 install -m 755 bin/scree contrib/scree-mcp ~/.local/bin/
-claude mcp add scree --scope user -- ~/.local/bin/scree-mcp
+claude mcp add scree --scope user -- ~/.local/bin/scree-mcp -notes ~/notes
 ```
 
 The wrapper refuses to start if the settings file is missing or readable by group or others. If `~/.local/bin` is not on the `PATH` Claude Code starts with, add `SCREE_BIN=/home/you/.local/bin/scree` to the settings file.
@@ -144,7 +145,7 @@ Stdio through the wrapper is the recommended setup. `serve -http` listens on loo
 
 ```sh
 printf 'SCREE_HTTP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.config/scree/env
-scree-run serve -http 0.0.0.0:7077 -allow-remote
+scree-run serve -notes ~/notes -http 0.0.0.0:7077 -allow-remote
 ```
 
 A client then needs the header. If you add it with `claude mcp add --transport http ... --header "Authorization: Bearer $SCREE_HTTP_TOKEN"`, expanding the variable at the shell keeps the token out of your shell history, but Claude Code still stores the expanded header in `~/.claude.json`.
@@ -159,6 +160,8 @@ cp contrib/scree-watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now scree-watch
 journalctl --user -u scree-watch -f
 ```
+
+The unit indexes `~/notes`. Edit `-notes` in `ExecStart` for another folder.
 
 ### Docker or Podman
 
@@ -175,11 +178,11 @@ With `docker run`:
 docker run -d --name scree-watch --restart unless-stopped \
   -e OPENROUTER_API_KEY \
   -v "$HOME/notes:/notes:ro,z" -v scree-data:/data \
-  scree watch
+  scree watch -notes /notes
 
 # one-off commands against the same index
-docker run --rm -e OPENROUTER_API_KEY -v "$HOME/notes:/notes:ro,z" -v scree-data:/data scree doctor
-docker run --rm -e OPENROUTER_API_KEY -v "$HOME/notes:/notes:ro,z" -v scree-data:/data scree search "backup password"
+docker run --rm -e OPENROUTER_API_KEY -v "$HOME/notes:/notes:ro,z" -v scree-data:/data scree doctor -notes /notes
+docker run --rm -e OPENROUTER_API_KEY -v "$HOME/notes:/notes:ro,z" -v scree-data:/data scree search -notes /notes "backup password"
 ```
 
 `:z` relabels the folder for SELinux (Fedora, RHEL); drop it elsewhere if your engine complains. `-e OPENROUTER_API_KEY` with no value passes the variable through from your shell, so the key never appears in the command line.
@@ -193,14 +196,13 @@ docker compose logs -f watch
 
 `compose.yaml` passes through `SCREE_MODEL`, `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_ZDR` and `SCREE_EMBED_URL` too, and `SCREE_HTTP_TOKEN` to `serve`. The `serve` service sits behind the `mcp` profile, so `up` doesn't start it.
 
-For Claude Code, the MCP server runs one container per session over stdio. `contrib/scree-mcp-docker` loads the settings file and runs `docker run -i --rm` with the notes folder (`SCREE_NOTES`), the `scree-data` volume, and only the variables that are set, passed by name so the key never appears on the command line. As with the native wrapper, the key stays out of `~/.claude.json`:
+For Claude Code, the MCP server runs one container per session over stdio. `contrib/scree-mcp-docker` loads the settings file and runs `docker run -i --rm` with the project folder mounted read-only **at its own path** (so each repo gets its own index in the `scree-data` volume), the `scree-data` volume, and only the variables that are set, passed by name so the key never appears on the command line. It mounts the git root above `CLAUDE_PROJECT_DIR`, so `.gitignore` applies; your global git excludes file is not visible inside the container. A repo's committed `.mcp.json` names `scree-mcp`, so install the Docker wrapper under that name:
 
 ```sh
-install -m 755 contrib/scree-mcp-docker ~/.local/bin/
-claude mcp add scree --scope user -- ~/.local/bin/scree-mcp-docker
+install -m 755 contrib/scree-mcp-docker ~/.local/bin/scree-mcp
 ```
 
-`SCREE_DOCKER=podman`, `SCREE_IMAGE` and `SCREE_DATA_VOLUME` in the settings file change the engine, image and volume.
+`SCREE_DOCKER=podman`, `SCREE_IMAGE` and `SCREE_DATA_VOLUME` in the settings file change the engine, image and volume. `SCREE_MOUNT_OPTS` (default `ro`) sets the mount options. On SELinux hosts (Fedora, RHEL), `ro,z` makes the folder readable in the container, but `z` **permanently relabels every file in it on the host**. Use it only on a folder you're happy to relabel, never your home directory.
 
 Inside a container, `serve -http` has to bind a non-loopback address to be reachable through a published port, so it needs `-allow-remote` and `SCREE_HTTP_TOKEN`. Publish the port on the host's loopback only, for example `-p 127.0.0.1:7077:7077`.
 

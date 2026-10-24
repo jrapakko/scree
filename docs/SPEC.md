@@ -131,6 +131,8 @@ scree doctor
 scree doctor -v
 ```
 
+Every command takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. See How indexing works for how the folder is chosen when `-notes` is absent.
+
 `reindex --all` rebuilds from scratch after a model or chunking change.
 
 HTTP transport (`serve -http`):

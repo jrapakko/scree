@@ -19,7 +19,7 @@ const secret = "sk-or-v1-test-secret-0123456789"
 const fake = `#!/bin/sh
 {
 	for a in "$@"; do printf 'arg=%s\n' "$a"; done
-	for v in OPENROUTER_API_KEY SCREE_NOTES SCREE_MODEL SCREE_DIMENSIONS; do
+	for v in OPENROUTER_API_KEY SCREE_DB SCREE_MODEL SCREE_DIMENSIONS CLAUDE_PROJECT_DIR; do
 		if eval "[ -n \"\${$v+x}\" ]"; then eval "printf 'env=%s=%s\n' $v \"\$$v\""; fi
 	done
 } > "$FAKE_OUT"
@@ -27,6 +27,7 @@ const fake = `#!/bin/sh
 
 type env struct {
 	dir, envFile, fakeBin, out string
+	project                    string // CLAUDE_PROJECT_DIR for run: <dir>/proj, with no .git above it
 }
 
 func setup(t *testing.T, content string, mode os.FileMode) env {
@@ -35,7 +36,11 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 		t.Skip("no /bin/sh")
 	}
 	dir := t.TempDir()
-	e := env{dir: dir, envFile: filepath.Join(dir, "env"), fakeBin: filepath.Join(dir, "fake"), out: filepath.Join(dir, "out")}
+	e := env{dir: dir, envFile: filepath.Join(dir, "env"), fakeBin: filepath.Join(dir, "fake"), out: filepath.Join(dir, "out"),
+		project: filepath.Join(dir, "proj")}
+	if err := os.Mkdir(e.project, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if content != "" {
 		if err := os.WriteFile(e.envFile, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -54,6 +59,12 @@ func setup(t *testing.T, content string, mode os.FileMode) env {
 // output, the lines the fake recorded, and the exit error.
 func (e env) run(t *testing.T, script string, args ...string) (string, []string, error) {
 	t.Helper()
+	return e.runEnv(t, nil, script, args...)
+}
+
+// runEnv is run with extra NAME=value entries, which override the defaults.
+func (e env) runEnv(t *testing.T, extra []string, script string, args ...string) (string, []string, error) {
+	t.Helper()
 	path, err := filepath.Abs(script)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +79,9 @@ func (e env) run(t *testing.T, script string, args ...string) (string, []string,
 		"SCREE_BIN=" + e.fakeBin,
 		"SCREE_DOCKER=" + e.fakeBin,
 		"FAKE_OUT=" + e.out,
+		"CLAUDE_PROJECT_DIR=" + e.project,
 	}
+	cmd.Env = append(cmd.Env, extra...)
 	out, err := cmd.CombinedOutput()
 	if strings.Contains(string(out), secret) {
 		t.Errorf("%s printed the key: %q", script, out)
@@ -80,7 +93,7 @@ func (e env) run(t *testing.T, script string, args ...string) (string, []string,
 	return string(out), lines, err
 }
 
-const envFile = "# scree settings\nSCREE_NOTES=/home/u/notes\nOPENROUTER_API_KEY=" + secret + "\nSCREE_MODEL=openai/text-embedding-3-small\n"
+const envFile = "# scree settings\nOPENROUTER_API_KEY=" + secret + "\nSCREE_MODEL=openai/text-embedding-3-small\n"
 
 var scripts = []string{"scree-mcp", "scree-mcp-docker", "scree-run"}
 
@@ -109,7 +122,8 @@ func TestWrapperRefusesMissingEnvFile(t *testing.T) {
 	e := setup(t, "", 0)
 	for _, s := range scripts {
 		out, lines, err := e.run(t, s)
-		if err == nil || lines != nil || !strings.Contains(out, "not found") {
+		if err == nil || lines != nil || !strings.Contains(out, "not found; create it with OPENROUTER_API_KEY, then") ||
+			strings.Contains(out, "SCREE_NOTES") {
 			t.Errorf("%s: err %v, child ran %v, output %q", s, err, lines != nil, out)
 		}
 	}
@@ -124,17 +138,19 @@ func TestScreeMCPPassesEnv(t *testing.T) {
 	want := []string{
 		"arg=serve", "arg=-http", "arg=127.0.0.1:7077",
 		"env=OPENROUTER_API_KEY=" + secret,
-		"env=SCREE_NOTES=/home/u/notes",
 		"env=SCREE_MODEL=openai/text-embedding-3-small",
+		"env=CLAUDE_PROJECT_DIR=" + e.project,
 	}
 	if !slices.Equal(lines, want) {
 		t.Errorf("child saw\n%q\nwant\n%q", lines, want)
 	}
 }
 
-func TestScreeMCPDockerArgs(t *testing.T) {
-	e := setup(t, envFile+"SCREE_ZDR=0\n", 0o600)
-	out, lines, err := e.run(t, "scree-mcp-docker", "-extra")
+// dockerArgs runs scree-mcp-docker with CLAUDE_PROJECT_DIR=project and
+// returns the arguments docker got.
+func dockerArgs(t *testing.T, e env, project string, extra ...string) ([]string, []string) {
+	t.Helper()
+	out, lines, err := e.runEnv(t, append([]string{"CLAUDE_PROJECT_DIR=" + project}, extra...), "scree-mcp-docker", "-extra")
 	if err != nil || out != "" {
 		t.Fatalf("err %v, output %q", err, out)
 	}
@@ -144,11 +160,23 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 			args = append(args, a)
 		}
 	}
+	return args, lines
+}
+
+func TestScreeMCPDockerArgs(t *testing.T) {
+	e := setup(t, envFile+"SCREE_ZDR=0\n", 0o600)
+	repo := filepath.Join(e.dir, "repo")
+	for _, d := range []string{".git", "sub"} {
+		if err := os.MkdirAll(filepath.Join(repo, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args, lines := dockerArgs(t, e, filepath.Join(repo, "sub"))
 	want := []string{
-		"run", "-i", "--rm",
+		"run", "-i", "--rm", "--pull=never",
 		"-e", "OPENROUTER_API_KEY", "-e", "SCREE_MODEL", "-e", "SCREE_ZDR",
-		"-v", "/home/u/notes:/notes:ro,z", "-v", "scree-data:/data",
-		"scree:latest", "serve", "-extra",
+		"-v", repo + ":" + repo + ":ro", "-v", "scree-data:/data",
+		"scree:latest", "serve", "-notes", repo, "-extra",
 	}
 	if !slices.Equal(args, want) {
 		t.Errorf("docker args\n%q\nwant\n%q", args, want)
@@ -164,11 +192,54 @@ func TestScreeMCPDockerArgs(t *testing.T) {
 	}
 }
 
-func TestScreeMCPDockerNeedsNotes(t *testing.T) {
+func TestScreeMCPDockerNoGit(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	args, _ := dockerArgs(t, e, e.project)
+	if !slices.Contains(args, e.project+":"+e.project+":ro") || !slices.Contains(args, "-notes") ||
+		args[slices.Index(args, "-notes")+1] != e.project {
+		t.Errorf("docker args %q", args)
+	}
+}
+
+func TestScreeMCPDockerMountOpts(t *testing.T) {
+	e := setup(t, envFile+"SCREE_MOUNT_OPTS=ro,z\n", 0o600)
+	args, _ := dockerArgs(t, e, e.project)
+	if !slices.Contains(args, e.project+":"+e.project+":ro,z") {
+		t.Errorf("docker args %q", args)
+	}
+}
+
+func TestScreeMCPDockerNeedsProjectDir(t *testing.T) {
 	e := setup(t, "OPENROUTER_API_KEY="+secret+"\n", 0o600)
-	out, lines, err := e.run(t, "scree-mcp-docker")
-	if err == nil || lines != nil || !strings.Contains(out, "SCREE_NOTES is not set") {
+	out, lines, err := e.runEnv(t, []string{"CLAUDE_PROJECT_DIR="}, "scree-mcp-docker")
+	if err == nil || lines != nil || !strings.Contains(out, "CLAUDE_PROJECT_DIR is not set") {
 		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
+	}
+}
+
+func TestScreeMCPDockerRefusesColon(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	dir := filepath.Join(e.dir, "a:b")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, lines, err := e.runEnv(t, []string{"CLAUDE_PROJECT_DIR=" + dir}, "scree-mcp-docker")
+	if err == nil || lines != nil || !strings.Contains(out, "contains ':'") {
+		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
+	}
+}
+
+func TestScreeMCPDockerRefusesHome(t *testing.T) {
+	e := setup(t, envFile, 0o600)
+	// HOME is e.dir; a dotfiles repo there lifts every project to it.
+	if err := os.Mkdir(filepath.Join(e.dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{e.dir, e.project} {
+		out, lines, err := e.runEnv(t, []string{"CLAUDE_PROJECT_DIR=" + dir}, "scree-mcp-docker")
+		if err == nil || lines != nil || !strings.Contains(out, "refusing to mount") {
+			t.Errorf("%s: err %v, child ran %v, output %q", dir, err, lines != nil, out)
+		}
 	}
 }
 
@@ -176,7 +247,7 @@ func TestScreeMCPDockerNeedsNotes(t *testing.T) {
 // must never run anything, even when the cwd holds a matching executable.
 func TestEnvFileIsData(t *testing.T) {
 	notes := "/Users/u/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault"
-	content := "SCREE_NOTES=" + notes + "\n" +
+	content := "SCREE_DB=" + notes + "\n" +
 		"OPENROUTER_API_KEY=" + secret + "\n" +
 		"SCREE_MODEL=$(touch pwned-subst)`touch pwned-tick`\n"
 	for _, s := range scripts {
@@ -197,7 +268,7 @@ func TestEnvFileIsData(t *testing.T) {
 				t.Errorf("%s: %s ran", s, f)
 			}
 		}
-		if !slices.Contains(lines, "env=SCREE_NOTES="+notes) ||
+		if !slices.Contains(lines, "env=SCREE_DB="+notes) ||
 			!slices.Contains(lines, "env=SCREE_MODEL=$(touch pwned-subst)`touch pwned-tick`") {
 			t.Errorf("%s: values not kept literally: %q", s, lines)
 		}
@@ -207,7 +278,7 @@ func TestEnvFileIsData(t *testing.T) {
 func TestEnvFileSyntax(t *testing.T) {
 	content := "  # indented comment\n\n" +
 		"export OPENROUTER_API_KEY=\"" + secret + "\"\r\n" +
-		"SCREE_NOTES='/home/u/my notes'\n" +
+		"SCREE_DB='/home/u/my notes'\n" +
 		"SCREE_MODEL=\"it's fine\"\n" +
 		"SCREE_DIMENSIONS=256" // no final newline
 	e := setup(t, content, 0o600)
@@ -217,7 +288,7 @@ func TestEnvFileSyntax(t *testing.T) {
 	}
 	for _, want := range []string{
 		"env=OPENROUTER_API_KEY=" + secret,
-		"env=SCREE_NOTES=/home/u/my notes",
+		"env=SCREE_DB=/home/u/my notes",
 		"env=SCREE_MODEL=it's fine",
 		"env=SCREE_DIMENSIONS=256",
 	} {
@@ -232,16 +303,16 @@ func TestEnvFileRefusesOtherNames(t *testing.T) {
 		e := setup(t, envFile+line+"\n", 0o600)
 		for _, s := range scripts {
 			out, lines, err := e.run(t, s)
-			if err == nil || lines != nil || !strings.Contains(out, "line 5") {
+			if err == nil || lines != nil || !strings.Contains(out, "line 4") {
 				t.Errorf("%s with %q: err %v, child ran %v, output %q", s, line, err, lines != nil, out)
 			}
 		}
 	}
 }
 
-func TestScreeMCPDockerNeedsAbsoluteNotes(t *testing.T) {
-	e := setup(t, "SCREE_NOTES=notes\nOPENROUTER_API_KEY="+secret+"\n", 0o600)
-	out, lines, err := e.run(t, "scree-mcp-docker")
+func TestScreeMCPDockerNeedsAbsoluteProjectDir(t *testing.T) {
+	e := setup(t, "OPENROUTER_API_KEY="+secret+"\n", 0o600)
+	out, lines, err := e.runEnv(t, []string{"CLAUDE_PROJECT_DIR=proj"}, "scree-mcp-docker")
 	if err == nil || lines != nil || !strings.Contains(out, "absolute path") {
 		t.Errorf("err %v, child ran %v, output %q", err, lines != nil, out)
 	}
@@ -253,7 +324,19 @@ func TestScreeRunPassesArgs(t *testing.T) {
 	if err != nil || out != "" {
 		t.Fatalf("err %v, output %q", err, out)
 	}
-	if len(lines) < 2 || lines[0] != "arg=search" || lines[1] != "arg=a b" || !slices.Contains(lines, "env=SCREE_NOTES=/home/u/notes") {
+	if len(lines) < 2 || lines[0] != "arg=search" || lines[1] != "arg=a b" || !slices.Contains(lines, "env=SCREE_MODEL=openai/text-embedding-3-small") {
 		t.Errorf("child saw %q", lines)
+	}
+}
+
+// CLAUDE_PROJECT_DIR comes from Claude Code's environment. The env file must
+// not be able to set it and so redirect the mount.
+func TestEnvFileCannotSetProjectDir(t *testing.T) {
+	e := setup(t, envFile+"CLAUDE_PROJECT_DIR=/etc\n", 0o600)
+	for _, s := range scripts {
+		out, lines, err := e.run(t, s)
+		if err == nil || lines != nil || !strings.Contains(out, "CLAUDE_PROJECT_DIR is not a scree setting") {
+			t.Errorf("%s: err %v, child ran %v, output %q", s, err, lines != nil, out)
+		}
 	}
 }

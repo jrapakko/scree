@@ -152,6 +152,45 @@ func (s *Store) CheckModel(model string) error {
 	return nil
 }
 
+// ErrRootMismatch means the index was built for a different folder. Syncing
+// it against this one would delete the other folder's rows.
+var ErrRootMismatch = errors.New("index root mismatch")
+
+// Meta returns the meta value for key, or "" if it is not set.
+func (s *Store) Meta(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetMeta sets the meta value for key, replacing any earlier one.
+func (s *Store) SetMeta(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO meta(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+// CheckRoot records root, the indexed folder with symlinks resolved, on
+// first use and returns ErrRootMismatch if the index was built for another
+// folder. An index with files but no recorded root (from the single-folder
+// version) is adopted for root; the next sync reconciles it.
+func (s *Store) CheckRoot(root string) error {
+	have, err := s.Meta("root")
+	switch {
+	case err != nil:
+		return err
+	case have == "":
+		return s.SetMeta("root", root)
+	case have != root:
+		return fmt.Errorf("%w: index %s was built for %s, not %s; pass a different -db or delete it",
+			ErrRootMismatch, s.path, have, root)
+	}
+	return nil
+}
+
 // Model returns the model the index was built with, or "" if none yet.
 func (s *Store) Model() (string, error) {
 	var m string

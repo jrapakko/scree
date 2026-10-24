@@ -4,7 +4,8 @@ After=network-online.target
 
 [Service]
 EnvironmentFile=%h/.config/scree/env
-ExecStart=%h/.local/bin/scree watch
+# Change -notes to the folder to keep current.
+ExecStart=%h/.local/bin/scree watch -notes %h/notes
 Restart=on-failure
 RestartSec=10
 

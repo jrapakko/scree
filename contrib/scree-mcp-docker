@@ -4,18 +4,27 @@
 # Claude Code's config. The key reaches the container through the
 # environment, never the command line.
 #
-#   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp-docker
+# It mounts the git work tree above CLAUDE_PROJECT_DIR read-only at its own
+# host path, so each repo gets its own index in the data volume. Install it
+# as scree-mcp, the name a repo's committed .mcp.json uses, then from the
+# repo's root:
+#
+#   install -m 755 contrib/scree-mcp-docker ~/.local/bin/scree-mcp
+#   claude mcp add scree --scope project -- scree-mcp
 #
 # SCREE_ENV_FILE     env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
 # SCREE_DOCKER       container CLI (default docker; podman works too)
 # SCREE_IMAGE        image (default scree:latest)
 # SCREE_DATA_VOLUME  index volume (default scree-data)
+# SCREE_MOUNT_OPTS   options for the folder mount (default ro). On SELinux
+#                    hosts, ro,z makes it readable but permanently relabels
+#                    every file in the folder on the host.
 set -eu
 
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
 
 if [ ! -f "$env_file" ]; then
-	echo "scree-mcp-docker: $env_file not found; create it with SCREE_NOTES and OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
+	echo "scree-mcp-docker: $env_file not found; create it with OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
 	exit 1
 fi
 # GNU stat first, then BSD/macOS stat.
@@ -72,28 +81,47 @@ while IFS= read -r line || [ -n "$line" ]; do
 	export "$name=$value"
 done <"$env_file"
 
-if [ -z "${SCREE_NOTES:-}" ]; then
-	echo "scree-mcp-docker: SCREE_NOTES is not set in $env_file" >&2
+dir=${CLAUDE_PROJECT_DIR:-}
+if [ -z "$dir" ]; then
+	echo "scree-mcp-docker: CLAUDE_PROJECT_DIR is not set; run it from Claude Code" >&2
 	exit 1
 fi
-case $SCREE_NOTES in
+case $dir in
 /*) ;;
 *)
 	# A relative path would silently become a named volume.
-	echo "scree-mcp-docker: SCREE_NOTES must be an absolute path" >&2
+	echo "scree-mcp-docker: CLAUDE_PROJECT_DIR must be an absolute path" >&2
+	exit 1
+	;;
+esac
+# Mount the git work tree's top so .gitignore and .git/info/exclude are visible.
+d=$dir
+while [ "$d" != / ] && [ ! -e "$d/.git" ]; do d=$(dirname "$d"); done
+if [ -e "$d/.git" ]; then dir=$d; fi
+case $dir in
+*:*)
+	echo "scree-mcp-docker: cannot mount $dir: the path contains ':'" >&2
+	exit 1
+	;;
+esac
+case $dir in
+"$HOME" | /)
+	echo "scree-mcp-docker: refusing to mount $dir" >&2
 	exit 1
 	;;
 esac
 
 # Build the argument list back to front, keeping the caller's arguments last.
-set -- "${SCREE_IMAGE:-scree:latest}" serve "$@"
-set -- -v "$SCREE_NOTES:/notes:ro,z" -v "${SCREE_DATA_VOLUME:-scree-data}:/data" "$@"
+set -- "${SCREE_IMAGE:-scree:latest}" serve -notes "$dir" "$@"
+set -- -v "$dir:$dir:${SCREE_MOUNT_OPTS:-ro}" -v "${SCREE_DATA_VOLUME:-scree-data}:/data" "$@"
 # Pass a variable only if it is set, so unset ones keep the image defaults.
 for v in SCREE_HTTP_TOKEN SCREE_EMBED_URL SCREE_MAX_FILE_BYTES SCREE_ZDR SCREE_DIMENSIONS SCREE_MODEL OPENROUTER_API_KEY; do
 	if eval "[ -n \"\${$v+x}\" ]"; then
 		set -- -e "$v" "$@"
 	fi
 done
-set -- run -i --rm "$@"
+# --pull=never: a missing image is never fetched from a registry and handed
+# the key.
+set -- run -i --rm --pull=never "$@"
 
 exec "${SCREE_DOCKER:-docker}" "$@"

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -155,5 +156,50 @@ func TestCheckFile(t *testing.T) {
 			t.Errorf("replace=%v: CheckFile = %v", replace, err)
 		}
 		s.Close()
+	}
+}
+
+func TestMeta(t *testing.T) {
+	s := open(t)
+	if v, err := s.Meta("k"); err != nil || v != "" {
+		t.Fatalf("unset Meta = %q, %v", v, err)
+	}
+	for _, want := range []string{"one", "two"} {
+		if err := s.SetMeta("k", want); err != nil {
+			t.Fatal(err)
+		}
+		if v, err := s.Meta("k"); err != nil || v != want {
+			t.Fatalf("Meta = %q, %v, want %q", v, err, want)
+		}
+	}
+}
+
+func TestCheckRoot(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	if err := s.CheckRoot("/a"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.Meta("root"); v != "/a" {
+		t.Fatalf("root = %q", v)
+	}
+	if err := s.CheckRoot("/a"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.CheckRoot("/b")
+	if !errors.Is(err, ErrRootMismatch) || !strings.Contains(err.Error(), "built for /a, not /b") {
+		t.Fatalf("err = %v", err)
+	}
+
+	// A legacy index has files but no recorded root: it is adopted.
+	legacy := open(t)
+	if err := legacy.ReplaceFile(ctx, "a.md", "h", 1, []Chunk{{Text: "x"}}, [][]float32{{1, 2}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.CheckRoot("/notes"); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.CheckRoot("/other"); !errors.Is(err, ErrRootMismatch) {
+		t.Fatalf("after adoption: err = %v", err)
 	}
 }

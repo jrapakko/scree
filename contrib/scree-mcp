@@ -1,8 +1,10 @@
 #!/bin/sh
 # scree-mcp: run `scree serve` for Claude Code with settings from the scree
 # env file, so the API key never has to be stored in Claude Code's config.
+# serve indexes the git root above CLAUDE_PROJECT_DIR, which Claude Code sets
+# and which passes through exec unchanged. From a repo's root:
 #
-#   claude mcp add scree --scope user -- ~/.local/bin/scree-mcp
+#   claude mcp add scree --scope project -- scree-mcp
 #
 # SCREE_ENV_FILE  env file (default ${XDG_CONFIG_HOME:-$HOME/.config}/scree/env)
 # SCREE_BIN       scree binary (default: scree on PATH)
@@ -11,7 +13,7 @@ set -eu
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
 
 if [ ! -f "$env_file" ]; then
-	echo "scree-mcp: $env_file not found; create it with SCREE_NOTES and OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
+	echo "scree-mcp: $env_file not found; create it with OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
 	exit 1
 fi
 # GNU stat first, then BSD/macOS stat.

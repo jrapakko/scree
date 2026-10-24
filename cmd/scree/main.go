@@ -44,9 +44,10 @@ Usage:
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
 
-Every command takes -notes, -db and -gitignore. Environment:
-  SCREE_NOTES         notes folder (required unless -notes is given)
-  SCREE_DB            index file (default $XDG_DATA_HOME/scree/index.db)
+Every command takes -notes, -db and -gitignore. The folder is -notes if
+given; for serve, else $CLAUDE_PROJECT_DIR; otherwise the git root of the
+current directory, or the current directory outside git. Environment:
+  SCREE_DB            index file (default $XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
   SCREE_EMBED_URL     embeddings endpoint (default OpenRouter)
@@ -63,6 +64,10 @@ type config struct {
 	dims                          int
 	maxBytes                      int64
 	zdr, gitignore                bool
+	serve                         bool         // the folder defaults to CLAUDE_PROJECT_DIR
+	doctor                        bool         // doctor reports the SCREE_NOTES warning itself
+	source                        folderSource // set by open
+	dbExplicit                    bool         // -db or SCREE_DB was given; set by open
 }
 
 func main() {
@@ -105,8 +110,8 @@ func main() {
 
 func flags(name string, cfg *config) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	fs.StringVar(&cfg.notes, "notes", os.Getenv("SCREE_NOTES"), "notes folder")
-	fs.StringVar(&cfg.db, "db", envOr("SCREE_DB", defaultDB()), "index file")
+	fs.StringVar(&cfg.notes, "notes", "", "folder to index (default: see usage)")
+	fs.StringVar(&cfg.db, "db", os.Getenv("SCREE_DB"), "index file (default: one per folder under $XDG_DATA_HOME/scree/indexes)")
 	fs.BoolVar(&cfg.gitignore, "gitignore", true, "honor .gitignore, .git/info/exclude and core.excludesFile")
 	cfg.model = envOr("SCREE_MODEL", "openai/text-embedding-3-small")
 	cfg.url = envOr("SCREE_EMBED_URL", "https://openrouter.ai/api/v1/embeddings")
@@ -125,15 +130,6 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func defaultDB() string {
-	base := os.Getenv("XDG_DATA_HOME")
-	if base == "" {
-		home, _ := os.UserHomeDir()
-		base = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(base, "scree", "index.db")
 }
 
 // maxFileBytes reads SCREE_MAX_FILE_BYTES.
@@ -165,8 +161,8 @@ func zdrSetting() (bool, error) {
 // open builds an indexer from cfg. checkModel guards against mixing vectors
 // from different models. Release it with closeIndexer.
 func open(cfg *config, checkModel bool) (*index.Indexer, error) {
-	if cfg.notes == "" {
-		return nil, errors.New("no notes folder: set SCREE_NOTES or pass -notes")
+	if os.Getenv("SCREE_NOTES") != "" && !cfg.doctor {
+		log.Print(notesWarning)
 	}
 	var err error
 	if cfg.maxBytes, err = maxFileBytes(); err != nil {
@@ -175,21 +171,38 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if cfg.zdr, err = zdrSetting(); err != nil {
 		return nil, err
 	}
-	root, err := filepath.Abs(cfg.notes)
+	root, src, err := resolveFolder(cfg.notes, cfg.serve)
 	if err != nil {
 		return nil, err
 	}
+	cfg.source = src
 	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
-		return nil, fmt.Errorf("notes folder %s is not a directory", root)
+		return nil, fmt.Errorf("folder %s is not a directory", root)
 	}
 	p, err := policy.OpenOptions(root, policy.Options{MaxBytes: cfg.maxBytes, GitIgnore: cfg.gitignore})
 	if err != nil {
 		return nil, err
 	}
+	cfg.dbExplicit = cfg.db != ""
+	if !cfg.dbExplicit {
+		cfg.db = filepath.Join(indexDir(p.Root()), "index.db")
+	}
 	s, err := store.Open(cfg.db)
 	if err != nil {
 		p.Close()
 		return nil, err
+	}
+	if err := s.CheckRoot(p.Root()); err != nil {
+		s.Close()
+		p.Close()
+		return nil, err
+	}
+	if !cfg.dbExplicit {
+		if err := writeRootFile(filepath.Dir(cfg.db), p.Root()); err != nil {
+			s.Close()
+			p.Close()
+			return nil, fmt.Errorf("index %s: %w", cfg.db, err)
+		}
 	}
 	e := embed.New(cfg.url, cfg.apiKey, cfg.model, cfg.dims)
 	e.ZDR = cfg.zdr
@@ -205,6 +218,9 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	}
 	return &index.Indexer{Policy: p, Store: s, Embedder: e, QueryEmbedder: &q, Log: log.Default()}, nil
 }
+
+// notesWarning is shown when the environment still sets SCREE_NOTES.
+const notesWarning = "SCREE_NOTES is no longer read; remove it from the settings file (the folder is now -notes or the git root)"
 
 func closeIndexer(ix *index.Indexer) {
 	ix.Store.Close()
@@ -231,7 +247,7 @@ func runWatch(ctx context.Context, args []string) error {
 }
 
 func runServe(ctx context.Context, args []string) error {
-	var cfg config
+	cfg := config{serve: true}
 	fs := flags("serve", &cfg)
 	addr := fs.String("http", "", "serve streamable HTTP on this address instead of stdio, e.g. 127.0.0.1:7077")
 	allowRemote := fs.Bool("allow-remote", false, "allow -http on a non-loopback address (needs SCREE_HTTP_TOKEN)")
@@ -249,6 +265,7 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 	defer closeIndexer(ix)
+	log.Printf("serving %s (index %s)", ix.Root(), cfg.db)
 	srv := mcpserver.New(ix, version)
 	if *addr == "" {
 		return srv.Run(ctx, &mcp.StdioTransport{})
@@ -307,6 +324,9 @@ func runReindex(ctx context.Context, args []string) error {
 		if err := ix.Store.CheckModel(ix.Embedder.Model()); err != nil {
 			return err
 		}
+		if err := ix.Store.CheckRoot(ix.Root()); err != nil {
+			return err
+		}
 	}
 	if fs.NArg() == 1 {
 		return reindexOne(ctx, ix, fs.Arg(0))
@@ -346,7 +366,7 @@ func reindexOne(ctx context.Context, ix *index.Indexer, arg string) error {
 }
 
 func runDoctor(ctx context.Context, args []string) error {
-	var cfg config
+	cfg := config{doctor: true}
 	fs := flags("doctor", &cfg)
 	offline := fs.Bool("offline", false, "skip the test call to the embeddings API")
 	verbose := fs.Bool("v", false, "list every ignored or unreadable path")
@@ -364,13 +384,16 @@ func runDoctor(ctx context.Context, args []string) error {
 		fmt.Printf("warn %s\n", fmt.Sprintf(format, a...))
 	}
 
+	if os.Getenv("SCREE_NOTES") != "" {
+		warn("%s", notesWarning)
+	}
 	ix, err := open(&cfg, false)
 	if err != nil {
 		report(false, "%v", err)
 		return errors.New("doctor found problems")
 	}
 	defer closeIndexer(ix)
-	report(true, "notes folder %s", ix.Root())
+	report(true, "folder %s (from %s)", ix.Root(), cfg.source)
 	doctorScan(ctx, ix, cfg.gitignore, *verbose, report, warn)
 
 	st, err := ix.Store.Stats(ctx)

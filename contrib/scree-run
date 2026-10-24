@@ -12,7 +12,7 @@ set -eu
 env_file=${SCREE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/scree/env}
 
 if [ ! -f "$env_file" ]; then
-	echo "scree-run: $env_file not found; create it with SCREE_NOTES and OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
+	echo "scree-run: $env_file not found; create it with OPENROUTER_API_KEY, then: chmod 600 $env_file" >&2
 	exit 1
 fi
 # GNU stat first, then BSD/macOS stat.

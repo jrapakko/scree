@@ -26,8 +26,7 @@ COPY --from=build /out/scree /usr/local/bin/scree
 COPY --from=build /out/licenses /usr/share/doc/scree
 # Owned by nonroot so a fresh named volume mounted here is writable.
 COPY --from=build --chown=65532:65532 /out/data /data
-ENV SCREE_NOTES=/notes \
-    SCREE_DB=/data/index.db
+ENV XDG_DATA_HOME=/data
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/scree"]
-CMD ["watch"]
+CMD ["watch", "-notes", "/notes"]
