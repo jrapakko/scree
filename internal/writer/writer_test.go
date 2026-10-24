@@ -205,7 +205,8 @@ func TestStaleQueuedToHolder(t *testing.T) {
 	os.Remove(filepath.Join(e.root, "b.md"))
 	a.Stale([]string{"b.md"})
 	ctx := context.Background()
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous: a slow macOS runner under -race has needed over 5s.
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		paths, _ := a.Indexer.Store.Paths(ctx)
 		if slices.Equal(paths, []string{"a.md"}) {
