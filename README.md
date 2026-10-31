@@ -173,6 +173,8 @@ other hits:
 
 A word matches whole tokens, as keyword search does, including inside a path written in a note: `ci` matches `.forgejo/workflows/ci.yml`. Each location is a link to the file in terminals that support OSC 8 links; set `NO_COLOR` to turn them off (`scree run search` honours it). There is no colour. Use `-mode keyword` for a grep-like view with no semantic hits.
 
+Known issue: a keyword hit whose phrase crosses a line break (`ci` at the end of one line and `yml` at the start of the next, for `ci.yml`) is listed under `other hits:` instead of under its word.
+
 Piped, or with `-format xml`, each hit is a `<hit>` element:
 
 ```
