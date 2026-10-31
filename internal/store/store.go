@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS vocab_files(
 );
 `
 
+// ftsTokenize is the keyword index's tokenizer, which MatchTexts shares.
+const ftsTokenize = "unicode61 remove_diacritics 2 tokenchars '_-'"
+
 // ftsSchema is the keyword index: an external-content FTS5 table over chunk
 // text, heading and path, so the text is not stored twice. The triggers keep
 // it in step with chunks inside the same transaction as every write. With
@@ -66,7 +69,7 @@ const ftsSchema = `
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 	text, heading, path,
 	content='chunks', content_rowid='id',
-	tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
+	tokenize="` + ftsTokenize + `"
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_terms USING fts5vocab(chunks_fts, 'row');
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN

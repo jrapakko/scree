@@ -237,11 +237,13 @@ func runMCP(args []string) error {
 	if docker {
 		return execDocker(home, s, pd)
 	}
-	return reexec(home, s, pd, "serve")
+	return reexec(home, s, pd, false, "serve")
 }
 
 // runRun is `scree run <command> [args]`: any other command, with its
-// arguments, run the way scree mcp runs serve.
+// arguments, run the way scree mcp runs serve. NO_COLOR set or TERM=dumb
+// reaches the child as NO_COLOR=1, so search's text view leaves out links;
+// neither raw value is passed.
 func runRun(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: scree run <command> [args]")
@@ -253,13 +255,14 @@ func runRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	return reexec(home, s, os.Getenv("CLAUDE_PROJECT_DIR"), args...)
+	noColor := os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb"
+	return reexec(home, s, os.Getenv("CLAUDE_PROJECT_DIR"), noColor, args...)
 }
 
 // reexec replaces the process with this binary running args, in an
 // environment of HOME (the passwd home), cleanPath, CLAUDE_PROJECT_DIR when
-// set, and the settings.
-func reexec(home string, s map[string]string, pd string, args ...string) error {
+// set, NO_COLOR=1 with noColor, and the settings.
+func reexec(home string, s map[string]string, pd string, noColor bool, args ...string) error {
 	exe, err := selfExecutable()
 	if err != nil {
 		return fmt.Errorf("cannot find the scree binary: %w", err)
@@ -267,6 +270,9 @@ func reexec(home string, s map[string]string, pd string, args ...string) error {
 	var extra []string
 	if pd != "" {
 		extra = append(extra, "CLAUDE_PROJECT_DIR="+pd)
+	}
+	if noColor {
+		extra = append(extra, "NO_COLOR=1")
 	}
 	env := childEnv(home, cleanPath, s, false, extra...)
 	if err := execProgram(exe, append([]string{exe}, args...), env); err != nil {

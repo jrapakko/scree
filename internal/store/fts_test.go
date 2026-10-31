@@ -296,3 +296,47 @@ func TestPeekNeverWrites(t *testing.T) {
 		t.Errorf("Peek while open = %+v, %v", sum, err)
 	}
 }
+
+// TestMatchTextsAgreesWithKeyword: every chunk keyword search returns for
+// a word has a line, its path or its heading matched by MatchTexts, so the
+// text view can always say where the word is.
+func TestMatchTextsAgreesWithKeyword(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	files := map[string][]Chunk{
+		"ci/README.md": {{Heading: "Pipeline", Text: "the build\nruns on push"}},
+		"docs/release.md": {
+			{Heading: "Release", Text: "see .forgejo/workflows/ci.yml\nfor the job"},
+			{Heading: "Café notes", Text: "run PURGE_OLD_RECORDS\nafter R7-Q2"},
+		},
+		"docs/db.md": {{Heading: "DB", Text: "seed the database\nwith fixtures; circle back"}},
+	}
+	for p, cs := range files {
+		vecs := make([][]float32, len(cs))
+		for i := range vecs {
+			vecs[i] = []float32{1, 0}
+		}
+		if err := s.ReplaceFile(ctx, p, "h", 1, nil, cs, vecs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, w := range []string{"ci", "seed", "cafe", "purge_old_records", "r7-q2", "ci.yml", "md", "docs", "pipeline", "the", "circle"} {
+		hits, err := s.Keyword(ctx, phrase(w), 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) == 0 {
+			t.Errorf("%q: no keyword hits", w)
+		}
+		for _, h := range hits {
+			texts := append(strings.Split(h.Text, "\n"), h.Path, h.Heading)
+			m, err := MatchTexts(ctx, []string{w}, texts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(m[0]) == 0 {
+				t.Errorf("%q: keyword hit %s %q, but MatchTexts finds nothing in %q", w, h.Path, h.Heading, texts)
+			}
+		}
+	}
+}

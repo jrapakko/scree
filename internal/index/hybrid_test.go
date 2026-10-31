@@ -64,6 +64,33 @@ func TestFTSQuery(t *testing.T) {
 	}
 }
 
+// TestKeywordWords: the words are what ftsQuery quotes, before quoting.
+func TestKeywordWords(t *testing.T) {
+	for in, want := range map[string][]string{
+		"what is (R7-Q2)?":         {"what", "is", "R7-Q2"},
+		`foo"OR"bar`:               {`foo"OR"bar`},
+		"tab\there\x00z":           {"tab", "herez"},
+		"'quoted', [list]; {set}.": {"quoted", "list", "set"},
+		"ci ci seed":               {"ci", "ci", "seed"},
+		"( ) ?!":                   nil,
+	} {
+		got := KeywordWords(in)
+		if !slices.Equal(got, want) {
+			t.Errorf("KeywordWords(%q) = %q, want %q", in, got, want)
+		}
+		quoted := make([]string, len(got))
+		for i, w := range got {
+			quoted[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
+		}
+		if q, ok := ftsQuery(in); q != strings.Join(quoted, " OR ") || ok != (len(got) > 0) {
+			t.Errorf("ftsQuery(%q) = %s, %v; words %q", in, q, ok, got)
+		}
+	}
+	if got := KeywordWords(strings.Repeat("w ", 40)); len(got) != maxFTSTerms {
+		t.Errorf("40 words gave %d", len(got))
+	}
+}
+
 // TestFTSQueryEscaping runs FTS operators and quote tricks through search:
 // none is a syntax error, and quotes match only literal text.
 func TestFTSQueryEscaping(t *testing.T) {

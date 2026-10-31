@@ -131,6 +131,9 @@ func TestMCPCleanEnv(t *testing.T) {
 	for k, v := range hostile(l) {
 		t.Setenv(k, v)
 	}
+	// Only scree run passes NO_COLOR on.
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("TERM", "dumb")
 	if err := runMCP(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -151,12 +154,15 @@ func TestMCPCleanEnv(t *testing.T) {
 }
 
 // TestRunCleanEnvAndArgs: scree run passes its arguments through, with the
-// same clean environment.
+// same clean environment, plus NO_COLOR=1 when NO_COLOR is set or TERM is
+// dumb; TERM itself never.
 func TestRunCleanEnvAndArgs(t *testing.T) {
 	l := launchSetup(t, testSettings, 0o600)
 	for k, v := range hostile(l) {
 		t.Setenv(k, v)
 	}
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
 	t.Setenv("CLAUDE_PROJECT_DIR", "")
 	if err := runRun([]string{"search", "a b", "-k", "3"}); err != nil {
 		t.Fatal(err)
@@ -168,6 +174,21 @@ func TestRunCleanEnvAndArgs(t *testing.T) {
 	if !slices.Equal(l.env, want) {
 		t.Errorf("child env\n%q\nwant\n%q", l.env, want)
 	}
+	withNoColor := slices.Insert(slices.Clone(want), 2, "NO_COLOR=1")
+	for _, env := range [][2]string{{"NO_COLOR", "always; rm -rf"}, {"TERM", "dumb"}} {
+		t.Setenv("NO_COLOR", "")
+		t.Setenv("TERM", "xterm-256color")
+		t.Setenv(env[0], env[1])
+		l.called = false
+		if err := runRun([]string{"search", "a b", "-k", "3"}); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(l.env, withNoColor) {
+			t.Errorf("%s=%s: child env\n%q\nwant\n%q", env[0], env[1], l.env, withNoColor)
+		}
+	}
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
 	// Under Claude Code, CLAUDE_PROJECT_DIR goes through, so serve's checks apply.
 	t.Setenv("CLAUDE_PROJECT_DIR", l.proj)
 	l.called = false

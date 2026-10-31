@@ -165,13 +165,15 @@ CLI:
 scree watch
 scree serve
 scree serve -http addr [-allow-remote]
-scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format xml|json] "query"
+scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] "query"
 scree reindex [-all] [path]
 scree doctor [-v] [-offline]
 scree indexes [-prune]
 ```
 
 `-format json` prints one object per hit, the stable format for evals: `{"n","mode","path","start","end","heading","score","match","stale","also","also_more"}`, with `mode` the mode that ran, `null` for an absent line or score, `also` a list of `{"path","start","end"}` (plus `"stale":true` on a copy whose text is gone), and `also_more` present only when it is not zero.
+
+`-format text`, the default when stdout is a terminal (xml otherwise), groups the results by query word, split and trimmed as for keyword search: a `word:` line, then one tab-indented `>path:line: text` line per current source line of a hit that holds the word as keyword search matches it (same tokenizer; each line once per word, at most 10 per word; a line over 4 KB is matched only in a 4 KB window starting at the hit's chunk text; whitespace runs shown as one space, each cut at 160 characters around the match), or `>path:a-b (in path)` / `(in heading)` when only those hold it. Hits with no word, and stale hits, follow under `other hits:`. Lines are read from the current file through the same rules; control and format characters (Unicode Cf, which includes the bidi controls) are dropped. If matching fails, every hit is listed under `other hits:` with the error. `-k` must be at least 1. On a terminal with `NO_COLOR` unset each location is an OSC 8 link to the file.
 
 `scree indexes` lists every index with its folder, size and last sync; `-prune` deletes those whose folder is gone. It also shows each index's file and chunk counts, its model, and whether a writer holds it. Listing never writes: it reads each index over a read-only connection without upgrading it, and checks the lock without creating it. `-prune` keeps an index a writer holds, works only on real directories directly inside the indexes folder, and never follows a symlink out of it. It also points out an index left by the single-folder version. Each value it prints from an index's root file or meta table is cut at 80 characters.
 
@@ -201,7 +203,7 @@ Cost: indexing measured about $0.0025 per MB of markdown with `openai/text-embed
 
 ## Open items
 
-- **Human view.** Decide between plain files in an editor and a small local search page over the same index.
+- **Human view.** Resolved: the human view is `scree search`'s text format (see CLI), with per-hit file links; no local search page.
 - **MCP registry.** The license, CI, release workflow, OCI label and tagged releases are done. Still to do: build an MCPB bundle, write `server.json` for `io.github.jrapakko/scree`, and publish with `mcp-publisher`.
 - **Base image pinning.** The Dockerfile's `golang` and distroless images are referenced by tag. Pin them by digest once something like Dependabot keeps the digests current.
 - **Docker and worktrees.** `scree mcp -docker` mounts only the work tree, so a worktree whose git dir lives in the main repository outside the mount cannot be read in the container, and it requires `CLAUDE_PROJECT_DIR` to lift to the same work tree, not just the same repository as native `serve` allows.
@@ -210,6 +212,7 @@ Cost: indexing measured about $0.0025 per MB of markdown with `openai/text-embed
 - **Tracked-but-ignored files.** Read `.git/index` so that tracked files matching a `.gitignore` pattern are indexed, as git considers them. Today they are skipped.
 - **`[include]` in git config.** `core.excludesFile` is read only from the three standard config files.
 - **Several folders per session.** Index `--add-dir` folders only if each has opted in (for example its own `.mcp.json` entry), with a `root` attribute on hits.
+- **Text view: phrases across a line break.** A keyword hit whose quoted word spans two lines (`ci` at the end of one line, `yml` at the start of the next, for `ci.yml`) is listed under `other hits:` instead of under its word, since `-format text` matches each line on its own. Fix: when no single line matches, match the joined range and point at its first line.
 - **Roots without `CLAUDE_PROJECT_DIR`.** For other clients, consider roots via MRTR input requests (protocol 2026-07-28) instead of `-notes`.
 - Resolved: embedding model `openai/text-embedding-3-small` at 512 dimensions. It beat `perplexity/pplx-embed-v1-0.6b` on 16 questions over 75 real notes (file-level MRR 0.89 vs 0.78).
 - Resolved: the SQLite driver plus vector extension builds without CGO, using vec1 instead of `sqlite-vec` (see Go stack).

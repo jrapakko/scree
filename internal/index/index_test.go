@@ -83,6 +83,11 @@ func TestSyncIndexesChangesAndRemovals(t *testing.T) {
 		t.Fatalf("first sync = %+v", st)
 	}
 
+	for _, k := range []int{0, -5} {
+		if _, err := ix.Search(ctx, "cherry", k, Hybrid); err == nil {
+			t.Errorf("k=%d: no error", k)
+		}
+	}
 	hits, err := ix.Search(ctx, "cherry", 1, Hybrid)
 	if err != nil {
 		t.Fatal(err)
@@ -793,5 +798,45 @@ func TestCollapseKeepsK(t *testing.T) {
 			t.Errorf("duplicate text in two hits: %s", h.Path)
 		}
 		seen[h.TextHash] = true
+	}
+}
+
+// TestLines: Lines gives each hit's current lines, and nil when the hit is
+// stale, the file is refused, or its range no longer holds the text.
+func TestLines(t *testing.T) {
+	ix := indexed(t, map[string]string{"a.md": "# A\r\napple pie\r\n", "b.md": "# B\nbanana\n"})
+	a := searchOne(t, ix, "apple", "a.md")
+	b := searchOne(t, ix, "banana", "b.md")
+	got := ix.Lines([]store.Hit{a, b})
+	if !slices.Equal(got[0], []string{"# A", "apple pie"}) || !slices.Equal(got[1], []string{"# B", "banana"}) {
+		t.Fatalf("unchanged: %q", got)
+	}
+	noEnd := a
+	noEnd.EndLine = 0
+	if got := ix.Lines([]store.Hit{noEnd}); !slices.Equal(got[0], []string{"# A", "apple pie"}) {
+		t.Errorf("no end line: %q", got)
+	}
+
+	// Moved down: Search finds the new range, and Lines reads it.
+	write(t, ix.Root(), "a.md", "intro\n\n# A\napple pie\n") // no sync
+	moved := searchOne(t, ix, "apple", "a.md")
+	if got := ix.Lines([]store.Hit{moved}); moved.Line != 3 || !slices.Equal(got[0], []string{"# A", "apple pie"}) {
+		t.Errorf("moved to %d: %q", moved.Line, got)
+	}
+	// Changed after Search: the old range no longer holds the text.
+	write(t, ix.Root(), "a.md", "intro\n\n# A\npear tart\n")
+	if got := ix.Lines([]store.Hit{moved}); got[0] != nil {
+		t.Errorf("text gone: %q", got)
+	}
+	// Stale from Search.
+	if h := searchOne(t, ix, "apple", "a.md"); !h.Stale {
+		t.Fatalf("not stale: %+v", h)
+	} else if got := ix.Lines([]store.Hit{h}); got[0] != nil {
+		t.Errorf("stale: %q", got)
+	}
+	// Ignored since: never read.
+	write(t, ix.Root(), ".screeignore", "b.md\n")
+	if got := ix.Lines([]store.Hit{b}); got[0] != nil {
+		t.Errorf("ignored: %q", got)
 	}
 }

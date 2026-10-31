@@ -590,6 +590,9 @@ const keywordHint = `; mode="keyword" still works without the embedding API`
 // with identical text in several files are folded into one hit, with the
 // other copies in Also. Paths dropped or changed are passed to OnStale.
 func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) ([]store.Hit, error) {
+	if k < 1 {
+		return nil, fmt.Errorf("index: search: k must be at least 1, not %d", k)
+	}
 	mode = ix.Resolve(ctx, mode, query)
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
@@ -663,6 +666,41 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) (
 	return out, nil
 }
 
+// Lines returns the current text of each hit's line range, read through
+// the policy once per file. A stale hit, a file now refused or
+// unreadable, or a range that no longer holds the hit's text
+// (collapse(range) does not contain collapse(h.Text)) gives nil. A hit
+// with no recorded end line is taken to span as many lines as its text.
+func (ix *Indexer) Lines(hits []store.Hit) [][]string {
+	out := make([][]string, len(hits))
+	files := map[string][]string{} // nil: refused or unreadable
+	for i, h := range hits {
+		if h.Stale || h.Line < 1 {
+			continue
+		}
+		lines, seen := files[h.Path]
+		if !seen {
+			if src, err := ix.Policy.Read(h.Path); err == nil {
+				lines = strings.Split(strings.ReplaceAll(string(src), "\r\n", "\n"), "\n")
+			}
+			files[h.Path] = lines
+		}
+		end := h.EndLine
+		if end == 0 {
+			end = h.Line + strings.Count(h.Text, "\n")
+		}
+		if lines == nil || end < h.Line || end > len(lines) {
+			continue
+		}
+		r := lines[h.Line-1 : end]
+		if !strings.Contains(collapse(strings.Join(r, "\n")), collapse(h.Text)) {
+			continue
+		}
+		out[i] = slices.Clone(r)
+	}
+	return out
+}
+
 // fuse merges vector and keyword hits by reciprocal rank fusion: a chunk
 // scores the sum of w/(rrfBase+rank) over the lists it is in (rank is
 // 1-based). Ties go to the better single rank, then the lower chunk id. A
@@ -717,15 +755,12 @@ const (
 	maxFTSTermBytes = 64
 )
 
-// ftsQuery turns user text into an FTS5 query that is never parsed as FTS
-// syntax: it splits on whitespace, strips control characters and trims
-// .,;:!?()[]{}"' from each end of a word (not _ or -), keeps at most
-// maxFTSTerms words of at most maxFTSTermBytes, and writes each one as a
-// quoted string with inner quotes doubled, joined with OR. Inside quotes,
-// AND, NEAR, *, ^ and col: are plain text. ok is false when no word is
-// left, and keyword search is skipped.
-func ftsQuery(q string) (string, bool) {
-	var terms []string
+// KeywordWords returns the words keyword search looks for in user text: it
+// splits on whitespace, strips control characters and trims
+// .,;:!?()[]{}"' from each end of a word (not _ or -), and keeps at most
+// maxFTSTerms words of at most maxFTSTermBytes. Duplicates are kept.
+func KeywordWords(q string) []string {
+	var words []string
 	for _, f := range strings.Fields(q) {
 		f = strings.Map(func(r rune) rune {
 			if unicode.IsControl(r) {
@@ -740,10 +775,24 @@ func ftsQuery(q string) (string, bool) {
 		if len(f) > maxFTSTermBytes {
 			f = f[:runeCut(f, maxFTSTermBytes)]
 		}
-		terms = append(terms, `"`+strings.ReplaceAll(f, `"`, `""`)+`"`)
-		if len(terms) == maxFTSTerms {
+		words = append(words, f)
+		if len(words) == maxFTSTerms {
 			break
 		}
+	}
+	return words
+}
+
+// ftsQuery turns user text into an FTS5 query that is never parsed as FTS
+// syntax: it writes each of KeywordWords(q) as a quoted string with inner
+// quotes doubled, joined with OR. Inside quotes, AND, NEAR, *, ^ and col:
+// are plain text. ok is false when no word is left, and keyword search is
+// skipped.
+func ftsQuery(q string) (string, bool) {
+	words := KeywordWords(q)
+	terms := make([]string, len(words))
+	for i, w := range words {
+		terms[i] = `"` + strings.ReplaceAll(w, `"`, `""`) + `"`
 	}
 	return strings.Join(terms, " OR "), len(terms) > 0
 }

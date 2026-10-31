@@ -47,12 +47,14 @@ Usage:
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
                            -http is loopback only unless -allow-remote)
-  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format xml|json] "query"
+  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] "query"
                            auto (default) is semantic, plus keyword search
                            when the query holds an identifier such as FOO_BAR
                            or a name from the folder's code;
-                           keyword makes no API call; -format json prints one
-                           object per hit, the stable format for evals
+                           keyword makes no API call; -format text (the
+                           default on a terminal) groups lines by query word;
+                           -format json prints one object per hit, the stable
+                           format for evals
   scree reindex [-all] [path]
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
@@ -510,17 +512,26 @@ func runSearch(ctx context.Context, args []string) error {
 	fs := flags("search", &cfg)
 	k := fs.Int("k", 8, "number of results")
 	modeFlag := fs.String("mode", "auto", "auto (semantic, plus keyword for identifier-like queries or names from the folder's code), hybrid, semantic or keyword (no API call)")
-	format := fs.String("format", "xml", "xml, or json for one object per hit")
+	format := fs.String("format", "", "text (the default on a terminal), xml (the default otherwise) or json")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format xml|json] "query"`)
+		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] "query"`)
+	}
+	if *k < 1 {
+		return fmt.Errorf("-k must be at least 1, not %d", *k)
 	}
 	mode, err := index.ParseMode(*modeFlag)
 	if err != nil {
 		return err
 	}
-	if *format != "xml" && *format != "json" {
-		return fmt.Errorf("format must be xml or json, not %q", *format)
+	if *format == "" {
+		*format = "xml"
+		if stdoutTerminal() {
+			*format = "text"
+		}
+	}
+	if *format != "text" && *format != "xml" && *format != "json" {
+		return fmt.Errorf("format must be text, xml or json, not %q", *format)
 	}
 	ix, err := open(&cfg, true)
 	if err != nil {
@@ -538,6 +549,9 @@ func runSearch(ctx context.Context, args []string) error {
 	note := ""
 	if mode == index.Auto {
 		note = mcpserver.ModeNote(used)
+	}
+	if *format == "text" {
+		return writeText(ctx, os.Stdout, ix, fs.Arg(0), hits, note, linksOn())
 	}
 	fmt.Println(mcpserver.FormatHits(hits, note))
 	return nil
