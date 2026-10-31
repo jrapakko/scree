@@ -126,7 +126,7 @@ scree reindex docs/a.md  # re-index one file
 scree reindex -all       # rebuild from scratch
 scree search "how do I rotate the backup keys"
 scree search -mode keyword PURGE_OLD_RECORDS   # exact words, no API call
-scree search -format text "ci seed"              # lines grouped by query word (the default on a terminal)
+scree search -format text "ci seed"              # hits grouped by query word (the default on a terminal)
 scree search -format json "…"                    # one JSON object per hit
 scree watch              # keep the index current (run as a service)
 scree serve -notes .     # MCP over stdio, from a terminal
@@ -155,25 +155,29 @@ The query is never passed to FTS5 as syntax: each word becomes a quoted term. Wo
 
 ### Results
 
-On a terminal, `scree search` prints a text view grouped by query word: each line of a hit that holds the word, as keyword search matches it, with its file and line number, at most 10 per word and each cut at 160 characters. A hit where only the path or heading holds the word gets one `(in path)` or `(in heading)` entry; hits with no query word (usually semantic-only) and stale hits come last. Lines are read from the current file through the same ignore rules.
+On a terminal, `scree search` prints a text view grouped by query word. Each hit is listed once, under the first query word its text, path or heading holds, as keyword search matches it: its heading and the lines that hold the word (at most 10, each cut at 160 characters), then its location, then every line of that range from the current file, numbered (read through the same ignore rules, cut at 3,500 bytes). Hits with no query word (usually semantic-only) and stale hits come last; a stale hit has no numbered lines.
 
 ```
-ci:
-	>docs/release.md:41: see .forgejo/workflows/ci.yml for the job
-	>ci/README.md:3-9 (in path)
-	>docs/ops.md:20-31 (in heading)
-	>… 4 more lines
 seed:
-	>docs/db.md:7: seed the database with fixtures
+  ### 5.1 Files
+  - `.forgejo/workflows/ci.yml`: build, test, and the seed from the run number
+	>docs/plan.md:189-191
+		>>189  ### 5.1 Files
+		>>190
+		>>191  - `.forgejo/workflows/ci.yml`: build, test, and the seed from the run number
+
 other hits:
-	>docs/keys.md:3-9 Setup > Keys
+  ## Keys
+	>docs/keys.md:3-4
+		>>3  ## Keys
+		>>4  Rotate them yearly.
+
+  # Old notes
 	>docs/old.md (stale)
 [mode: auto → hybrid]
 ```
 
-A word matches whole tokens, as keyword search does, including inside a path written in a note: `ci` matches `.forgejo/workflows/ci.yml`. Each location is a link to the file in terminals that support OSC 8 links; set `NO_COLOR` to turn them off (`scree run search` honours it). There is no colour. Use `-mode keyword` for a grep-like view with no semantic hits.
-
-Known issue: a keyword hit whose phrase crosses a line break (`ci` at the end of one line and `yml` at the start of the next, for `ci.yml`) is listed under `other hits:` instead of under its word.
+A word matches whole tokens, as keyword search does, including inside a path written in a note (`ci` matches `.forgejo/workflows/ci.yml`) and across a line break. Each location is a link to the file in terminals that support OSC 8 links; set `NO_COLOR` or `TERM=dumb` to turn them off (`scree run search` honours it). There is no colour. Use `-mode keyword` for a grep-like view with no semantic hits.
 
 Piped, or with `-format xml`, each hit is a `<hit>` element:
 

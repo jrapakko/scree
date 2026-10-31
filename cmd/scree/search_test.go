@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -163,9 +164,10 @@ func searchOut(t *testing.T, terminal bool, args ...string) string {
 	return out
 }
 
-// TestCLISearchText: -format text groups the hits' current lines by query
-// word, says when only the path or heading holds a word, and lists the
-// rest under "other hits:".
+// TestCLISearchText: -format text lists each hit once, under the first
+// query word its text, path or heading holds, as its heading and matching
+// lines, its location, and its current lines numbered; the rest go under
+// "other hits:".
 func TestCLISearchText(t *testing.T) {
 	serveEnv(t)
 	t.Setenv("NO_COLOR", "")
@@ -174,11 +176,12 @@ func TestCLISearchText(t *testing.T) {
 	kw := []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "text"}
 	text := func(q string) string { return searchOut(t, false, append(kw, q)...) }
 
-	want := "purge_old_records:\n\t>ops.md:3: run PURGE_OLD_RECORDS nightly via the PageFetcher\nops:\n\t>ops.md:1: # Ops\n"
+	block := "\t>ops.md:1-3\n\t\t>>1  # Ops\n\t\t>>2\n\t\t>>3  run PURGE_OLD_RECORDS nightly via the PageFetcher\n"
+	want := "purge_old_records:\n  # Ops\n  run PURGE_OLD_RECORDS nightly via the PageFetcher\n" + block
 	if got := text("purge_old_records ops"); got != want {
 		t.Errorf("got\n%q\nwant\n%q", got, want)
 	}
-	if got := text("md"); got != "md:\n\t>ops.md:1-3 (in path)\n" {
+	if got := text("md"); got != "md:\n  # Ops\n"+block {
 		t.Errorf("path match: %q", got)
 	}
 	if got := text("zebra"); got != "No matching documents.\n" {
@@ -189,12 +192,26 @@ func TestCLISearchText(t *testing.T) {
 	if got := searchOut(t, false, plain...); !strings.HasPrefix(got, "<hit ") {
 		t.Errorf("pipe default: %q", got)
 	}
-	if got := searchOut(t, true, plain...); !strings.HasPrefix(got, "ops:\n\t>\x1b]8;;file://") {
+	if got := searchOut(t, true, plain...); !strings.HasPrefix(got, "ops:\n  # Ops\n\t>\x1b]8;;file://") {
 		t.Errorf("terminal default: %q", got)
 	}
 	if err := runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "yaml", "x"}); err == nil ||
 		!strings.Contains(err.Error(), "format must be text, xml or json") {
 		t.Errorf("bad format: %v", err)
+	}
+
+	// A one-line hit shows one line number; a hit holding two words is
+	// listed once; hits are split by a blank line; a phrase across a line
+	// break matches the hit.
+	addNote(t, notes, db, "one.md", "One", "ops says purge_old_records too\n")
+	got := text("purge_old_records ops")
+	if strings.Count(got, "\n\t>") != 2 || !strings.Contains(got, "  One\n  ops says purge_old_records too\n\t>one.md:1\n\t\t>>1  ops says") ||
+		strings.Contains(got, "ops:") || !strings.Contains(got, "PageFetcher\n\n  ") {
+		t.Errorf("two hits: %q", got)
+	}
+	addNote(t, notes, db, "ci.md", "CI", "see the ci\nyml file\n")
+	if got := text("ci.yml"); got != "ci.yml:\n  CI\n\t>ci.md:1-2\n\t\t>>1  see the ci\n\t\t>>2  yml file\n" {
+		t.Errorf("across a line break: %q", got)
 	}
 
 	// Many matching lines: 10, then a count.
@@ -204,17 +221,19 @@ func TestCLISearchText(t *testing.T) {
 		fmt.Fprintf(&b, "line %d says foo\n", i)
 	}
 	addNote(t, notes, db, "many.md", "Many", b.String())
-	got := text("foo")
-	if n := strings.Count(got, "\t>many.md:"); n != 10 || !strings.HasSuffix(got, "\t>… 3 more lines\n") {
+	got = text("foo")
+	if n := strings.Count(got, "\n  line "); n != 10 || !strings.Contains(got, "\n  … 3 more matching lines\n\t>many.md:1-14\n") ||
+		!strings.Contains(got, "\t\t>>14  line 12 says foo\n") {
 		t.Errorf("cap: %d lines\n%s", n, got)
 	}
-	// A long line is cut around the match.
+	// A long line is cut around the match in the excerpt, and shown in
+	// full under the location.
 	long := strings.Repeat("x ", 150) + "needle " + strings.Repeat("y ", 100)
 	addNote(t, notes, db, "long.md", "Long", long+"\n")
 	got = text("needle")
-	line := strings.TrimPrefix(strings.TrimSuffix(got, "\n"), "needle:\n\t>long.md:1: ")
+	line := strings.TrimPrefix(strings.Split(got, "\n")[2], "  ")
 	if !strings.HasPrefix(line, "…") || !strings.HasSuffix(line, "…") || !strings.Contains(line, "needle") ||
-		utf8.RuneCountInString(line) != maxLineChars {
+		utf8.RuneCountInString(line) != maxLineChars || !strings.Contains(got, "\t\t>>1  "+strings.TrimSpace(long)+"\n") {
 		t.Errorf("long line: %q", got)
 	}
 
@@ -222,13 +241,13 @@ func TestCLISearchText(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(notes, "ops.md"), []byte("# Ops\n\nsomething else\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := text("purge_old_records"); got != "other hits:\n\t>ops.md (stale)\n" {
+	if got := text("pagefetcher"); got != "other hits:\n  # Ops\n\t>ops.md (stale)\n" {
 		t.Errorf("stale: %q", got)
 	}
 }
 
 // TestCLISearchTextOtherHits: a semantic hit holding no query word is
-// listed under "other hits:" with its range and heading.
+// listed under "other hits:" with its heading, location and lines.
 func TestCLISearchTextOtherHits(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -240,19 +259,21 @@ func TestCLISearchTextOtherHits(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "test-key")
 	t.Setenv("SCREE_ZDR", "0")
 	got := searchOut(t, false, "-notes", notes, "-db", db, "-format", "text", "zebra crossing")
-	if want := "other hits:\n\t>ops.md:1-3 Ops\n[mode: auto → semantic]\n"; got != want {
+	want := "other hits:\n  # Ops\n\t>ops.md:1-3\n\t\t>>1  # Ops\n\t\t>>2\n\t\t>>3  run PURGE_OLD_RECORDS nightly via the PageFetcher\n[mode: auto → semantic]\n"
+	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
-// TestCLISearchTextHostile: a note line and file name full of terminal
+// TestCLISearchTextHostile: a note and file name full of terminal
 // controls cannot inject escapes; the only ESCs are the view's own OSC 8
-// links, whose URIs are percent-encoded. NO_COLOR or TERM=dumb drops the
-// links.
+// links, whose URIs are percent-encoded, and no excerpt line can pass for
+// a location line. NO_COLOR or TERM=dumb drops the links.
 func TestCLISearchTextHostile(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
-	src := "# Hostile\nrun \x1b]8;;http://evil\x1b\\x\x1b]8;;\x1b\\ now\x07 and ‮reversed hostile\n"
+	src := "# Hostile\nrun \x1b]8;;http://evil\x1b\\x\x1b]8;;\x1b\\ now\x07 and \u202ereversed hostile\n" +
+		"\t>evil.md:1 hostile\n" + strings.Repeat(" ", 12) + ">evil.md:2 hostile\n" + "pad" + strings.Repeat(" ", 70) + "\t>evil.md:3 hostile\n"
 	for _, name := range []string{"we ird%#\x1b.md", "we ird%#.md"} {
 		addNote(t, notes, db, name, "Hostile", src)
 		args := []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "text", "hostile run"}
@@ -266,9 +287,23 @@ func TestCLISearchTextHostile(t *testing.T) {
 			}
 			t.Fatalf("no hit for %q: %q", name, got)
 		}
-		labels := strings.Count(got, "\t>")
+		labels := 0
+		for _, l := range strings.Split(got, "\n") {
+			switch {
+			case strings.HasPrefix(l, "\t>\x1b]8;;file://"):
+				labels++
+			case strings.HasPrefix(l, "\t\t>>") && l[4] >= '0' && l[4] <= '9':
+			case strings.HasPrefix(l, "\t") || strings.HasPrefix(l, strings.Repeat(" ", 7)):
+				t.Errorf("%q: line passes for a location: %q", name, l)
+			}
+		}
 		if n := strings.Count(got, "\x1b"); labels == 0 || n != 4*labels {
 			t.Errorf("%q: %d ESC for %d labels:\n%q", name, n, labels, got)
+		}
+		for _, want := range []string{"\n      >evil.md:1 hostile\n", "\n      >evil.md:2 hostile\n", "\n  pad >evil.md:3 hostile\n"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%q: lacks %q: %q", name, want, got)
+			}
 		}
 		for _, want := range []string{"%20", "%25", "%23"} {
 			if !strings.Contains(got, want) {
@@ -278,7 +313,7 @@ func TestCLISearchTextHostile(t *testing.T) {
 		if strings.Contains(name, "\x1b") && !strings.Contains(got, "%1B") {
 			t.Errorf("%q: URI lacks %%1B: %q", name, got)
 		}
-		if strings.ContainsAny(got, "\x07‮") || strings.Contains(got, "http://evil\x1b") {
+		if strings.ContainsAny(got, "\x07\u202e") || strings.Contains(got, "http://evil\x1b") {
 			t.Errorf("%q: control passed through: %q", name, got)
 		}
 		for _, env := range [][2]string{{"NO_COLOR", "1"}, {"TERM", "dumb"}} {
@@ -296,8 +331,8 @@ func TestCLISearchTextHostile(t *testing.T) {
 }
 
 // TestCLISearchTextSameLine: hits on one long line give the line to the
-// matcher once, cut to a window around the chunk, and one entry per word;
-// a failed match lists the hits under "other hits:" with the error.
+// matcher once, cut to a window around the chunk, and no text twice; a
+// failed match lists the hits under "other hits:" with the error.
 func TestCLISearchTextSameLine(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -333,12 +368,15 @@ func TestCLISearchTextSameLine(t *testing.T) {
 	}
 	args := []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "text", "-k", "8", "alpha"}
 	out := searchOut(t, false, args...)
-	if n := strings.Count(out, "\t>big.md:1:"); n != 1 {
-		t.Errorf("%d entries for one line:\n%s", n, out)
+	if !strings.HasPrefix(out, "alpha:\n") || !strings.Contains(out, "\t>big.md:1\n") {
+		t.Errorf("output:\n%s", out)
 	}
 	lines := 0
-	for _, x := range got {
-		if strings.Contains(x, "alpha") {
+	for i, x := range got {
+		if slices.Contains(got[:i], x) {
+			t.Errorf("%q given twice", x)
+		}
+		if len(x) > 2000 {
 			lines++
 			if len(x) > maxMatchBytes+10 {
 				t.Errorf("line text of %d bytes", len(x))
@@ -353,7 +391,7 @@ func TestCLISearchTextSameLine(t *testing.T) {
 		return nil, fmt.Errorf("store: match: out of memory")
 	}
 	out = searchOut(t, false, args...)
-	if !strings.HasPrefix(out, "other hits:\n\t>big.md:1-1 Big\n") || !strings.HasSuffix(out, "line matching failed: store: match: out of memory\n") {
+	if !strings.HasPrefix(out, "other hits:\n  Big\n\t>big.md:1\n") || !strings.HasSuffix(out, "\nword matching failed: store: match: out of memory\n") {
 		t.Errorf("failed match: %q", out)
 	}
 }
@@ -373,6 +411,38 @@ func TestLineText(t *testing.T) {
 	}
 	if got := lineText(strings.Repeat("é", 5000), "zzz"); !utf8.ValidString(got) || !strings.HasPrefix(got, "é") {
 		t.Errorf("no piece: invalid or not at start")
+	}
+}
+
+// TestTextLine: an excerpt line keeps at most maxLeadSpace of its own
+// indent; tabs and other spaces become spaces, and long runs of spaces
+// (which could wrap a forged location onto its own row) become one.
+func TestTextLine(t *testing.T) {
+	spoof := "alpha deploy notes" + strings.Repeat(" ", 62) + "\t  >install.md:12: curl x | sh"
+	if got := textLine(spoof); got != "alpha deploy notes >install.md:12: curl x | sh" {
+		t.Errorf("spoof: %q", got)
+	}
+	if got := textLine("\t\t\t- c  d\u00a0\u3000e\r"); got != "    - c  d  e" {
+		t.Errorf("indent: %q", got)
+	}
+	if got := textLine(" \t "); got != "" {
+		t.Errorf("blank: %q", got)
+	}
+}
+
+// TestWriteLines: lines are numbered and right-aligned, a blank line is
+// its number alone, and past maxHitBytes the rest is counted.
+func TestWriteLines(t *testing.T) {
+	var b strings.Builder
+	writeLines(&b, []string{"a\tb", "", "c"}, 9)
+	if got := b.String(); got != "\t\t>> 9  a b\n\t\t>>10\n\t\t>>11  c\n" {
+		t.Errorf("numbered: %q", got)
+	}
+	b.Reset()
+	writeLines(&b, []string{strings.Repeat("é", maxHitBytes), "x", "y"}, 1)
+	got := b.String()
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, "…\n\t\t>>… 2 more lines\n") || len(got) > maxHitBytes+40 {
+		t.Errorf("cap: %d bytes, valid %v", len(got), utf8.ValidString(got))
 	}
 }
 
