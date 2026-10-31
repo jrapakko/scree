@@ -443,19 +443,8 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, fs.FileInfo, 
 	if err != nil {
 		return nil, nil, readErr(rel, err)
 	}
-	// What was opened must be the file the rules were checked on, reached
-	// through the same folders: os.Root follows in-root symlinks in folder
-	// names, so a folder swapped for a link to a hidden one would otherwise
-	// pass. A swap and swap back between these checks remains possible; it
-	// needs a local process that can already read the files.
-	if !os.SameFile(lfi, ffi) {
-		return nil, nil, readErr(rel, ErrChanged)
-	}
-	if again, err := p.resolve(realRel); err != nil || again != realRel {
-		return nil, nil, readErr(rel, ErrChanged)
-	}
-	if now, err := p.r.Lstat(realRel); err != nil || !os.SameFile(now, ffi) {
-		return nil, nil, readErr(rel, ErrChanged)
+	if err := p.checkOpened(rel, realRel, lfi, ffi); err != nil {
+		return nil, nil, err
 	}
 	src, err := io.ReadAll(io.LimitReader(f, p.max+1))
 	if err != nil {
@@ -468,6 +457,27 @@ func (p *Policy) read(rel string, resolve bool, rs rules) ([]byte, fs.FileInfo, 
 		return nil, nil, ignored(rel, FrontMatter)
 	}
 	return src, ffi, nil
+}
+
+// checkOpened refuses with ErrChanged unless ffi, the Stat of the opened
+// file, is the regular file lfi, its Lstat, described. What was opened must
+// be the file the rules were checked on, reached through the same folders:
+// os.Root follows in-root symlinks in folder names, so a folder swapped for a
+// link to a hidden one would otherwise pass. Regularity is checked on its
+// own because a FIFO swapped in can reuse the note's inode number. A swap
+// and swap back between these checks remains possible; it needs a local
+// process that can already read the files.
+func (p *Policy) checkOpened(rel, realRel string, lfi, ffi fs.FileInfo) error {
+	if !ffi.Mode().IsRegular() || !os.SameFile(lfi, ffi) {
+		return readErr(rel, ErrChanged)
+	}
+	if again, err := p.resolve(realRel); err != nil || again != realRel {
+		return readErr(rel, ErrChanged)
+	}
+	if now, err := p.r.Lstat(realRel); err != nil || !os.SameFile(now, ffi) {
+		return readErr(rel, ErrChanged)
+	}
+	return nil
 }
 
 // check runs every rule of read that needs no content, and returns the path

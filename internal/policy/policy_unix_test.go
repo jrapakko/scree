@@ -331,6 +331,23 @@ func TestFIFOSwappedNoteDoesNotBlock(t *testing.T) {
 	})
 }
 
+// A FIFO that is the same file as the Lstat (as when it reuses the removed
+// note's inode number) is still refused after opening.
+func TestCheckOpenedRefusesFIFO(t *testing.T) {
+	dir := fixture(t)
+	root := filepath.Join(dir, "notes")
+	write(t, filepath.Join(root, "a.md"), "a")
+	p := open(t, root, 0)
+	mkfifo(t, filepath.Join(root, "f.md"))
+	fi, err := os.Lstat(filepath.Join(root, "f.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.checkOpened("f.md", "f.md", fi, fi); !errors.Is(err, ErrChanged) {
+		t.Errorf("checkOpened err = %v, want ErrChanged", err)
+	}
+}
+
 // Estimate counts what Scan allows, plus front-matter opt-outs, and never
 // opens a file: a FIFO named like a note would block a read.
 func TestEstimateMatchesScan(t *testing.T) {
