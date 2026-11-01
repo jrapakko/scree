@@ -170,8 +170,8 @@ func (w *Writer) hold(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.logf("sync done: %d files, %d indexed, %d removed, %d failed, %d deferred",
-		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
+	w.logf("sync done: %d files, %s, %d removed, %d failed, %d deferred",
+		st.Scanned, st.IndexedText(), st.Removed, st.Failed, st.Deferred)
 	// A first sync allocates much more than watching does; hand the heap
 	// back now rather than holding it for the life of the session.
 	debug.FreeOSMemory()

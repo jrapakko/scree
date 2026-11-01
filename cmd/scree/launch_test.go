@@ -131,9 +131,10 @@ func TestMCPCleanEnv(t *testing.T) {
 	for k, v := range hostile(l) {
 		t.Setenv(k, v)
 	}
-	// Only scree run passes NO_COLOR on.
+	// Only scree run passes NO_COLOR and TERM on.
 	t.Setenv("NO_COLOR", "1")
 	t.Setenv("TERM", "dumb")
+	t.Setenv("TERMINFO", "/tmp/evil-terminfo")
 	if err := runMCP(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,8 @@ func TestMCPCleanEnv(t *testing.T) {
 
 // TestRunCleanEnvAndArgs: scree run passes its arguments through, with the
 // same clean environment, plus NO_COLOR=1 when NO_COLOR is set or TERM is
-// dumb; TERM itself never.
+// dumb, and TERM when it is a plain terminal name; never TERMINFO,
+// TERMINFO_DIRS or TERMCAP.
 func TestRunCleanEnvAndArgs(t *testing.T) {
 	l := launchSetup(t, testSettings, 0o600)
 	for k, v := range hostile(l) {
@@ -163,6 +165,9 @@ func TestRunCleanEnvAndArgs(t *testing.T) {
 	}
 	t.Setenv("NO_COLOR", "")
 	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("TERMINFO", "/tmp/evil-terminfo")
+	t.Setenv("TERMINFO_DIRS", "/tmp/evil-terminfo")
+	t.Setenv("TERMCAP", "xterm|evil:")
 	t.Setenv("CLAUDE_PROJECT_DIR", "")
 	if err := runRun([]string{"search", "a b", "-k", "3"}); err != nil {
 		t.Fatal(err)
@@ -170,12 +175,12 @@ func TestRunCleanEnvAndArgs(t *testing.T) {
 	if !slices.Equal(l.argv, []string{testExe, "search", "a b", "-k", "3"}) {
 		t.Errorf("argv %q", l.argv)
 	}
-	want := []string{"HOME=" + l.home, "PATH=/usr/local/bin:/usr/bin:/bin", "OPENROUTER_API_KEY=" + testSecret, "SCREE_MODEL=openai/text-embedding-3-small"}
+	plain := []string{"HOME=" + l.home, "PATH=/usr/local/bin:/usr/bin:/bin", "OPENROUTER_API_KEY=" + testSecret, "SCREE_MODEL=openai/text-embedding-3-small"}
+	want := slices.Insert(slices.Clone(plain), 2, "TERM=xterm-256color")
 	if !slices.Equal(l.env, want) {
 		t.Errorf("child env\n%q\nwant\n%q", l.env, want)
 	}
-	withNoColor := slices.Insert(slices.Clone(want), 2, "NO_COLOR=1")
-	for _, env := range [][2]string{{"NO_COLOR", "always; rm -rf"}, {"TERM", "dumb"}} {
+	for _, env := range [][3]string{{"NO_COLOR", "always; rm -rf", "TERM=xterm-256color"}, {"TERM", "dumb", "TERM=dumb"}} {
 		t.Setenv("NO_COLOR", "")
 		t.Setenv("TERM", "xterm-256color")
 		t.Setenv(env[0], env[1])
@@ -183,8 +188,25 @@ func TestRunCleanEnvAndArgs(t *testing.T) {
 		if err := runRun([]string{"search", "a b", "-k", "3"}); err != nil {
 			t.Fatal(err)
 		}
-		if !slices.Equal(l.env, withNoColor) {
-			t.Errorf("%s=%s: child env\n%q\nwant\n%q", env[0], env[1], l.env, withNoColor)
+		if want := slices.Insert(slices.Clone(plain), 2, "NO_COLOR=1", env[2]); !slices.Equal(l.env, want) {
+			t.Errorf("%s=%s: child env\n%q\nwant\n%q", env[0], env[1], l.env, want)
+		}
+	}
+	// A TERM that is not a plain terminal name is dropped.
+	for _, term := range []string{"", "xterm;rm -rf ~", "../../tmp/evil", "/tmp/evil", "xterm/../x", "a..b", "-x",
+		".hidden", "xterm 256", "xterm\x1b[2J", "x" + strings.Repeat("y", 64)} {
+		t.Setenv("TERM", term)
+		l.called = false
+		if err := runRun([]string{"search", "q"}); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(l.env, plain) {
+			t.Errorf("TERM=%q: child env\n%q\nwant\n%q", term, l.env, plain)
+		}
+	}
+	for _, term := range []string{"xterm-kitty", "screen.xterm-256color", "rxvt-unicode+256", "st_x", "x" + strings.Repeat("y", 63)} {
+		if !safeTerm(term) {
+			t.Errorf("TERM=%q refused", term)
 		}
 	}
 	t.Setenv("NO_COLOR", "")

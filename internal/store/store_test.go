@@ -227,7 +227,7 @@ func TestStoreMigratesFileColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	h, st, err := s.FileInfo(ctx, "old.md")
+	h, st, _, err := s.FileInfo(ctx, "old.md")
 	if err != nil || h != "h" || st != nil {
 		t.Fatalf("legacy row: %q, %v, %v", h, st, err)
 	}
@@ -254,7 +254,7 @@ func TestStoreMigratesFileColumns(t *testing.T) {
 	if err := s.SetFileStat(ctx, "old.md", want); err != nil {
 		t.Fatal(err)
 	}
-	if _, st, _ := s.FileInfo(ctx, "old.md"); st == nil || *st != want {
+	if _, st, _, _ := s.FileInfo(ctx, "old.md"); st == nil || *st != want {
 		t.Errorf("after SetFileStat: %v", st)
 	}
 }
@@ -466,5 +466,99 @@ func TestMigrateTextHash(t *testing.T) {
 	}
 	if len(TextHash("x")) != 32 {
 		t.Errorf("TextHash length %d", len(TextHash("x")))
+	}
+}
+
+// TestKeywordOnlyFile: chunks stored with nil vectors are in the keyword
+// index but never found by vector search, and the file is recorded as
+// keyword-only until it is replaced with vectors.
+func TestKeywordOnlyFile(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	if err := s.ReplaceFile(ctx, "a.md", "h1", 1, nil, []Chunk{{Path: "a.md", Text: "apple"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// No vectors at all yet: vector search finds nothing rather than failing.
+	if hits, err := s.Search(ctx, []float32{1, 0}, 5); err != nil || hits != nil {
+		t.Fatalf("search over no vectors = %v, %v", hits, err)
+	}
+	if hits, err := s.Keyword(ctx, `"apple"`, 5); err != nil || len(hits) != 1 {
+		t.Fatalf("keyword = %v, %v", hits, err)
+	}
+	h, _, kw, err := s.FileInfo(ctx, "a.md")
+	if err != nil || h != "h1" || !kw {
+		t.Fatalf("FileInfo = %q, %v, %v", h, kw, err)
+	}
+	if h, _ := s.FileHash(ctx, "a.md"); h != "h1" {
+		t.Fatalf("FileHash = %q", h)
+	}
+	if err := s.ReplaceFile(ctx, "b.md", "h2", 1, nil, []Chunk{{Path: "b.md", Text: "banana"}}, [][]float32{{0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.Search(ctx, []float32{1, 0}, 5)
+	if err != nil || len(hits) != 1 || hits[0].Path != "b.md" {
+		t.Fatalf("search = %+v, %v", hits, err)
+	}
+	if st, err := s.Stats(ctx); err != nil || st.Files != 2 || st.Chunks != 2 || st.KeywordOnly != 1 {
+		t.Fatalf("Stats = %+v, %v", st, err)
+	}
+	if err := s.ReplaceFile(ctx, "a.md", "h1", 2, nil, []Chunk{{Path: "a.md", Text: "apple"}}, [][]float32{{1, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, kw, _ := s.FileInfo(ctx, "a.md"); kw {
+		t.Fatal("still keyword-only after vectors")
+	}
+	if n, err := s.KeywordOnlyFiles(ctx); err != nil || n != 0 {
+		t.Fatalf("KeywordOnlyFiles = %d, %v", n, err)
+	}
+	if hits, _ := s.Search(ctx, []float32{1, 0}, 5); len(hits) != 2 || hits[0].Path != "a.md" {
+		t.Fatalf("search after vectors = %+v", hits)
+	}
+	// A mismatch other than nil vectors is still an error.
+	if err := s.ReplaceFile(ctx, "c.md", "h", 1, nil, []Chunk{{Text: "x"}, {Text: "y"}}, [][]float32{{1, 0}}); err == nil {
+		t.Fatal("2 chunks with 1 vector accepted")
+	}
+}
+
+// TestKeywordOnlyAfterUpgrade: an index from schema 1 (no line ranges or
+// text hashes) takes keyword-only files beside its embedded ones, and both
+// survive reopening.
+func TestKeywordOnlyAfterUpgrade(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceFile(ctx, "old.md", "h", 1, nil, []Chunk{{Path: "old.md", Line: 1, Text: "embedded"}}, [][]float32{{1, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`DROP INDEX chunks_text_hash`, `ALTER TABLE chunks DROP COLUMN text_hash`,
+		`ALTER TABLE chunks DROP COLUMN end_line`, `DELETE FROM meta WHERE key = 'schema'`} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+	for range 2 {
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReplaceFile(ctx, "new.md", "h2", 1, nil, []Chunk{{Path: "new.md", Line: 1, EndLine: 1, Text: "fresh words"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if v, _ := s.Meta("schema"); v != SchemaVersion {
+			t.Errorf("schema = %q", v)
+		}
+		if hits, err := s.Search(ctx, []float32{1, 0}, 5); err != nil || len(hits) != 1 || hits[0].Path != "old.md" {
+			t.Fatalf("search = %+v, %v", hits, err)
+		}
+		if hits, err := s.Keyword(ctx, `"fresh"`, 5); err != nil || len(hits) != 1 || hits[0].Path != "new.md" {
+			t.Fatalf("keyword = %+v, %v", hits, err)
+		}
+		if _, _, kw, _ := s.FileInfo(ctx, "old.md"); kw {
+			t.Fatal("old.md marked keyword-only")
+		}
+		s.Close()
 	}
 }

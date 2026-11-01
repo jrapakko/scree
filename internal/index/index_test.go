@@ -613,7 +613,7 @@ func TestBackfillSkipsWhenChunkingDiffers(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Rows from an older chunker: same file hash, other chunk text.
-	hash, stat, err := ix.Store.FileInfo(ctx, "a.md")
+	hash, stat, _, err := ix.Store.FileInfo(ctx, "a.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,5 +838,205 @@ func TestLines(t *testing.T) {
 	write(t, ix.Root(), ".screeignore", "b.md\n")
 	if got := ix.Lines([]store.Hit{b}); got[0] != nil {
 		t.Errorf("ignored: %q", got)
+	}
+}
+
+// keyEmbedder is fakeEmbedder that reports whether it has an API key, like
+// an embed.Client, and records the inputs it embeds.
+type keyEmbedder struct {
+	fakeEmbedder
+	key    bool
+	inputs []string
+}
+
+func (k *keyEmbedder) HasKey() bool { return k.key }
+
+func (k *keyEmbedder) Embed(ctx context.Context, in []string) ([][]float32, error) {
+	k.inputs = append(k.inputs, in...)
+	return k.fakeEmbedder.Embed(ctx, in)
+}
+
+// embeddedPaths returns the files of the embedded inputs, in order.
+func embeddedPaths(in []string) []string {
+	var out []string
+	for _, s := range in {
+		p, _, _ := strings.Cut(s, "\n")
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func keywordOnly(t *testing.T, ix *Indexer) int {
+	t.Helper()
+	n, err := ix.Store.KeywordOnlyFiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestSyncWithoutKey: with no API key, sync stores chunks for keyword search
+// without calling the API, and auto search falls back to keyword and finds
+// them. The first sync with a key embeds exactly those files, leaving files
+// that already have vectors alone, and semantic search then finds them.
+func TestSyncWithoutKey(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	ke := &keyEmbedder{key: true}
+	ix.Embedder = ke
+	write(t, ix.Root(), "cherry.md", "# Cherry\ncherry cherry\n")
+	if st, err := ix.Sync(ctx); err != nil || st != (SyncStats{Scanned: 1, Indexed: 1}) {
+		t.Fatalf("sync with a key = %+v, %v", st, err)
+	}
+
+	ke.key, ke.inputs = false, nil
+	write(t, ix.Root(), "a.md", "# Apples\napple apple\n")
+	write(t, ix.Root(), "sub/b.md", "# Bananas\nbanana\n")
+	write(t, ix.Root(), "empty.md", "")
+	st, err := ix.Sync(ctx)
+	if err != nil || st != (SyncStats{Scanned: 4, Indexed: 3, KeywordOnly: 2}) || ke.calls != 1 || len(ke.inputs) != 0 {
+		t.Fatalf("sync without a key = %+v, %v; embed calls %d, inputs %q", st, err, ke.calls, ke.inputs)
+	}
+	if n := keywordOnly(t, ix); n != 2 {
+		t.Fatalf("keyword-only files = %d, want 2", n)
+	}
+	if !ix.PausedUntil().IsZero() {
+		t.Fatal("no key paused indexing")
+	}
+	for _, mode := range []Mode{Keyword, Auto} {
+		used := ix.Resolve(ctx, mode, "apple")
+		hits, err := ix.Search(ctx, "apple", 3, used)
+		if err != nil || used != Keyword || len(hits) != 1 || hits[0].Path != "a.md" {
+			t.Fatalf("%s ran %s: hits %+v, %v", mode, used, hits, err)
+		}
+	}
+	// Unchanged, keyword-only files stay as they are while there is no key.
+	if st, err := ix.Sync(ctx); err != nil || st.Indexed != 0 || st.KeywordOnly != 0 || len(ke.inputs) != 0 {
+		t.Fatalf("second sync without a key = %+v, %v; inputs %q", st, err, ke.inputs)
+	}
+	// A file that had vectors and changed loses them until a key appears.
+	write(t, ix.Root(), "cherry.md", "# Cherry\ncherry cherry cherry\n")
+	if st, _ := ix.Sync(ctx); st.KeywordOnly != 1 || keywordOnly(t, ix) != 3 {
+		t.Fatalf("changed file without a key = %+v", st)
+	}
+
+	ke.key = true
+	st, err = ix.Sync(ctx)
+	if err != nil || st != (SyncStats{Scanned: 4, Indexed: 3}) {
+		t.Fatalf("sync with a key again = %+v, %v", st, err)
+	}
+	if got := embeddedPaths(ke.inputs); !slices.Equal(got, []string{"a.md", "cherry.md", "sub/b.md"}) {
+		t.Fatalf("embedded %q", got)
+	}
+	if n := keywordOnly(t, ix); n != 0 {
+		t.Fatalf("keyword-only files after the key = %d", n)
+	}
+	hits, err := ix.Search(ctx, "apple", 1, Semantic)
+	if err != nil || len(hits) != 1 || hits[0].Path != "a.md" || hits[0].Match != store.MatchSemantic {
+		t.Fatalf("semantic = %+v, %v", hits, err)
+	}
+	// Nothing is embedded twice.
+	ke.inputs = nil
+	if st, _ := ix.Sync(ctx); st.Indexed != 0 || len(ke.inputs) != 0 {
+		t.Fatalf("third sync = %+v, inputs %q", st, ke.inputs)
+	}
+}
+
+// TestIndexFileWithoutKey: the watcher's path stores a file for keyword
+// search too, and embeds it once there is a key though it is unchanged.
+func TestIndexFileWithoutKey(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	ke := &keyEmbedder{}
+	ix.Embedder = ke
+	write(t, ix.Root(), "a.md", "# Apples\napple\n")
+	if changed, err := ix.IndexFile(ctx, "a.md"); err != nil || !changed || ke.calls != 0 || keywordOnly(t, ix) != 1 {
+		t.Fatalf("IndexFile without a key = %v, %v; calls %d", changed, err, ke.calls)
+	}
+	if changed, err := ix.IndexFile(ctx, "a.md"); err != nil || changed {
+		t.Fatalf("again without a key = %v, %v", changed, err)
+	}
+	ke.key = true
+	if changed, err := ix.IndexFile(ctx, "a.md"); err != nil || !changed || ke.calls != 1 || keywordOnly(t, ix) != 0 {
+		t.Fatalf("IndexFile with a key = %v, %v; calls %d", changed, err, ke.calls)
+	}
+}
+
+// TestSemanticOverKeywordOnlyIndex: with a key for queries but only
+// keyword-only files, semantic search finds nothing rather than failing, and
+// hybrid still finds the keyword side.
+func TestSemanticOverKeywordOnlyIndex(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	ix.Embedder = &keyEmbedder{}
+	write(t, ix.Root(), "a.md", "# Apples\napple\n")
+	if _, err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ix.QueryEmbedder = &keyEmbedder{key: true}
+	if hits, err := ix.Search(ctx, "apple", 3, Semantic); err != nil || len(hits) != 0 {
+		t.Fatalf("semantic = %+v, %v", hits, err)
+	}
+	hits, err := ix.Search(ctx, "apple", 3, Hybrid)
+	if err != nil || len(hits) != 1 || hits[0].Match != store.MatchKeyword {
+		t.Fatalf("hybrid = %+v, %v", hits, err)
+	}
+}
+
+// failEmbedder fails every call with an error that is not ErrUnavailable,
+// such as a rejected key.
+type failEmbedder struct{ fakeEmbedder }
+
+func (f *failEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	f.calls++
+	return nil, errors.New("embed: 401 Unauthorized")
+}
+
+// TestKeywordOnlyAPIErrors: once there is a key, a keyword-only file whose
+// embedding fails is deferred (with the usual pause) or failed as any file
+// is, and keeps its keyword rows.
+func TestKeywordOnlyAPIErrors(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	ix.Embedder = &keyEmbedder{}
+	write(t, ix.Root(), "a.md", "# Apples\napple\n")
+	write(t, ix.Root(), "b.md", "# Bananas\nbanana\n")
+	if st, _ := ix.Sync(ctx); st.KeywordOnly != 2 {
+		t.Fatalf("sync without a key = %+v", st)
+	}
+	de := &downEmbedder{down: true}
+	ix.Embedder = de
+	st, err := ix.Sync(ctx)
+	if err != nil || st.Deferred != 2 || st.Indexed != 0 || de.calls != 1 || time.Until(ix.PausedUntil()) < 25*time.Second {
+		t.Fatalf("API down = %+v, %v; calls %d", st, err, de.calls)
+	}
+	ix.mu.Lock()
+	ix.pauseUntil, ix.backoff = time.Time{}, 0
+	ix.mu.Unlock()
+	fe := &failEmbedder{}
+	ix.Embedder = fe
+	if st, err := ix.Sync(ctx); err != nil || st.Failed != 2 || st.Indexed != 0 || fe.calls != 2 {
+		t.Fatalf("API error = %+v, %v; calls %d", st, err, fe.calls)
+	}
+	if n := keywordOnly(t, ix); n != 2 {
+		t.Fatalf("keyword-only files = %d, want 2", n)
+	}
+	if hits, err := ix.Search(ctx, "banana", 3, Keyword); err != nil || len(hits) != 1 {
+		t.Fatalf("keyword = %+v, %v", hits, err)
+	}
+	ix.Embedder = &keyEmbedder{key: true}
+	if st, err := ix.Sync(ctx); err != nil || st.Indexed != 2 || keywordOnly(t, ix) != 0 {
+		t.Fatalf("API back = %+v, %v", st, err)
+	}
+}
+
+func TestIndexedText(t *testing.T) {
+	if got := (SyncStats{Indexed: 3}).IndexedText(); got != "3 indexed" {
+		t.Errorf("got %q", got)
+	}
+	if got := (SyncStats{Indexed: 3, KeywordOnly: 2}).IndexedText(); got != "3 indexed (2 keyword only: no API key)" {
+		t.Errorf("got %q", got)
 	}
 }

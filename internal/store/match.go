@@ -10,8 +10,12 @@ import (
 )
 
 // TextMatch is a text that matched a word, by its index in the texts
-// given, and the byte offset of the match's first token in it.
-type TextMatch struct{ Row, At int }
+// given, the byte offset of the match's first token in it, and the byte
+// range [start, end) of each place the word matches, in order.
+type TextMatch struct {
+	Row, At int
+	Spans   [][2]int
+}
 
 // MatchTexts reports, for each word, which texts match it as keyword
 // search would: each word is quoted as phrase() quotes it and matched in
@@ -70,7 +74,7 @@ func MatchTexts(ctx context.Context, words, texts []string) (out [][]TextMatch, 
 				rows.Close()
 				return nil, err
 			}
-			out[i] = append(out[i], TextMatch{Row: row - 1, At: max(strings.IndexByte(marked, 1), 0)})
+			out[i] = append(out[i], TextMatch{Row: row - 1, At: max(strings.IndexByte(marked, 1), 0), Spans: spans(marked)})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -78,4 +82,25 @@ func MatchTexts(ctx context.Context, words, texts []string) (out [][]TextMatch, 
 		}
 	}
 	return out, nil
+}
+
+// spans returns the byte ranges in the unmarked text that highlight()
+// marked with \x01 and \x02.
+func spans(marked string) [][2]int {
+	var out [][2]int
+	start, cut := -1, 0
+	for i := 0; i < len(marked); i++ {
+		switch marked[i] {
+		case 1:
+			start = i - cut
+			cut++
+		case 2:
+			if start >= 0 {
+				out = append(out, [2]int{start, i - cut})
+			}
+			start = -1
+			cut++
+		}
+	}
+	return out
 }

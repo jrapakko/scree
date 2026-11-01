@@ -76,7 +76,9 @@ Settings come from environment variables. The [settings file](#settings-file) is
 | `SCREE_FIRST_SYNC_MB` | `50`; a Claude Code session or `watch` won't start the first index of a folder with more markdown than this (`0` = no limit); `scree reindex` always does |
 | `SCREE_ZDR` | `1`; set `0` for endpoints other than OpenRouter |
 | `SCREE_HTTP_TOKEN` | none; required with `serve -allow-remote`, and enforced on loopback if set |
-| `OPENROUTER_API_KEY` | none; when unset and the [settings file](#settings-file) holds one (`scree key` writes it there), `search`, `reindex`, `doctor` and `watch` run as `scree run` would. Without a key, `auto` search runs `keyword` |
+| `SCREE_PAGER` | `less -FRX` from `/usr/local/bin`, `/usr/bin` or `/bin`; the pager for `scree search`'s text view on a terminal, run without a shell: an absolute path or a name in those folders (never looked up on `PATH`), then its arguments. Set it empty for none |
+| `SCREE_COLORS` | `word=1:match=1;33:link=36:lineno=2`; the text view's colours as SGR codes (digits and `;` only) for the word headings, the matched words, the locations and the line numbers. `match=` turns one off |
+| `OPENROUTER_API_KEY` | none; when unset and the [settings file](#settings-file) holds one (`scree key` writes it there), `search`, `reindex`, `doctor` and `watch` run as `scree run` would. Without a key (unset or empty), notes are indexed for keyword search only and `auto` search runs `keyword` |
 
 `$XDG_DATA_HOME` defaults to `~/.local/share`.
 
@@ -127,6 +129,7 @@ scree reindex -all       # rebuild from scratch
 scree search "how do I rotate the backup keys"
 scree search -mode keyword PURGE_OLD_RECORDS   # exact words, no API call
 scree search -format text "ci seed"              # hits grouped by query word (the default on a terminal)
+scree search -no-pager "ci seed"                 # the same, printed without the pager
 scree search -format json "…"                    # one JSON object per hit
 scree watch              # keep the index current (run as a service)
 scree serve -notes .     # MCP over stdio, from a terminal
@@ -146,6 +149,8 @@ Every command but `indexes` and `key` takes `-notes <dir>`, `-db <file>` and `-g
 - **`keyword`**: FTS5 only. It makes no API call, so it works without a key or while the API is down. A failed embedding call says so.
 
 With no API key, `auto` runs `keyword` and its output ends with `[mode: auto → keyword: no API key; run scree key, or set OPENROUTER_API_KEY]`; `-mode semantic` or `hybrid` is an error. `serve` says `set OPENROUTER_API_KEY, or start through scree mcp` instead, since it never reads the settings file, and on Windows only `set OPENROUTER_API_KEY`.
+
+Without a key, indexing still works: each note is chunked and stored for keyword search, with no API call, and `reindex` reports those files as `indexed (N keyword only: no API key)`. Once a key is set, the next sync (`scree reindex`, or the writer starting) embeds exactly those files and no others. Until then, `semantic` and `hybrid` miss them and say so (`[N files indexed for keyword search only; scree reindex embeds them]`), and `scree doctor` counts them on its index line. An API error or outage with a key is not treated as no key: the file fails or waits for the API as before.
 
 On a private set of 16 plain-language and 7 identifier queries over real notes, `auto` kept plain-question file MRR at 0.89 while raising identifier MRR from 0.46 to 0.80. Always-on `hybrid` raised identifiers as much but cost plain questions, which is why it is not the default.
 
@@ -179,7 +184,9 @@ other hits:
 [mode: auto → hybrid]
 ```
 
-A word matches whole tokens, as keyword search does, including inside a path written in a note (`ci` matches `.forgejo/workflows/ci.yml`) and across a line break. Each location is a link to the file in terminals that support OSC 8 links; set `NO_COLOR` or `TERM=dumb` to turn them off (`scree run search` honours it). There is no colour. Use `-mode keyword` for a grep-like view with no semantic hits.
+A word matches whole tokens, as keyword search does, including inside a path written in a note (`ci` matches `.forgejo/workflows/ci.yml`) and across a line break. Each location is a link to the file in terminals that support OSC 8 links. The query words are coloured wherever they match in the excerpt and the numbered lines, and the word headings, locations and line numbers have their own colours (`SCREE_COLORS`). Set `NO_COLOR` or `TERM=dumb` to turn links and colours off (`scree run search` honours it). Use `-mode keyword` for a grep-like view with no semantic hits.
+
+On a terminal the text view goes through a pager, so it starts at the top: `less -FRX` (it quits at once if the view fits on one screen, passes the colours and links, and leaves the text on screen when you quit), or `SCREE_PAGER`. `less` 566 and later pass OSC 8 links with `-R`; older versions show them as raw escapes, so use `-no-pager` or `SCREE_PAGER=` there. `-no-pager`, `SCREE_PAGER=` (set but empty), a pipe, or a pager that cannot start prints directly. Quitting the pager early is not an error. `scree run search`, and a direct `scree search` using the settings file's key, take `SCREE_PAGER` and `SCREE_COLORS` from the settings file only. They pass your `TERM` on only if it is a plain terminal name such as `xterm-256color`, and never `TERMINFO`, `TERMINFO_DIRS` or `TERMCAP`. Without a usable `TERM` the default `less` is not used, because `less` needs it.
 
 Piped, or with `-format xml`, each hit is a `<hit>` element:
 

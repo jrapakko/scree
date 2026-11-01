@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestMatchTexts: words match texts as keyword search matches chunks, and
-// At points at the match.
+// TestMatchTexts: words match texts as keyword search matches chunks, At
+// points at the match, and Spans covers each place the word matches.
 func TestMatchTexts(t *testing.T) {
 	texts := []string{
 		"see .forgejo/workflows/ci.yml for the job", // 0
@@ -19,22 +19,37 @@ func TestMatchTexts(t *testing.T) {
 		"purge everything",                          // 5
 		"ship R7-Q2 then R7",                        // 6
 		`NEAR the col:x "quoted" text`,              // 7
+		"Café, then café again",                     // 8
+	}
+	// m is a match of the text at row on each of words, found in order.
+	m := func(row int, words ...string) TextMatch {
+		tm := TextMatch{Row: row}
+		from := 0
+		for i, w := range words {
+			at := from + strings.Index(texts[row][from:], w)
+			if i == 0 {
+				tm.At = at
+			}
+			tm.Spans = append(tm.Spans, [2]int{at, at + len(w)})
+			from = at + len(w)
+		}
+		return tm
 	}
 	cases := []struct {
 		word string
 		want []TextMatch
 	}{
-		{"ci", []TextMatch{{0, strings.Index(texts[0], "ci.yml")}}},
-		{"cafe", []TextMatch{{2, 0}, {3, 0}}},
-		{"Café", []TextMatch{{2, 0}, {3, 0}}},
-		{"purge_old_records", []TextMatch{{4, 4}}},
-		{"purge", []TextMatch{{5, 0}}},
-		{"ci.yml", []TextMatch{{0, strings.Index(texts[0], "ci.yml")}}},
-		{"R7-Q2", []TextMatch{{6, 5}}},
-		{"r7", []TextMatch{{6, strings.LastIndex(texts[6], "R7")}}},
-		{"NEAR", []TextMatch{{7, 0}}},
-		{"col:x", []TextMatch{{7, strings.Index(texts[7], "col")}}},
-		{`"quoted"`, []TextMatch{{7, strings.Index(texts[7], "quoted")}}},
+		{"ci", []TextMatch{m(0, "ci")}},
+		{"cafe", []TextMatch{m(2, "Café"), m(3, "CAFÉ"), m(8, "Café", "café")}},
+		{"Café", []TextMatch{m(2, "Café"), m(3, "CAFÉ"), m(8, "Café", "café")}},
+		{"purge_old_records", []TextMatch{m(4, "PURGE_OLD_RECORDS")}},
+		{"purge", []TextMatch{m(5, "purge")}},
+		{"ci.yml", []TextMatch{m(0, "ci.yml")}},
+		{"R7-Q2", []TextMatch{m(6, "R7-Q2")}},
+		{"r7", []TextMatch{{Row: 6, At: strings.LastIndex(texts[6], "R7"), Spans: [][2]int{{16, 18}}}}},
+		{"NEAR", []TextMatch{m(7, "NEAR")}},
+		{"col:x", []TextMatch{m(7, "col:x")}},
+		{`"quoted"`, []TextMatch{m(7, "quoted")}},
 		{"/", nil},
 		{"nothing", nil},
 	}
@@ -50,7 +65,9 @@ func TestMatchTexts(t *testing.T) {
 		t.Fatalf("%d results for %d words", len(got), len(words))
 	}
 	for i, c := range cases {
-		if !slices.Equal(got[i], c.want) {
+		if !slices.EqualFunc(got[i], c.want, func(a, b TextMatch) bool {
+			return a.Row == b.Row && a.At == b.At && slices.Equal(a.Spans, b.Spans)
+		}) {
 			t.Errorf("%q: %v, want %v", c.word, got[i], c.want)
 		}
 	}

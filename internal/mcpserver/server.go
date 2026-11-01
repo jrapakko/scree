@@ -105,6 +105,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 		if mode == index.Auto {
 			note = joinNotes(ModeNote(used, ix.KeyHint()), note)
 		}
+		note = joinNotes(note, KeywordOnlyNote(ctx, ix, used, "reindex embeds them"))
 		return textResult(FormatHits(hits, note)), nil, nil
 	})
 
@@ -168,8 +169,8 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
-		return textResult(fmt.Sprintf("Scanned %d files: %d indexed, %d removed, %d failed, %d deferred.",
-			st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)), nil, nil
+		return textResult(fmt.Sprintf("Scanned %d files: %s, %d removed, %d failed, %d deferred.",
+			st.Scanned, st.IndexedText(), st.Removed, st.Failed, st.Deferred)), nil, nil
 	})
 
 	return s
@@ -244,6 +245,22 @@ func ModeNote(used index.Mode, keyHint string) string {
 		return "[mode: auto → keyword: no API key; " + keyHint + "]"
 	}
 	return "[mode: auto → " + string(used) + "]"
+}
+
+// KeywordOnlyNote is a line for FormatHits output when used, the mode a
+// search ran, embeds the query and the index holds files stored without
+// vectors (indexed with no API key), which only keyword search finds:
+// "[N files indexed for keyword search only; hint]". It is "" otherwise,
+// and when the count cannot be read.
+func KeywordOnlyNote(ctx context.Context, ix *index.Indexer, used index.Mode, hint string) string {
+	if used == index.Keyword || ix.Store == nil {
+		return ""
+	}
+	n, err := ix.Store.KeywordOnlyFiles(ctx)
+	if err != nil || n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[%d files indexed for keyword search only; %s]", n, hint)
 }
 
 // joinNotes joins the non-empty notes with newlines.

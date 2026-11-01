@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -192,7 +193,7 @@ func TestCLISearchText(t *testing.T) {
 	if got := searchOut(t, false, plain...); !strings.HasPrefix(got, "<hit ") {
 		t.Errorf("pipe default: %q", got)
 	}
-	if got := searchOut(t, true, plain...); !strings.HasPrefix(got, "ops:\n  # Ops\n\t>\x1b]8;;file://") {
+	if got := searchOut(t, true, plain...); !strings.HasPrefix(got, "\x1b[1mops:\x1b[m\n  # \x1b[1;33mOps\x1b[m\n\t>\x1b]8;;file://") {
 		t.Errorf("terminal default: %q", got)
 	}
 	if err := runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "yaml", "x"}); err == nil ||
@@ -267,8 +268,10 @@ func TestCLISearchTextOtherHits(t *testing.T) {
 
 // TestCLISearchTextHostile: a note and file name full of terminal
 // controls cannot inject escapes; the only ESCs are the view's own OSC 8
-// links, whose URIs are percent-encoded, and no excerpt line can pass for
-// a location line. NO_COLOR or TERM=dumb drops the links.
+// links, whose URIs are percent-encoded, and its own colours, each around
+// a query word, a heading, a location label or a line number; and no
+// excerpt line can pass for a location line. NO_COLOR or TERM=dumb drops
+// the links and colours.
 func TestCLISearchTextHostile(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -287,8 +290,19 @@ func TestCLISearchTextHostile(t *testing.T) {
 			}
 			t.Fatalf("no hit for %q: %q", name, got)
 		}
+		// The view's own colours, in the default palette, set aside.
+		colors := regexp.MustCompile("\x1b\\[(?:1|1;33|36|2)?m")
+		for _, m := range regexp.MustCompile("\x1b\\[1;33m([^\x1b]*)\x1b\\[m").FindAllStringSubmatch(got, -1) {
+			if w := strings.ToLower(m[1]); w != "hostile" && w != "run" {
+				t.Errorf("%q: match colour on %q", name, m[1])
+			}
+		}
+		if n := len(colors.FindAllString(got, -1)); n == 0 || n%2 != 0 {
+			t.Errorf("%q: %d colour codes:\n%q", name, n, got)
+		}
+		plain := colors.ReplaceAllString(got, "")
 		labels := 0
-		for _, l := range strings.Split(got, "\n") {
+		for _, l := range strings.Split(plain, "\n") {
 			switch {
 			case strings.HasPrefix(l, "\t>\x1b]8;;file://"):
 				labels++
@@ -297,11 +311,11 @@ func TestCLISearchTextHostile(t *testing.T) {
 				t.Errorf("%q: line passes for a location: %q", name, l)
 			}
 		}
-		if n := strings.Count(got, "\x1b"); labels == 0 || n != 4*labels {
+		if n := strings.Count(plain, "\x1b"); labels == 0 || n != 4*labels {
 			t.Errorf("%q: %d ESC for %d labels:\n%q", name, n, labels, got)
 		}
 		for _, want := range []string{"\n      >evil.md:1 hostile\n", "\n      >evil.md:2 hostile\n", "\n  pad >evil.md:3 hostile\n"} {
-			if !strings.Contains(got, want) {
+			if !strings.Contains(plain, want) {
 				t.Errorf("%q: lacks %q: %q", name, want, got)
 			}
 		}
@@ -431,16 +445,23 @@ func TestTextLine(t *testing.T) {
 }
 
 // TestWriteLines: lines are numbered and right-aligned, a blank line is
-// its number alone, and past maxHitBytes the rest is counted.
+// its number alone, and past maxHitBytes the rest is counted. With a code
+// the ">>" and number are painted, and mark sees each line's text.
 func TestWriteLines(t *testing.T) {
-	var b strings.Builder
-	writeLines(&b, []string{"a\tb", "", "c"}, 9)
-	if got := b.String(); got != "\t\t>> 9  a b\n\t\t>>10\n\t\t>>11  c\n" {
+	write := func(lines []string, first int, code string, mark func(string) string) string {
+		var b strings.Builder
+		shown, more := shownLines(lines)
+		writeLines(&b, shown, more, len(lines), first, code, mark)
+		return b.String()
+	}
+	same := func(s string) string { return s }
+	if got := write([]string{"a\tb", "", "c"}, 9, "", same); got != "\t\t>> 9  a b\n\t\t>>10\n\t\t>>11  c\n" {
 		t.Errorf("numbered: %q", got)
 	}
-	b.Reset()
-	writeLines(&b, []string{strings.Repeat("é", maxHitBytes), "x", "y"}, 1)
-	got := b.String()
+	if got := write([]string{"a b", ""}, 1, "2", strings.ToUpper); got != "\t\t\x1b[2m>>1\x1b[m  A B\n\t\t\x1b[2m>>2\x1b[m\n" {
+		t.Errorf("painted: %q", got)
+	}
+	got := write([]string{strings.Repeat("é", maxHitBytes), "x", "y"}, 1, "", same)
 	if !utf8.ValidString(got) || !strings.HasSuffix(got, "…\n\t\t>>… 2 more lines\n") || len(got) > maxHitBytes+40 {
 		t.Errorf("cap: %d bytes, valid %v", len(got), utf8.ValidString(got))
 	}
@@ -462,6 +483,109 @@ func TestCLISearchBadK(t *testing.T) {
 		err := runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-mode", "keyword", "-k", k, "ops"})
 		if err == nil || !strings.Contains(err.Error(), "-k must be at least 1") {
 			t.Errorf("-k %s: %v", k, err)
+		}
+	}
+}
+
+// TestCLISearchTextColors: on a terminal the text view paints the word
+// heading, each place a query word matches in the excerpt and the
+// numbered lines, the location label and the line numbers, in the default
+// palette or SCREE_COLORS; NO_COLOR, TERM=dumb or a pipe give no colour.
+// A bad SCREE_COLORS is an error before the index is opened.
+func TestCLISearchTextColors(t *testing.T) {
+	serveEnv(t)
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm")
+	notes, db := searchFixture(t)
+	args := []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "text", "purge_old_records ops"}
+	view := func(word, match, link, lineno string) string {
+		p := func(code, s string) string { return "\x1b[" + code + "m" + s + "\x1b[m" }
+		if lineno == "" {
+			p0 := p
+			p = func(code, s string) string {
+				if code == "" {
+					return s
+				}
+				return p0(code, s)
+			}
+		}
+		return p(word, "purge_old_records:") + "\n" +
+			"  # " + p(match, "Ops") + "\n" +
+			"  run " + p(match, "PURGE_OLD_RECORDS") + " nightly via the PageFetcher\n" +
+			"\t>" + osc8(p(link, "ops.md:1-3"), filepath.Join(notes, "ops.md")) + "\n" +
+			"\t\t" + p(lineno, ">>1") + "  # " + p(match, "Ops") + "\n" +
+			"\t\t" + p(lineno, ">>2") + "\n" +
+			"\t\t" + p(lineno, ">>3") + "  run " + p(match, "PURGE_OLD_RECORDS") + " nightly via the PageFetcher\n"
+	}
+	if got, want := searchOut(t, true, args...), view("1", "1;33", "36", "2"); got != want {
+		t.Errorf("default palette:\n%q\nwant\n%q", got, want)
+	}
+	t.Setenv("SCREE_COLORS", "match=7:lineno=:word=4;1")
+	if got, want := searchOut(t, true, args...), view("4;1", "7", "36", ""); got != want {
+		t.Errorf("SCREE_COLORS:\n%q\nwant\n%q", got, want)
+	}
+	for _, env := range [][2]string{{"NO_COLOR", "1"}, {"TERM", "dumb"}} {
+		t.Setenv(env[0], env[1])
+		if got := searchOut(t, true, args...); strings.Contains(got, "\x1b") || !strings.HasPrefix(got, "purge_old_records:\n") {
+			t.Errorf("%s=%s: %q", env[0], env[1], got)
+		}
+		t.Setenv("NO_COLOR", "")
+		t.Setenv("TERM", "xterm")
+	}
+	if got := searchOut(t, false, args...); strings.Contains(got, "\x1b") {
+		t.Errorf("pipe: %q", got)
+	}
+
+	// Every query word is painted wherever it matches, the long line cut
+	// around the match with the paint inside the cut.
+	t.Setenv("SCREE_COLORS", "")
+	long := strings.Repeat("x ", 150) + "needle and Needle " + strings.Repeat("y ", 100)
+	addNote(t, notes, db, "long.md", "Long", "# Needle\n"+long+"\n")
+	got := searchOut(t, true, "-notes", notes, "-db", db, "-mode", "keyword", "-format", "text", "needle")
+	if n := strings.Count(got, "\x1b[1;33m"); n != 6 || strings.Count(got, "\x1b[1;33mNeedle\x1b[m") != 4 ||
+		!strings.Contains(got, "\n  …x x ") || !strings.Contains(got, "\x1b[1;33mneedle\x1b[m and \x1b[1;33mNeedle\x1b[m y ") {
+		t.Errorf("long line: %d match codes\n%q", n, got)
+	}
+
+	// A bad SCREE_COLORS is refused before the index is opened, so a
+	// missing index is not the error; other formats ignore it.
+	t.Setenv("SCREE_COLORS", "matches=1")
+	missing := []string{"-notes", notes, "-db", filepath.Join(tempDir(t), "no", "index.db"), "-mode", "keyword", "-format", "text", "x"}
+	if err := runSearch(context.Background(), missing); err == nil || err.Error() != "SCREE_COLORS: unknown key matches (want word, match, link or lineno)" {
+		t.Errorf("bad SCREE_COLORS: %v", err)
+	}
+	if out := searchOut(t, false, "-notes", notes, "-db", db, "-mode", "keyword", "-format", "json", "ops"); !strings.Contains(out, `"path":"ops.md"`) {
+		t.Errorf("json with bad SCREE_COLORS: %q", out)
+	}
+}
+
+// TestParseColors: SCREE_COLORS sets codes over the defaults; unknown
+// keys and codes with anything but digits and ";" are errors naming the
+// key and never the code.
+func TestParseColors(t *testing.T) {
+	for s, want := range map[string]palette{
+		"":                           defaultPalette,
+		"match=":                     {word: "1", link: "36", lineno: "2"},
+		"match=4:link=35;1::":        {word: "1", match: "4", link: "35;1", lineno: "2"},
+		"word=:match=:link=:lineno=": {},
+		"lineno=38;5;244":            {word: "1", match: "1;33", link: "36", lineno: "38;5;244"},
+	} {
+		if got, err := parseColors(s); err != nil || got != want {
+			t.Errorf("%q: %+v, %v; want %+v", s, got, err, want)
+		}
+	}
+	for s, want := range map[string]string{
+		"bold=1":               "unknown key bold",
+		"match=1;33m\x1b]8;;x": "match: a code holds only digits",
+		"link=36\x1b[2J":       "link: a code holds only digits",
+		"word=1 ":              "word: a code holds only digits",
+		"lineno":               "lineno has no =code",
+		"\x1b[31m=1":           "expected key=code items",
+		"match=1;33,link=36":   "match: a code holds only digits",
+	} {
+		_, err := parseColors(s)
+		if err == nil || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "\x1b") {
+			t.Errorf("%q: %v, want %q", s, err, want)
 		}
 	}
 }

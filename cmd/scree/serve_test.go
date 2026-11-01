@@ -24,9 +24,11 @@ func serveEnv(t *testing.T) string {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	data := filepath.Join(home, "data")
 	t.Setenv("XDG_DATA_HOME", data)
-	for _, v := range []string{"SCREE_DB", "SCREE_NOTES", "SCREE_EMBED_URL", "OPENROUTER_API_KEY", "SCREE_HTTP_TOKEN", "CLAUDE_PROJECT_DIR"} {
+	for _, v := range []string{"SCREE_DB", "SCREE_NOTES", "SCREE_EMBED_URL", "OPENROUTER_API_KEY", "SCREE_HTTP_TOKEN", "CLAUDE_PROJECT_DIR", "SCREE_COLORS"} {
 		t.Setenv(v, "")
 	}
+	// Set and empty: no pager, so tests on a fake terminal read stdout.
+	t.Setenv("SCREE_PAGER", "")
 	return data
 }
 

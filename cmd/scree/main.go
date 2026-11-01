@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -53,15 +54,16 @@ Usage:
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
                            -http is loopback only unless -allow-remote)
-  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] "query"
+  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] [-no-pager] "query"
                            auto (default) is semantic, plus keyword search
                            when the query holds an identifier such as FOO_BAR
                            or a name from the folder's code, and keyword
                            alone when there is no API key;
                            keyword makes no API call; -format text (the
-                           default on a terminal) groups lines by query word;
-                           -format json prints one object per hit, the stable
-                           format for evals
+                           default on a terminal) groups lines by query word,
+                           on a terminal coloured and through a pager unless
+                           -no-pager; -format json prints one object per
+                           hit, the stable format for evals
   scree reindex [-all] [path]
   scree doctor [-v] [-offline]
                            check configuration, the index and ignore rules
@@ -93,6 +95,13 @@ not $HOME. Environment:
                       with settings from that file only
   SCREE_HTTP_TOKEN    bearer token for serve -http; required with
                       -allow-remote, enforced on loopback when set
+  SCREE_PAGER         pager for search's text view on a terminal, run
+                      without a shell: an absolute path or a name in
+                      /usr/local/bin, /usr/bin or /bin, then its arguments
+                      (default less -FRX from those folders); empty for none
+  SCREE_COLORS        text view colours as SGR codes, e.g.
+                      word=1:match=1;33:link=36:lineno=2 (the default);
+                      key= turns one off
 `
 
 type config struct {
@@ -544,9 +553,10 @@ func runSearch(ctx context.Context, args []string) error {
 	k := fs.Int("k", 8, "number of results")
 	modeFlag := fs.String("mode", "auto", "auto (semantic, plus keyword for identifier-like queries or names from the folder's code), hybrid, semantic or keyword (no API call)")
 	format := fs.String("format", "", "text (the default on a terminal), xml (the default otherwise) or json")
+	noPager := fs.Bool("no-pager", false, "print the text view directly, without a pager")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] "query"`)
+		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] [-no-pager] "query"`)
 	}
 	if *k < 1 {
 		return fmt.Errorf("-k must be at least 1, not %d", *k)
@@ -563,6 +573,19 @@ func runSearch(ctx context.Context, args []string) error {
 	}
 	if *format != "text" && *format != "xml" && *format != "json" {
 		return fmt.Errorf("format must be text, xml or json, not %q", *format)
+	}
+	// Colours, like links, and the pager are for the terminal on stdout.
+	var pal palette
+	links, paged := false, false
+	if *format == "text" {
+		colors, err := parseColors(os.Getenv("SCREE_COLORS"))
+		if err != nil {
+			return err
+		}
+		if links = linksOn(); links {
+			pal = colors
+		}
+		paged = !*noPager && stdoutTerminal()
 	}
 	ix, err := open(&cfg, true)
 	if err != nil {
@@ -581,8 +604,15 @@ func runSearch(ctx context.Context, args []string) error {
 	if mode == index.Auto {
 		note = mcpserver.ModeNote(used, ix.KeyHint())
 	}
+	if kw := mcpserver.KeywordOnlyNote(ctx, ix, used, "scree reindex embeds them"); kw != "" {
+		note = strings.TrimPrefix(note+"\n"+kw, "\n")
+	}
 	if *format == "text" {
-		return writeText(ctx, os.Stdout, ix, fs.Arg(0), hits, note, linksOn())
+		out, done := io.Writer(os.Stdout), func(err error) error { return err }
+		if paged {
+			out, done = startPager()
+		}
+		return done(writeText(ctx, out, ix, fs.Arg(0), hits, note, links, pal))
 	}
 	fmt.Println(mcpserver.FormatHits(hits, note))
 	return nil
@@ -642,8 +672,8 @@ func runReindex(ctx context.Context, args []string) error {
 	if err := writer.MarkSynced(ix.Store); err != nil {
 		return err
 	}
-	fmt.Printf("%d files: %d indexed, %d removed, %d failed, %d deferred\n",
-		st.Scanned, st.Indexed, st.Removed, st.Failed, st.Deferred)
+	fmt.Printf("%d files: %s, %d removed, %d failed, %d deferred\n",
+		st.Scanned, st.IndexedText(), st.Removed, st.Failed, st.Deferred)
 	if st.Failed+st.Deferred > 0 {
 		return fmt.Errorf("%d files failed and %d were deferred; run reindex again", st.Failed, st.Deferred)
 	}
@@ -721,7 +751,7 @@ func runDoctor(ctx context.Context, args []string) error {
 		report(true, "index %s: not created yet (the first serve, watch or reindex builds it)", cfg.db)
 	} else {
 		st, err := ix.Store.Stats(ctx)
-		report(err == nil, "index %s: %d files, %d chunks (vec1 %s)", cfg.db, st.Files, st.Chunks, st.Vec1Info)
+		report(err == nil, "index %s: %d files, %d chunks%s (vec1 %s)", cfg.db, st.Files, st.Chunks, keywordOnlyText(st.KeywordOnly, cfg.apiKey != ""), st.Vec1Info)
 		doctorKeyword(ctx, ix.Store, st.Chunks, *verbose, report)
 		doctorVocab(ctx, ix.Store, *verbose, report)
 		have, _ = ix.Store.Model()
@@ -779,6 +809,19 @@ func runDoctor(ctx context.Context, args []string) error {
 		return errors.New("doctor found problems")
 	}
 	return nil
+}
+
+// keywordOnlyText is doctor's note on the n files indexed without vectors,
+// which semantic search cannot find: how to embed them, given whether there
+// is a key now. It is "" for none.
+func keywordOnlyText(n int, key bool) string {
+	switch {
+	case n == 0:
+		return ""
+	case key:
+		return fmt.Sprintf(" (%d files keyword-only: indexed without an API key; run scree reindex)", n)
+	}
+	return fmt.Sprintf(" (%d files keyword-only: no API key; %s)", n, noKeyHint(false))
 }
 
 // doctorKeyword reports the keyword index: its row count must equal chunks,

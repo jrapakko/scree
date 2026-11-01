@@ -252,8 +252,9 @@ func runMCP(args []string) error {
 
 // runRun is `scree run <command> [args]`: any other command, with its
 // arguments, run the way scree mcp runs serve. NO_COLOR set or TERM=dumb
-// reaches the child as NO_COLOR=1, so search's text view leaves out links;
-// neither raw value is passed.
+// reaches the child as NO_COLOR=1, so search's text view leaves out links
+// and colours; NO_COLOR's raw value is not passed, and TERM only when
+// safeTerm accepts it.
 func runRun(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: scree run <command> [args]")
@@ -269,11 +270,33 @@ func runRun(args []string) error {
 }
 
 // runExtra is what scree run adds to the settings in the child's
-// environment: CLAUDE_PROJECT_DIR when set, and NO_COLOR=1 when NO_COLOR is
-// set or TERM is dumb.
+// environment: CLAUDE_PROJECT_DIR when set, NO_COLOR=1 when NO_COLOR is
+// set or TERM is dumb, and TERM when safeTerm accepts it, so a pager can
+// drive the terminal. TERMINFO, TERMINFO_DIRS and TERMCAP are never
+// passed, so the terminal description comes from the system's.
 func runExtra() []string {
-	noColor := os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb"
-	return launchExtra(os.Getenv("CLAUDE_PROJECT_DIR"), noColor)
+	term := os.Getenv("TERM")
+	extra := launchExtra(os.Getenv("CLAUDE_PROJECT_DIR"), os.Getenv("NO_COLOR") != "" || term == "dumb")
+	if safeTerm(term) {
+		extra = append(extra, "TERM="+term)
+	}
+	return extra
+}
+
+// safeTerm reports whether t is a terminal name: [A-Za-z0-9] then at most
+// 63 of [A-Za-z0-9._+-], with no "..", so it cannot name a path.
+func safeTerm(t string) bool {
+	if t == "" || len(t) > 64 || strings.Contains(t, "..") {
+		return false
+	}
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		alnum := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+		if !alnum && (i == 0 || c != '.' && c != '_' && c != '+' && c != '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // launchExtra is CLAUDE_PROJECT_DIR=pd when pd is set, then NO_COLOR=1 with
@@ -423,11 +446,8 @@ func validVolume(v string) bool {
 // findEngine returns the absolute path of docker or podman in engineDirs,
 // never through PATH.
 func findEngine(name string) (string, error) {
-	for _, d := range engineDirs {
-		p := filepath.Join(d, name)
-		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0 {
-			return p, nil
-		}
+	if p := findExec(engineDirs, name); p != "" {
+		return p, nil
 	}
 	return "", fmt.Errorf("mcp -docker: %s not found in %s", name, strings.Join(engineDirs, ", "))
 }

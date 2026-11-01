@@ -163,3 +163,37 @@ func TestAlsoStale(t *testing.T) {
 		t.Errorf("json %s", b.String())
 	}
 }
+
+func TestKeywordOnlyNote(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ix := &index.Indexer{Store: s}
+	if got := KeywordOnlyNote(ctx, ix, index.Semantic, "h"); got != "" {
+		t.Errorf("no keyword-only files: %q", got)
+	}
+	if err := s.ReplaceFile(ctx, "a.md", "h", 1, nil, []store.Chunk{{Path: "a.md", Text: "x"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []index.Mode{index.Semantic, index.Hybrid} {
+		if got := KeywordOnlyNote(ctx, ix, m, "reindex embeds them"); got != "[1 files indexed for keyword search only; reindex embeds them]" {
+			t.Errorf("%s: %q", m, got)
+		}
+	}
+	if got := KeywordOnlyNote(ctx, ix, index.Keyword, "h"); got != "" {
+		t.Errorf("keyword: %q", got)
+	}
+}
+
+// TestReindexWithoutKey: the reindex tool counts files indexed without a
+// key as indexed, keyword only, not failed.
+func TestReindexWithoutKey(t *testing.T) {
+	cs, _, _, _ := connectWith(t, noKeyEmbedder{}, nil)
+	text, isErr := call(t, cs, "reindex", nil)
+	if isErr || !strings.Contains(text, "1 indexed (1 keyword only: no API key), 0 removed, 0 failed, 0 deferred") {
+		t.Fatalf("reindex = %q, %v", text, isErr)
+	}
+}

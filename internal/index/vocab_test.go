@@ -263,7 +263,7 @@ func TestSyncSymlinkClass(t *testing.T) {
 	}
 	// Defence in depth: nothing but markdown reaches the embedder.
 	n := len(re.inputs)
-	if _, err := ix.indexSrc(ctx, "secret.py", []byte("class SecretKeeper: pass\n"), nil); err == nil || len(re.inputs) != n {
+	if _, _, err := ix.indexSrc(ctx, "secret.py", []byte("class SecretKeeper: pass\n"), nil); err == nil || len(re.inputs) != n {
 		t.Errorf("indexSrc(secret.py) = %v, %d inputs", err, len(re.inputs)-n)
 	}
 }

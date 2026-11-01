@@ -133,7 +133,11 @@ func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel stri
 		src, fi, err = c.ReadStat(clean)
 		switch {
 		case err == nil:
-			return ix.indexSrc(ctx, clean, src, fi)
+			changed, keywordOnly, err := ix.indexSrc(ctx, clean, src, fi)
+			if changed && keywordOnly {
+				ix.logf("indexed %q for keyword search only: no API key; %s", clean, ix.KeyHint())
+			}
+			return changed, err
 		case errors.Is(err, fs.ErrNotExist):
 			return ix.remove(ctx, clean)
 		}
@@ -150,27 +154,32 @@ func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel stri
 }
 
 // indexSrc stores src as the content of rel, embedding it only if its hash
-// changed. fi is the file as opened; its mtime and size are recorded so
-// search can tell when the file changed since.
-func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.FileInfo) (bool, error) {
+// changed, or if it was stored without vectors and the embedder now has an
+// API key. Without a key (see noKey), the chunks are stored without vectors,
+// for keyword search only, and keywordOnly is true; the API is not called.
+// fi is the file as opened; its mtime and size are recorded so search can
+// tell when the file changed since.
+func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.FileInfo) (changed, keywordOnly bool, err error) {
 	if !policy.IsMarkdown(rel) {
-		return false, fmt.Errorf("%q: not markdown; never embedded", rel)
+		return false, false, fmt.Errorf("%q: not markdown; never embedded", rel)
 	}
 	sum := sha256.Sum256(src)
 	hash := hex.EncodeToString(sum[:])
 	st := &store.FileStat{Mtime: fi.ModTime().UnixNano(), Size: fi.Size()}
-	have, haveSt, err := ix.Store.FileInfo(ctx, rel)
+	have, haveSt, haveKeywordOnly, err := ix.Store.FileInfo(ctx, rel)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	if have == hash {
+	keywordOnly = noKey(ix.Embedder)
+	// Unchanged, unless it lacks vectors that can now be made.
+	if have == hash && (!haveKeywordOnly || keywordOnly) {
 		if err := ix.backfillLines(ctx, rel, src); err != nil {
-			return false, err
+			return false, false, err
 		}
 		if haveSt == nil || *haveSt != *st {
-			return false, ix.Store.SetFileStat(ctx, rel, *st)
+			return false, false, ix.Store.SetFileStat(ctx, rel, *st)
 		}
-		return false, nil
+		return false, false, nil
 	}
 
 	pieces := chunk.Split(string(src))
@@ -182,16 +191,22 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.F
 		inputs[i] = rel + "\n" + p.Heading + "\n\n" + p.Text
 	}
 	var vecs [][]float32
-	if len(inputs) > 0 {
+	switch {
+	case len(inputs) == 0:
+		keywordOnly = false
+	case !keywordOnly:
 		if vecs, err = ix.embed(ctx, inputs); err != nil {
-			return false, fmt.Errorf("%q: %w", rel, err)
+			return false, false, fmt.Errorf("%q: %w", rel, err)
 		}
 	}
+	// With vecs nil, ReplaceFile stores the chunks for keyword search only.
 	if err := ix.Store.ReplaceFile(ctx, rel, hash, time.Now().Unix(), st, chunks, vecs); err != nil {
-		return false, fmt.Errorf("%q: %w", rel, err)
+		return false, false, fmt.Errorf("%q: %w", rel, err)
 	}
-	ix.logf("indexed %q (%d chunks)", rel, len(chunks))
-	return true, nil
+	if !keywordOnly {
+		ix.logf("indexed %q (%d chunks)", rel, len(chunks))
+	}
+	return true, keywordOnly, nil
 }
 
 // backfillLines records line ranges for an unchanged file indexed before
@@ -254,13 +269,25 @@ func (ix *Indexer) RemovePrefix(ctx context.Context, rel string) error {
 }
 
 // SyncStats reports what a Sync did. Deferred counts files left for later
-// because the embedding API was unavailable; their old rows are kept. The
-// counts are of notes; Sources counts the manifests and source files read
-// for the code vocabulary, and SourcesChanged those whose names were
-// re-read because they are new or changed.
+// because the embedding API was unavailable; their old rows are kept.
+// KeywordOnly counts the files among Indexed that were stored without
+// vectors, for keyword search only, because there is no API key. The counts
+// are of notes; Sources counts the manifests and source files read for the
+// code vocabulary, and SourcesChanged those whose names were re-read because
+// they are new or changed.
 type SyncStats struct {
 	Scanned, Indexed, Removed, Failed, Deferred int
+	KeywordOnly                                 int
 	Sources, SourcesChanged                     int
+}
+
+// IndexedText is "N indexed" for a sync summary, with " (M keyword only: no
+// API key)" added when st.KeywordOnly is not zero.
+func (st SyncStats) IndexedText() string {
+	if st.KeywordOnly == 0 {
+		return fmt.Sprintf("%d indexed", st.Indexed)
+	}
+	return fmt.Sprintf("%d indexed (%d keyword only: no API key)", st.Indexed, st.KeywordOnly)
 }
 
 // MaxSourceFiles caps the manifests and source files one Sync reads for the
@@ -282,7 +309,9 @@ var sourceCap, nameCap = MaxSourceFiles, vocab.MaxNames
 // that no longer exist or are now ignored. Files are processed one at a
 // time. A failure on one file is logged and does not stop the rest, and its
 // existing rows are kept. Sync fails, indexing nothing, if .screeignore
-// cannot be read or has a bad line.
+// cannot be read or has a bad line. Without an API key, new and changed
+// notes are stored for keyword search only (see SyncStats.KeywordOnly), and
+// one line is logged for them all; the first sync with a key embeds them.
 //
 // The same walk rebuilds the code vocabulary (see package vocab) from the
 // manifests and source files the policy allows outside hidden folders. A
@@ -399,7 +428,10 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 			ix.logf("error: %v", err)
 			return nil
 		}
-		changed, err := ix.indexSrc(ctx, rel, src, fi)
+		changed, keywordOnly, err := ix.indexSrc(ctx, rel, src, fi)
+		if changed && keywordOnly {
+			st.KeywordOnly++
+		}
 		switch {
 		case errors.Is(err, embed.ErrUnavailable):
 			if st.Deferred == 0 {
@@ -419,6 +451,9 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 	})
 	if err != nil {
 		return st, err
+	}
+	if st.KeywordOnly > 0 {
+		ix.logf("%d files indexed for keyword search only: no API key; %s", st.KeywordOnly, ix.KeyHint())
 	}
 	kept := func(p string) bool {
 		return slices.ContainsFunc(keep, func(dir string) bool { return strings.HasPrefix(p, dir) })
@@ -513,6 +548,12 @@ func (ix *Indexer) NoKey() bool {
 	if e == nil {
 		e = ix.Embedder
 	}
+	return noKey(e)
+}
+
+// noKey reports whether e reports it has no API key. An embedder that cannot
+// tell is taken to have one.
+func noKey(e embed.Embedder) bool {
 	k, ok := e.(interface{ HasKey() bool })
 	return ok && !k.HasKey()
 }

@@ -144,7 +144,7 @@ func TestDirectCommandsReexecWithSettingsKey(t *testing.T) {
 	} {
 		t.Setenv(k, v)
 	}
-	want := []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "NO_COLOR=1", "SCREE_KEY_FROM=" + file,
+	want := []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "NO_COLOR=1", "TERM=dumb", "SCREE_KEY_FROM=" + file,
 		"HTTPS_PROXY=http://proxy.internal:3128", "OPENROUTER_API_KEY=" + testSecret, "SCREE_EMBED_URL=http://127.0.0.1:1/v1"}
 	for _, cmd := range keyCommands {
 		r := recordExec(t)
@@ -156,6 +156,21 @@ func TestDirectCommandsReexecWithSettingsKey(t *testing.T) {
 		}
 		if !slices.Equal(r.env, want) {
 			t.Errorf("%s: child env\n%q\nwant\n%q", cmd, r.env, want)
+		}
+	}
+
+	// A plain TERM is passed; one that could name a path or hold shell
+	// syntax is dropped; TERMINFO never goes through.
+	t.Setenv("TERMINFO", "/tmp/evil-terminfo")
+	for term, want := range map[string]string{"xterm-256color": "TERM=xterm-256color", "xterm;rm": "", "../evil": "", "/tmp/evil": ""} {
+		t.Setenv("TERM", term)
+		r := recordExec(t)
+		if err := useSettingsKey("search", nil); err != nil || !r.called {
+			t.Fatalf("TERM=%q: %v, exec %v", term, err, r.called)
+		}
+		got := slices.IndexFunc(r.env, func(e string) bool { return strings.HasPrefix(e, "TERM") })
+		if want == "" && got >= 0 || want != "" && (got < 0 || r.env[got] != want) {
+			t.Errorf("TERM=%q: child env %q", term, r.env)
 		}
 	}
 
@@ -436,13 +451,14 @@ func TestKeyWritesSettings(t *testing.T) {
 	// key -check with the file's settings and the marker.
 	os.WriteFile(file, []byte("SCREE_EMBED_URL="+api.URL+"\nSCREE_ZDR=0\n"), 0o600)
 	t.Setenv("SCREE_EMBED_URL", "https://attacker.example/v1")
+	t.Setenv("TERM", "xterm")
 	r := recordExec(t)
 	out, err = keyRun(t, false, testSecret+"\r\n")
 	if err != nil || !strings.Contains(out, "saved OPENROUTER_API_KEY in "+file) {
 		t.Fatalf("%q, %v", out, err)
 	}
 	home := filepath.Dir(filepath.Dir(filepath.Dir(file)))
-	wantEnv := []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "SCREE_KEY_FROM=" + file,
+	wantEnv := []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "TERM=xterm", "SCREE_KEY_FROM=" + file,
 		"OPENROUTER_API_KEY=" + testSecret, "SCREE_EMBED_URL=" + api.URL, "SCREE_ZDR=0"}
 	if !r.called || !slices.Equal(r.argv, []string{testExe, "key", "-check"}) || !slices.Equal(r.env, wantEnv) {
 		t.Fatalf("exec %v %q\nenv %q\nwant %q", r.called, r.argv, r.env, wantEnv)

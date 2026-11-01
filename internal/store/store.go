@@ -543,6 +543,18 @@ func (s *Store) Model() (string, error) {
 	return m, err
 }
 
+// keywordOnlyMark prefixes the stored hash of a file whose chunks were
+// stored without vectors (indexed with no API key), so the file is found
+// only by keyword search until a sync with a key embeds it. Marking the hash
+// needs no schema change, and an older version reading the index sees a
+// hash that never matches, so it re-embeds the file rather than keeping it
+// without vectors.
+const keywordOnlyMark = "novec:"
+
+// keywordOnlySQL is true for a files row stored without vectors; 6 is
+// len(keywordOnlyMark).
+const keywordOnlySQL = `substr(hash, 1, 6) = '` + keywordOnlyMark + `'`
+
 // FileHash returns the stored content hash for path, or "" if not indexed.
 func (s *Store) FileHash(ctx context.Context, path string) (string, error) {
 	var h string
@@ -550,22 +562,23 @@ func (s *Store) FileHash(ctx context.Context, path string) (string, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
-	return h, err
+	return strings.TrimPrefix(h, keywordOnlyMark), err
 }
 
 // FileInfo returns the stored hash and stat for path: "" and nil if it is not
-// indexed, and a nil stat if none was recorded.
-func (s *Store) FileInfo(ctx context.Context, path string) (string, *FileStat, error) {
-	var h string
+// indexed, and a nil stat if none was recorded. keywordOnly reports that its
+// chunks were stored without vectors (see ReplaceFile).
+func (s *Store) FileInfo(ctx context.Context, path string) (hash string, st *FileStat, keywordOnly bool, err error) {
 	var mtime, size sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT hash, mtime, size FROM files WHERE path = ?`, path).Scan(&h, &mtime, &size)
+	err = s.db.QueryRowContext(ctx, `SELECT hash, mtime, size FROM files WHERE path = ?`, path).Scan(&hash, &mtime, &size)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil, nil
+		return "", nil, false, nil
 	}
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
-	return h, statOf(mtime, size), nil
+	hash, keywordOnly = strings.CutPrefix(hash, keywordOnlyMark)
+	return hash, statOf(mtime, size), keywordOnly, nil
 }
 
 // SetFileStat records the stat of an indexed file whose content is
@@ -601,9 +614,16 @@ func (s *Store) Paths(ctx context.Context) ([]string, error) {
 }
 
 // ReplaceFile atomically swaps a file's chunks and vectors for new ones.
+// With vecs nil, the chunks are stored without vectors, for keyword search
+// only, and the file is recorded as such (FileInfo's keywordOnly) until it is
+// replaced again with vectors.
 func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, st *FileStat, chunks []Chunk, vecs [][]float32) error {
-	if len(chunks) != len(vecs) {
+	keywordOnly := vecs == nil && len(chunks) > 0
+	if len(chunks) != len(vecs) && !keywordOnly {
 		return fmt.Errorf("store: %d chunks but %d vectors", len(chunks), len(vecs))
+	}
+	if keywordOnly {
+		hash = keywordOnlyMark + hash
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -623,6 +643,9 @@ func (s *Store) ReplaceFile(ctx context.Context, path, hash string, unix int64, 
 		id, err := res.LastInsertId()
 		if err != nil {
 			return err
+		}
+		if keywordOnly {
+			continue
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO vecs(rowid, vector) VALUES(?, ?)`, id, encode(vecs[i])); err != nil {
 			return fmt.Errorf("store: inserting vector: %w", err)
@@ -733,12 +756,15 @@ func deleteFile(ctx context.Context, tx *sql.Tx, path string) error {
 	return err
 }
 
-// Search returns the k chunks nearest to query.
+// Search returns the k chunks nearest to query. Chunks stored without
+// vectors are never found.
 func (s *Store) Search(ctx context.Context, query []float32, k int) ([]Hit, error) {
-	// vec1 learns the vector size from the first insert, so an empty index
-	// rejects queries outright.
+	// vec1 learns the vector size from the first insert, so an index with no
+	// vectors yet (empty, or holding only keyword-only files) rejects queries
+	// outright.
 	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM chunks`).Scan(&n); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files f
+		WHERE NOT (`+keywordOnlySQL+`) AND EXISTS(SELECT 1 FROM chunks c WHERE c.path = f.path))`).Scan(&n); err != nil {
 		return nil, err
 	}
 	if n == 0 {
@@ -815,18 +841,28 @@ func (s *Store) CheckKeywordIndex(ctx context.Context) error {
 	return err
 }
 
-// Stats summarizes the index.
+// Stats summarizes the index. KeywordOnly counts the files stored without
+// vectors (see ReplaceFile).
 type Stats struct {
-	Files, Chunks int
-	Vec1Info      string
+	Files, Chunks, KeywordOnly int
+	Vec1Info                   string
 }
 
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	var st Stats
 	err := s.db.QueryRowContext(ctx,
-		`SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM chunks), vec1_info()`).
-		Scan(&st.Files, &st.Chunks, &st.Vec1Info)
+		`SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM chunks),
+			(SELECT count(*) FROM files WHERE `+keywordOnlySQL+`), vec1_info()`).
+		Scan(&st.Files, &st.Chunks, &st.KeywordOnly, &st.Vec1Info)
 	return st, err
+}
+
+// KeywordOnlyFiles returns the number of files stored without vectors, which
+// semantic search cannot find (see ReplaceFile).
+func (s *Store) KeywordOnlyFiles(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM files WHERE `+keywordOnlySQL).Scan(&n)
+	return n, err
 }
 
 // ChunkCount returns the number of chunks in the index.

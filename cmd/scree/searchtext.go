@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -46,6 +47,83 @@ func linksOn() bool {
 	return stdoutTerminal() && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 }
 
+// palette holds the SGR codes the text view colours with: the word
+// headings, the matched words, the location label and the line numbers.
+// An empty code leaves that part plain; the zero palette colours nothing.
+type palette struct{ word, match, link, lineno string }
+
+// defaultPalette is the palette on a terminal before SCREE_COLORS.
+var defaultPalette = palette{word: "1", match: "1;33", link: "36", lineno: "2"}
+
+// parseColors returns defaultPalette with the settings in s, which is
+// SCREE_COLORS: key=code items split by ":", the keys word, match, link
+// and lineno, each code digits and ";" only (so no other escape can be
+// set), "" for none. Errors name the key, never the code.
+func parseColors(s string) (palette, error) {
+	p := defaultPalette
+	for _, item := range strings.Split(s, ":") {
+		if item == "" {
+			continue
+		}
+		key, code, ok := strings.Cut(item, "=")
+		var dst *string
+		switch key {
+		case "word":
+			dst = &p.word
+		case "match":
+			dst = &p.match
+		case "link":
+			dst = &p.link
+		case "lineno":
+			dst = &p.lineno
+		default:
+			if isIdent(key) {
+				return palette{}, fmt.Errorf("SCREE_COLORS: unknown key %s (want word, match, link or lineno)", key)
+			}
+			return palette{}, errors.New("SCREE_COLORS: expected key=code items split by ':', keys word, match, link or lineno")
+		}
+		if !ok {
+			return palette{}, fmt.Errorf("SCREE_COLORS: %s has no =code", key)
+		}
+		if strings.Trim(code, "0123456789;") != "" {
+			return palette{}, fmt.Errorf("SCREE_COLORS: %s: a code holds only digits and ';', such as 1;33", key)
+		}
+		*dst = code
+	}
+	return p, nil
+}
+
+// paint wraps s in the SGR code, unless code or s is empty.
+func paint(code, s string) string {
+	if code == "" || s == "" {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + "\x1b[m"
+}
+
+// paintSpans returns s[lo:hi] with each part of it inside spans (byte
+// ranges of s, in any order, possibly overlapping) painted in code.
+func paintSpans(s string, spans [][2]int, lo, hi int, code string) string {
+	if code == "" || len(spans) == 0 {
+		return s[lo:hi]
+	}
+	spans = slices.Clone(spans)
+	slices.SortFunc(spans, func(a, b [2]int) int { return a[0] - b[0] })
+	var b strings.Builder
+	at := lo
+	for _, sp := range spans {
+		start, end := max(sp[0], at), min(sp[1], hi)
+		if start >= end {
+			continue
+		}
+		b.WriteString(s[at:start])
+		b.WriteString(paint(code, s[start:end]))
+		at = end
+	}
+	b.WriteString(s[at:hi])
+	return b.String()
+}
+
 // writeText writes hits as the text view: for each query word (split and
 // trimmed as keyword search splits the query), the hits whose text, path
 // or heading holds it as keyword search matches it, each hit under the
@@ -54,8 +132,10 @@ func linksOn() bool {
 // an excerpt indented two spaces (its heading line, then its current lines
 // that hold the word), a tab-indented ">path:start-end" location, and its
 // current lines in full, numbered after two tabs and ">>". With links the
-// location is an OSC 8 link to its file.
-func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string, hits []store.Hit, note string, links bool) error {
+// location is an OSC 8 link to its file. pal colours the headings, the
+// query words wherever they match in the excerpt and numbered lines, the
+// location label and the line numbers.
+func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string, hits []store.Hit, note string, links bool, pal palette) error {
 	if len(hits) == 0 {
 		_, err := fmt.Fprintln(w, mcpserver.FormatHits(nil, note))
 		return err
@@ -69,7 +149,8 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 	lines := ix.Lines(hits)
 	// texts holds each distinct text matched once: each hit's whole text,
 	// path and heading (whole[i]), then each distinct (path, line), cut
-	// to a window and made safe (row[i][j] for hits[i]'s line j).
+	// to a window and made safe (row[i][j] for hits[i]'s line j), and, to
+	// colour matches, each heading and numbered line as shown.
 	var texts []string
 	seenText := map[string]int{}
 	add := func(s string) int {
@@ -101,11 +182,24 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 				if j < len(chunk) {
 					piece = chunk[j]
 				}
-				n = len(texts)
+				n = add(lineText(l, piece))
 				seen[key] = n
-				texts = append(texts, lineText(l, piece))
 			}
 			row[i] = append(row[i], n)
+		}
+	}
+	head := make([]string, len(hits))
+	headAt := make([]int, len(hits)) // index in lines[i] of the heading line, or -1
+	shown := make([][]string, len(hits))
+	more := make([]int, len(hits))
+	for i, h := range hits {
+		head[i], headAt[i] = headLine(h, lines[i])
+		shown[i], more[i] = shownLines(lines[i])
+		if pal.match != "" {
+			add(head[i])
+			for _, l := range shown[i] {
+				add(l)
+			}
 		}
 	}
 	matches, err := matchTexts(ctx, words, texts)
@@ -115,11 +209,21 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 		note = strings.TrimSpace("word matching failed: " + err.Error() + "\n" + note)
 	}
 	at := make([]map[int]int, len(words)) // text row -> match offset
+	spans := map[int][][2]int{}           // text row -> every word's matches
 	for wi := range words {
 		at[wi] = map[int]int{}
 		for _, m := range matches[wi] {
 			at[wi][m.Row] = m.At
+			spans[m.Row] = append(spans[m.Row], m.Spans...)
 		}
+	}
+	// spansOf returns where the query words match s, a text given to the
+	// matcher.
+	spansOf := func(s string) [][2]int {
+		if n, ok := seenText[s]; ok {
+			return spans[n]
+		}
+		return nil
 	}
 	group := make([]int, len(hits)) // index into words, or -1
 	for i := range hits {
@@ -138,9 +242,9 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 	var b strings.Builder
 	entry := func(i int) {
 		h := hits[i]
-		hl, hj := headLine(h, lines[i])
-		if hl != "" {
-			b.WriteString("  " + hl + "\n")
+		hj := headAt[i]
+		if head[i] != "" {
+			b.WriteString("  " + cutLine(head[i], 0, spansOf(head[i]), pal.match) + "\n")
 		}
 		if g := group[i]; g >= 0 {
 			var shown []string
@@ -148,7 +252,7 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 				if a, ok := at[g][n]; ok && j != hj {
 					lead := textLine(lines[i][j])
 					lead = lead[:len(lead)-len(strings.TrimLeft(lead, " "))]
-					shown = append(shown, "  "+lead+cutLine(texts[n], a))
+					shown = append(shown, "  "+lead+cutLine(texts[n], a, spansOf(texts[n]), pal.match))
 				}
 			}
 			for _, l := range shown[:min(len(shown), maxHitLines)] {
@@ -159,18 +263,21 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 			}
 		}
 		if lines[i] == nil {
-			b.WriteString("\t>" + safe(h.Path) + " (stale)\n")
+			b.WriteString("\t>" + paint(pal.link, safe(h.Path)) + " (stale)\n")
 			return
 		}
 		l := safe(h.Path) + ":" + strconv.Itoa(h.Line)
 		if end := h.Line + len(lines[i]) - 1; end > h.Line {
 			l += "-" + strconv.Itoa(end)
 		}
+		l = paint(pal.link, l)
 		if links {
 			l = osc8(l, filepath.Join(ix.Root(), filepath.FromSlash(h.Path)))
 		}
 		b.WriteString("\t>" + l + "\n")
-		writeLines(&b, lines[i], h.Line)
+		writeLines(&b, shown[i], more[i], len(lines[i]), h.Line, pal.lineno, func(s string) string {
+			return paintSpans(s, spansOf(s), 0, len(s), pal.match)
+		})
 	}
 	section := func(head string, g int) {
 		first := true
@@ -182,7 +289,7 @@ func writeText(ctx context.Context, w io.Writer, ix *index.Indexer, query string
 				b.WriteString("\n")
 			}
 			if first {
-				b.WriteString(head + ":\n")
+				b.WriteString(paint(pal.word, head+":") + "\n")
 				first = false
 			}
 			entry(i)
@@ -204,8 +311,8 @@ var matchTexts = store.MatchTexts
 
 // headLine returns the excerpt line for h's heading: its first non-blank
 // line when that is a markdown heading (with that line's index in lines),
-// else the last heading in its trail (with -1), made safe by textLine and
-// cut to maxLineChars; "" for none.
+// else the last heading in its trail (with -1), made safe by textLine;
+// "" for none. The caller cuts it to maxLineChars.
 func headLine(h store.Hit, lines []string) (string, int) {
 	if lines == nil {
 		lines = strings.Split(h.Text, "\n")
@@ -215,24 +322,22 @@ func headLine(h store.Hit, lines []string) (string, int) {
 			continue
 		}
 		if t := strings.TrimLeft(l, " "); len(l)-len(t) <= 3 && strings.HasPrefix(t, "#") {
-			return cutLine(strings.TrimLeft(textLine(l), " "), 0), j
+			return strings.TrimLeft(textLine(l), " "), j
 		}
 		break
 	}
 	trail := strings.Split(h.Heading, " > ")
-	return cutLine(strings.TrimLeft(textLine(trail[len(trail)-1]), " "), 0), -1
+	return strings.TrimLeft(textLine(trail[len(trail)-1]), " "), -1
 }
 
-// writeLines writes lines, numbered from first and right-aligned, each
-// after two tabs and ">>" and made safe; a blank line is its number alone.
-// Past maxHitBytes of text the rest is cut, with a count of lines left.
-func writeLines(b *strings.Builder, lines []string, first int) {
-	width := len(strconv.Itoa(first + len(lines) - 1))
+// shownLines returns lines as writeLines shows them, made safe with
+// trailing space trimmed; past maxHitBytes of text the rest is cut, and
+// more is the count of lines left out.
+func shownLines(lines []string) (shown []string, more int) {
 	budget := maxHitBytes
 	for j, l := range lines {
 		if budget <= 0 {
-			fmt.Fprintf(b, "\t\t>>… %d more lines\n", len(lines)-j)
-			return
+			return shown, len(lines) - j
 		}
 		if len(l) > budget {
 			end := budget
@@ -242,11 +347,26 @@ func writeLines(b *strings.Builder, lines []string, first int) {
 			l = l[:end] + "…"
 		}
 		budget -= len(l)
-		fmt.Fprintf(b, "\t\t>>%*d", width, first+j)
-		if l = strings.TrimRightFunc(safe(l), unicode.IsSpace); l != "" {
-			b.WriteString("  " + l)
+		shown = append(shown, strings.TrimRightFunc(safe(l), unicode.IsSpace))
+	}
+	return shown, 0
+}
+
+// writeLines writes shown (from shownLines of n lines), numbered from
+// first and right-aligned, each after two tabs and ">>", the ">>" and
+// number painted in code and the text passed through mark; a blank line
+// is its number alone. Then a count of the more lines left out.
+func writeLines(b *strings.Builder, shown []string, more, n, first int, code string, mark func(string) string) {
+	width := len(strconv.Itoa(first + n - 1))
+	for j, l := range shown {
+		b.WriteString("\t\t" + paint(code, fmt.Sprintf(">>%*d", width, first+j)))
+		if l != "" {
+			b.WriteString("  " + mark(l))
 		}
 		b.WriteString("\n")
+	}
+	if more > 0 {
+		fmt.Fprintf(b, "\t\t>>… %d more lines\n", more)
 	}
 }
 
@@ -343,19 +463,33 @@ func osc8(label, abs string) string {
 
 // cutLine shortens s to maxLineChars characters, marking each cut with "…".
 // When the match at byte at would fall near or past the end, the kept part
-// starts matchLead characters before it.
-func cutLine(s string, at int) string {
+// starts matchLead characters before it. The parts of s inside spans are
+// painted in code.
+func cutLine(s string, at int, spans [][2]int, code string) string {
+	start, end := cutBounds(s, at)
+	out := paintSpans(s, spans, start, end, code)
+	if start > 0 {
+		out = "…" + out
+	}
+	if end < len(s) {
+		out += "…"
+	}
+	return out
+}
+
+// cutBounds returns the byte range of s that cutLine keeps.
+func cutBounds(s string, at int) (start, end int) {
 	r := []rune(s)
 	if len(r) <= maxLineChars {
-		return s
+		return 0, len(s)
 	}
-	start, prefix := 0, ""
+	first, budget := 0, maxLineChars
 	if a := utf8.RuneCountInString(s[:min(max(at, 0), len(s))]); a > maxLineChars-matchLead {
-		start, prefix = a-matchLead, "…"
+		first, budget = a-matchLead, maxLineChars-1
 	}
-	rest := r[start:]
-	if budget := maxLineChars - utf8.RuneCountInString(prefix); len(rest) > budget {
-		return prefix + string(rest[:budget-1]) + "…"
+	last := len(r)
+	if last-first > budget {
+		last = first + budget - 1
 	}
-	return prefix + string(rest)
+	return len(string(r[:first])), len(string(r[:last]))
 }
