@@ -23,6 +23,9 @@ These come before `scree serve` or the command starts.
 | `run: cannot run mcp` | `scree run` runs the other commands. |
 | `scree mcp and scree run are not supported on Windows; …` | Set the variables in the environment and run `scree serve -notes <dir>` or another command directly. |
 
+**`scree: warning: <file> …; running without an API key`**
+A command run directly found the settings file but it failed one of the checks above, so it runs without a key (`auto` search runs `keyword`). Fix the file as the table says.
+
 If Claude Code can't start the server at all, check that `scree` is on Claude Code's `PATH`, or register an [absolute path](using-with-claude-code.md#a-plain-scree-or-an-absolute-path). An old `.mcp.json` that names `scree-mcp` needs re-registering; see [Migrating](getting-started.md#from-the-scree-mcp-shell-wrappers).
 
 ## Choosing the folder
@@ -100,8 +103,17 @@ Check `doctor -v`, exclude build output or vendored docs with `.screeignore`, th
 **`bad line in .screeignore: …; nothing is indexed until it is fixed (scree doctor lists the lines)`**
 Fix the lines `doctor` names by number. Indexing resumes once the file parses.
 
-**`mode must be auto, hybrid, semantic or keyword, not "…"`**, **`format must be xml or json, not "…"`**
-A typo in `-mode`, `mode` or `-format`.
+**`mode must be auto, hybrid, semantic or keyword, not "…"`**, **`format must be text, xml or json, not "…"`**, **`-k must be at least 1, not N`**
+A typo in `-mode`, `mode`, `-format` or `-k`.
+
+**`[mode: auto → keyword: no API key; …]`**
+There is no API key, so `auto` searched keywords only. Run `scree key` to save one in the settings file. Under Claude Code the note ends `start through scree mcp`: the server got no key from `scree mcp`, so the settings file has none.
+
+**`no API key: …; mode "keyword" works without one`**
+`-mode semantic` or `hybrid` needs a key. Run `scree key`, or use `-mode keyword`.
+
+**`[N files indexed for keyword search only; scree reindex embeds them]`**
+Those files were indexed while there was no key, so the vector side can't find them. With a key set, `scree reindex` (or the next writer start) embeds exactly those files. `doctor` counts them on its index line.
 
 **Search returns nothing for a file you expect**
 Check `doctor -v` for the file's reason. An ignored, oversized or opted-out file never appears. For an exact name, try `-mode keyword`. A name with no `_` or digit makes `auto` add keyword search only if it is in the folder's [code vocabulary](using-with-claude-code.md#the-code-vocabulary) (a dependency, or a mixed-case name from imports and declarations); other such names, a stoplisted word, or a name from code under a hidden folder get only the vector search, so pass `-mode hybrid` or `-mode keyword`. The vocabulary is rebuilt on each full sync, not as code changes, so a brand-new name routes after the next sync (`scree run reindex`).
@@ -113,8 +125,8 @@ The file changed and the chunk's text is no longer in it. The writer re-indexes 
 
 When an embedding call fails during a search, the error ends with `; mode="keyword" still works without the embedding API`.
 
-**`embed: no API key (set OPENROUTER_API_KEY)`**
-The key isn't in the environment. Add it to the settings file and use `scree run`, not bare `scree`.
+**`embed: no API key (set OPENROUTER_API_KEY)`**, **`FAIL OPENROUTER_API_KEY not set (run scree key, or set OPENROUTER_API_KEY)`** (doctor)
+There is no key in the environment or the settings file. Run `scree key`. If the file holds one and a direct command still has none, look for a `running without an API key` warning [above](#scree-mcp-and-scree-run-refusals).
 
 **`embed: model <model> has no endpoint that meets zero data retention; choose another model or set SCREE_ZDR=0 (API: …)`**
 OpenRouter has no zero-retention endpoint for that model. Pick another `SCREE_MODEL`, or accept retention with `SCREE_ZDR=0`. With ZDR off, the same error says the model has no endpoint that `is allowed by the account's data policy`: check your OpenRouter privacy settings.
@@ -128,8 +140,40 @@ The OpenRouter account is out of credit. Add credit.
 **`embed: embedding API unavailable: …`**
 A timeout (`no response within 10s`), network error, 429 or 5xx. Indexing pauses (30 s, doubling to 5 min) and then resyncs on its own. With a proxy, set `HTTPS_PROXY` in the settings file.
 
+**`embed: 301 Moved Permanently: the endpoint redirects, and redirects are not followed; set SCREE_EMBED_URL to the final address`**
+scree never follows a redirect with your key. Set `SCREE_EMBED_URL` to the address the endpoint redirects to.
+
 **`SCREE_EMBED_URL is not OpenRouter; set SCREE_ZDR=0 if it rejects the provider field`** (doctor warning)
 Another endpoint may reject OpenRouter's `provider` field. Set `SCREE_ZDR=0` for it.
+
+## `scree key`
+
+| Message | Fix |
+| --- | --- |
+| `<file> already holds an API key; nothing saved (to replace it from stdin, add -replace)` | Add `-replace`, or run `scree key` on a terminal to type the new key. |
+| `no key given; nothing saved` | The prompt or stdin's first line was empty. |
+| `the key contains whitespace, control or invisible characters; nothing saved`, `the key contains a quote or backslash; nothing saved` | Copy the key again, without surrounding spaces or quotes. |
+| `<dir> is writable by group or others (mode N); fix with: chmod 700 <dir>` | `chmod 700 ~/.config/scree`. |
+| `<path> is a symlink; not writing the key through it` | `~/.config` or `~/.config/scree` is a symlink. Make it a real folder. |
+| `<file> holds no OPENROUTER_API_KEY; run scree key` | `-check` found no saved key. |
+| `the test call with the key in <file> failed: …` | The key was saved; the error says why the call failed, as in [the embeddings API](#the-embeddings-api) below. |
+
+## The search text view
+
+**Colours or links show as raw escape codes such as `^[]8;;`**
+An older `less` (before 566) doesn't pass OSC 8 links. Use `-no-pager`, set `SCREE_PAGER=` (empty) in the settings file, or install a newer `less`.
+
+**Characters such as `→` show as `<E2><86><92>` in the pager**
+`less` found no UTF-8 locale; `scree run` passes no `LANG` or `LC_*`. scree starts the pager with `LESSCHARSET=utf-8` unless you set `LESSCHARSET` yourself, so check for a `LESSCHARSET` with another value, or use `-no-pager`.
+
+**No colours, or no pager**
+`NO_COLOR` set or `TERM=dumb` turns colours and links off. The default `less` runs only with `TERM` set, and `scree run` passes `TERM` only when it is a plain terminal name. In a pipe, the output is `xml`; pass `-format text` for the text view.
+
+**`scree: warning: SCREE_PAGER: … not found in /usr/local/bin, /usr/bin, /bin; printing directly`**
+`SCREE_PAGER` names a program that isn't in those folders. Use its absolute path; `PATH` is never searched.
+
+**`SCREE_COLORS: unknown key …`**, **`SCREE_COLORS: …: a code holds only digits and ';', such as 1;33`**
+Fix the value: `key=code` items split by `:`, with keys `word`, `match`, `link` and `lineno`. See [Configuration](configuration.md#the-text-view).
 
 ## Settings values
 

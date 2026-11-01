@@ -68,7 +68,7 @@ Chunks go to the embeddings endpoint in batches of 64. With `SCREE_ZDR=1` (the d
 | Search query | 10 s | 2 |
 | Indexing | 30 s | 3 |
 
-Network errors, 429 and 5xx are retried; a timed-out attempt is not. After an outage, indexing pauses for 30 s, doubling up to 5 minutes, and then resyncs, so files changed during the outage are picked up without another edit. Error messages never contain the API key: it is scrubbed before any message is cut or printed.
+Network errors, 429 and 5xx are retried; a timed-out attempt is not. Redirects are never followed: a 3xx answer is an error asking you to set `SCREE_EMBED_URL` to the final address, so the key is never sent on to another host. After an outage, indexing pauses for 30 s, doubling up to 5 minutes, and then resyncs, so files changed during the outage are picked up without another edit. Error messages never contain the API key: it is scrubbed before any message is cut or printed.
 
 ## Storage
 
@@ -103,6 +103,14 @@ Code is never chunked, embedded, returned by `read_doc` or sent to the API; only
 
 In `serve` this runs in the background: the MCP handshake and searches never wait, and search output says the index is incomplete until the first sync finishes. For a new, empty index with more than `SCREE_FIRST_SYNC_MB` (default 50) of markdown, a session or `watch` skips the first sync and search says so; `scree reindex` indexes it on purpose.
 
+### Without an API key
+
+With no API key (`OPENROUTER_API_KEY` unset or empty), indexing still runs, with no API call: each file is chunked and stored the same way, but without vectors, so the keyword index has it and vector search doesn't. The sync logs one line for those files, and `reindex` counts them as `M keyword only: no API key`. While there is still no key, an unchanged keyword-only file is left alone.
+
+The first sync (or watcher event) with a key embeds every keyword-only file, even though its content hasn't changed, and only those; files that already have vectors are not re-embedded. Until then `semantic` and `hybrid` output say how many files they can't see, and `doctor` counts them on its index line.
+
+This is only for a missing key. With a key, an API error or outage fails or defers the file as before, and its existing rows are kept.
+
 ## The watcher
 
 After the sync, the writer watches the folder with fsnotify:
@@ -114,7 +122,7 @@ After the sync, the writer watches the folder with fsnotify:
 - **Overflow.** If the kernel's event queue overflows anyway, the writer resyncs and rebuilds its watches.
 - **Health.** Every 10 s it checks that the folder and the index file are still the ones it started with. If either was removed or replaced, `scree watch` exits with an error, so systemd or Docker restarts it; in `serve`, the writer stops, releases the lock, and search reports `[index not updating: …]` while it keeps serving what is indexed.
 
-Files are opened without blocking, so a FIFO is never waited on, and a file is used only after checking that what was opened is the regular file the policy checked. On shutdown, `serve` and `watch` wait at most 5 s for the writer; a second signal exits at once.
+Files are opened without blocking, so a FIFO is never waited on, and a file is used only after checking that what was opened is the regular file the policy checked, and still a regular file once open, so a FIFO swapped in for a note is refused even when it reuses the note's inode number. On shutdown, `serve` and `watch` wait at most 5 s for the writer; a second signal exits at once.
 
 ## Search
 

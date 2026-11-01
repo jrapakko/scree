@@ -40,6 +40,9 @@ The first-sync cap (`SCREE_FIRST_SYNC_MB`, default 50) bounds what an approved r
 - **The file is data.** It is parsed line by line as `NAME=value`, never sourced, so nothing in it is expanded or run. Only scree's own names, the proxy variables, and `DOCKER_HOST` and `DOCKER_CONTEXT` (for the docker CLI only) are accepted.
 - **Inherited environment and arguments are ignored.** `scree mcp` refuses every argument but `-docker`, and `exec`s its own binary as `scree serve` in an environment of exactly `HOME`, `PATH=/usr/local/bin:/usr/bin:/bin`, `CLAUDE_PROJECT_DIR` and the file's settings. Not an inherited `SCREE_*`, key or proxy variable, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `DOCKER_HOST`, or the Go runtime's `GODEBUG` and `GOMAXPROCS` gets through. A repo can't redirect your key to another endpoint through a proxy or `SCREE_EMBED_URL`, move the index, or point scree at another folder.
 - **The binary is fixed.** `scree mcp` re-executes its own binary, never one found on `PATH`. `scree mcp -docker` runs only `docker` or `podman`, from a fixed list of folders.
+- **Direct commands use the file's key only in a clean process.** When `OPENROUTER_API_KEY` is unset and the settings file holds a key, `scree search`, `reindex`, `doctor` and `watch` re-run themselves exactly as `scree run` would. The key is never used in the process that inherited your shell's environment, so a proxy, `SSL_CERT_FILE` or `SSL_CERT_DIR`, or `GODEBUG=http2debug` from an environment a repo can influence (a Claude Code `Bash` tool, for one) can't capture or print it. The re-run process never re-runs again, so there is no loop.
+- **The terminal settings passed on are checked.** `scree run` passes `NO_COLOR` only as `NO_COLOR=1`, and `TERM` only when it is a plain terminal name; `TERMINFO`, `TERMINFO_DIRS` and `TERMCAP` are never passed, so the terminal description comes from the system's terminfo.
+- **`scree key` writes the key carefully.** It reads the key without echo, never prints it, writes the file atomically with mode 600 through a temporary file in the same folder, and refuses a symlinked `~/.config` or `~/.config/scree`, or a `~/.config/scree` that isn't yours or is writable by others.
 
 ## The folder follows from the working directory
 
@@ -61,7 +64,7 @@ Indexing, search, `read_doc` and `reindex` go through the same policy, checked a
 - symlinks are followed only inside the folder, with the rules checked on the target too; symlinked folders are never descended;
 - a hard link can't be told from a regular file, so a hard link inside the folder, even to a file outside it, is treated as that file under its own name and passes the same rules;
 - non-regular files are skipped without being opened, and files are opened without blocking, so a FIFO can't hang a session;
-- a file is used only if what was opened is the regular file the policy checked, so swapping in a symlink mid-sync doesn't work;
+- a file is used only if what was opened is the regular file the policy checked, and is still a regular file once open, so swapping in a symlink or a FIFO mid-sync doesn't work, even when the FIFO reuses the file's inode number;
 - files over `SCREE_MAX_FILE_BYTES` (1 MiB) and names with control characters are refused.
 
 ## Code is read for names only
@@ -86,9 +89,17 @@ A folder found automatically (from the working directory, lifted to its git root
 - A search query is never FTS5 syntax: each word becomes a quoted term.
 - Log lines, which can contain file names and API messages, are made terminal-safe. `scree indexes` cuts each value it prints from an index to 80 characters.
 
+## The search text view and pager
+
+`scree search`'s text view writes note text to your terminal, so:
+
+- control and format characters, including bidi controls, are dropped from note text before it is coloured, so a note can't add its own escape sequences; the colours and OSC 8 links are scree's own, and `SCREE_COLORS` accepts only digits and `;`;
+- the numbered lines are read from the current file through the same policy as everything else;
+- the pager is run without a shell, and found only by absolute path or in `/usr/local/bin`, `/usr/bin` or `/bin`, never through `PATH`; under `scree run`, `SCREE_PAGER` comes from the settings file only.
+
 ## Zero data retention
 
-By default every embedding request asks OpenRouter for endpoints with zero data retention and `data_collection: deny`. A model with no such endpoint fails with an error naming the model, rather than silently using one that keeps data. `SCREE_ZDR=0` turns this off, for other endpoints. Search queries are embedded the same way; `keyword` mode sends nothing.
+By default every embedding request asks OpenRouter for endpoints with zero data retention and `data_collection: deny`. A model with no such endpoint fails with an error naming the model, rather than silently using one that keeps data. `SCREE_ZDR=0` turns this off, for other endpoints. Search queries are embedded the same way; `keyword` mode sends nothing, and neither does indexing without a key. The embeddings client never follows a redirect, so the key and text go only to the configured endpoint.
 
 ## HTTP mode
 

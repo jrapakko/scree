@@ -15,7 +15,7 @@ Built from the repo's `Dockerfile`: a Go build stage, then `gcr.io/distroless/st
 docker build -t scree .            # or: podman build -t scree .
 ```
 
-Tagged releases push `ghcr.io/jrapakko/scree:<version>` and `:<major>.<minor>` for linux/amd64 and linux/arm64, for example `ghcr.io/jrapakko/scree:0.2.0`.
+Tagged releases push `ghcr.io/jrapakko/scree:<version>` and `:<major>.<minor>` for linux/amd64 and linux/arm64, for example `ghcr.io/jrapakko/scree:0.3.5`.
 
 File events reach the container through a bind mount on Linux. Docker Desktop on macOS doesn't pass them through, so `watch` misses edits there.
 
@@ -94,6 +94,20 @@ Settings for it, in the settings file:
 | `SCREE_DATA_VOLUME` | `scree-data` | a volume name, not a path |
 | `SCREE_MOUNT_OPTS` | `ro` | `ro`, `ro,z`, `ro,Z`; use `ro,z` on SELinux hosts |
 | `DOCKER_HOST`, `DOCKER_CONTEXT` | unset | passed to the docker CLI only |
+
+## The MCP Registry listing
+
+scree is listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.jrapakko/scree`, with the image `ghcr.io/jrapakko/scree` as its package. A client that installs servers from the registry asks for two things, the folder to search and your `OPENROUTER_API_KEY`, and runs about:
+
+```
+docker run -i --rm -e OPENROUTER_API_KEY \
+  -v <folder>:/notes:ro -v scree-data:/data \
+  ghcr.io/jrapakko/scree:0.3.5 serve -notes /notes
+```
+
+That is one notes folder per registration, over stdio, with the key held by the client rather than your settings file, so `SCREE_MODEL` and the other settings in the file don't apply. On SELinux hosts the mount needs `:z` as well, with the relabelling [above](#selinux-z-is-required-and-it-relabels).
+
+For Claude Code, use `scree mcp` from a repo's `.mcp.json` (see [Getting started](getting-started.md#turn-scree-on-for-the-repo)), or `scree mcp -docker` above: those index the session's repo, enforce the opt-in, and take the key from your settings file. One-click bundles for Claude Desktop are [planned](roadmap.md#planned).
 
 ## HTTP inside a container
 

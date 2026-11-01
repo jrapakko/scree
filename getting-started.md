@@ -5,7 +5,7 @@ title: Getting started
 ## Requirements
 
 - Go 1.26 to build from source (`go.mod` says `go 1.26.10`). No CGO and no C toolchain: the SQLite driver, vec1 and FTS5 run as WebAssembly inside the Go binary.
-- An OpenRouter API key, from <https://openrouter.ai/settings/keys>. Any OpenAI-compatible embeddings endpoint also works through `SCREE_EMBED_URL` (see [Configuration](configuration.md)).
+- An OpenRouter API key, from <https://openrouter.ai/settings/keys>, for semantic search. Any OpenAI-compatible embeddings endpoint also works through `SCREE_EMBED_URL` (see [Configuration](configuration.md)). Without a key, notes are indexed for keyword search only.
 - Claude Code, for the MCP server. The CLI works without it.
 - Linux or macOS for `scree mcp` and `scree run`. The other commands also run on Windows, but `scree mcp` and `scree run` refuse to run there; see [Windows](#windows).
 
@@ -30,21 +30,25 @@ The release workflow (`.github/workflows/release.yml`) runs on a `v*` tag and pu
 - A **draft** GitHub release built by GoReleaser, with archives for Linux, macOS and Windows on amd64 and arm64, named `scree_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), plus `checksums.txt`. Each archive holds the binary, `LICENSE`, `README.md`, `docs/SPEC.md`, `contrib/scree-watch.service` and `THIRD_PARTY_LICENSES/`. The workflow runs `go test` before building.
 - A multi-arch (linux/amd64, linux/arm64) image at `ghcr.io/jrapakko/scree`, tagged `<version>` and `<major>.<minor>`. See [Docker](docker.md).
 
-The release is created as a draft and published by hand, so a tag alone does not make the GitHub release public; the image is pushed when the tag is. Releases are listed on the [GitHub releases page](https://github.com/jrapakko/scree/releases); the latest is `v0.2.0`.
+The release is created as a draft and published by hand, so a tag alone does not make the GitHub release public; the image is pushed when the tag is. Releases are listed on the [GitHub releases page](https://github.com/jrapakko/scree/releases); the latest is `v0.3.5`.
+
+scree is also listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.jrapakko/scree`, pointing at the image. That entry runs `scree serve` in a container for one notes folder, for MCP clients that install from the registry; for Claude Code, use `scree mcp` as below. See [Docker](docker.md#the-mcp-registry-listing).
 
 ## The settings file
 
-`scree mcp`, `scree run` and the systemd unit all read one file: `~/.config/scree/env`. It holds the API key and any optional settings. Create it without the key touching your screen or shell history:
+`scree mcp`, `scree run` and the systemd unit all read one file: `~/.config/scree/env`. It holds the API key and any optional settings. `scree key` creates it, or updates the key in it, without the key touching your screen or shell history:
 
 ```sh
-mkdir -p ~/.config/scree
-printf 'OpenRouter API key: '; stty -echo; IFS= read -r key; stty echo; echo
-( umask 077; printf "OPENROUTER_API_KEY='%s'\n" "$key" > ~/.config/scree/env )
-chmod 600 ~/.config/scree/env
-unset key
+scree key
 ```
 
-Rules:
+It prompts for the key without echoing it, writes the file atomically with mode 600 (creating `~/.config/scree` with mode 700 if needed), keeps every other line as it was, and then makes one test call to the embeddings API. Ctrl-C at the prompt saves nothing.
+
+- `scree key < file` reads the key from the first line of a file instead. Piped input replaces a key the file already holds only with `-replace`.
+- `-offline` skips the test call; `-check` makes only the test call, with the saved key.
+- It refuses an empty key, one with whitespace, quotes, a backslash or control characters, a settings file that fails the rules below, and a symlinked `~/.config` or `~/.config/scree`. It never prints the key.
+
+You can also edit the file by hand, following these rules:
 
 - **Always under your passwd home.** `~` is the home directory in the password database (your login's), not `$HOME` or `$XDG_CONFIG_HOME`, so nothing in a launching environment can move it.
 - **A regular file, mode 600, owned by you.** `scree mcp` and `scree run` refuse a file that is missing, is a symlink, is owned by someone else, gives group or others any permission at all, or is larger than 64 KB.
@@ -53,7 +57,7 @@ Rules:
 - **Only scree's variables:** `SCREE_*`, `OPENROUTER_API_KEY`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and their lowercase forms), and `DOCKER_HOST` and `DOCKER_CONTEXT`, which only `scree mcp -docker` uses. Any other name is an error naming the line.
 - It holds settings, not the folder. A leftover `SCREE_NOTES` line from the single-folder version is ignored, and `doctor` warns about it.
 
-Don't `export` the key in a shell profile. Use `scree run <command>` to run the CLI with the file's settings. The full list of settings is on the [Configuration](configuration.md) page.
+Don't `export` the key in a shell profile. With `OPENROUTER_API_KEY` unset, `scree search`, `reindex`, `doctor` and `watch` run directly use the file's key by re-running themselves as `scree run` would; `scree run <command>` loads the file's other settings for any command. See [Configuration](configuration.md#direct-commands-and-the-settings-files-key) for the details, and for the full list of settings.
 
 ## Check a repo before indexing it
 
@@ -92,6 +96,8 @@ scree run reindex
 ```
 
 A Claude Code session (or `scree watch`) does not start the first index of a folder with more than `SCREE_FIRST_SYNC_MB` (default 50) of markdown. Search then says so, and `scree run reindex` in the folder indexes it anyway. The CLI `reindex` is never capped.
+
+Without an API key, the first index still runs: each note is stored for keyword search, with no API call, and `reindex` counts those files as `keyword only: no API key`. Once a key is set, the next sync embeds just those files. See [How it works](how-it-works.md#without-an-api-key).
 
 ## A notes folder that isn't a repo
 
