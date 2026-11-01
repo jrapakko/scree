@@ -1,0 +1,60 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jrapakko/scree",
+  "title": "scree",
+  "description": "Local semantic and keyword search over the markdown in a repo or notes folder.",
+  "repository": {
+    "url": "https://github.com/jrapakko/scree",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/jrapakko/scree",
+  "version": "0.3.3",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/jrapakko/scree:0.3.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "{notes_dir}:/notes:ro",
+          "variables": {
+            "notes_dir": {
+              "description": "Absolute path of the folder to search, mounted read-only. On SELinux hosts the mount needs :z, which relabels the folder; see the README.",
+              "isRequired": true,
+              "format": "filepath"
+            }
+          }
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "scree-data:/data"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        },
+        {
+          "type": "named",
+          "name": "-notes",
+          "value": "/notes"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "OPENROUTER_API_KEY",
+          "description": "OpenRouter API key, used to embed the notes when indexing and each query when searching.",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
