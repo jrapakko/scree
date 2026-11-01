@@ -62,12 +62,16 @@ func New(url, apiKey, model string, dims int) *Client {
 		APIKey:      apiKey,
 		ModelName:   model,
 		Dimensions:  dims,
-		HTTP:        &http.Client{},
+		HTTP:        &http.Client{CheckRedirect: noRedirect},
 		Timeout:     30 * time.Second,
 		MaxAttempts: 3,
 		ZDR:         true,
 	}
 }
+
+// noRedirect keeps a client from following redirects: the API never needs
+// one, and following it would send the key on.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 func (c *Client) Model() string {
 	if c.Dimensions > 0 {
@@ -97,6 +101,9 @@ type response struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
+
+// HasKey reports whether the client has an API key.
+func (c *Client) HasKey() bool { return c.APIKey != "" }
 
 // Embed returns one vector per input, sending BatchSize inputs per request.
 // Errors never contain the API key.
@@ -181,6 +188,9 @@ func (c *Client) post(ctx context.Context, body []byte, n int) (vecs [][]float32
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
 		return transportErr("reading response: ", err)
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, false, fmt.Errorf("embed: %s: the endpoint redirects, and redirects are not followed; set SCREE_EMBED_URL to the final address", resp.Status)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, retryable(resp.StatusCode), c.statusErr(resp, raw)

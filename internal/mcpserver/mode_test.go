@@ -42,6 +42,48 @@ func TestSearchModeArgument(t *testing.T) {
 	}
 }
 
+// noKeyEmbedder embeds documents but, like an embed.Client with no API
+// key, reports it has none.
+type noKeyEmbedder struct{ lenEmbedder }
+
+func (noKeyEmbedder) HasKey() bool { return false }
+
+// TestSearchNoKey: with no API key, auto runs keyword search and says why;
+// a mode that embeds the query is an error. Both give the Indexer's
+// KeyHint, here the default, which never suggests scree key.
+func TestSearchNoKey(t *testing.T) {
+	cs, _, _, _ := connectWith(t, noKeyEmbedder{}, nil)
+	if _, isErr := call(t, cs, "reindex", nil); isErr {
+		t.Fatal("reindex failed")
+	}
+	for _, args := range []map[string]any{{"query": "zebra"}, {"query": "zebra", "mode": "auto"}} {
+		text, isErr := call(t, cs, "search_docs", args)
+		if isErr || !strings.HasPrefix(text, `<hit n="1" path="z.md" lines="1-2" heading="Zoo" match="keyword">`) ||
+			!strings.HasSuffix(text, "</hit>\n[mode: auto → keyword: no API key; set OPENROUTER_API_KEY]") {
+			t.Errorf("%v = %q, %v", args, text, isErr)
+		}
+	}
+	text, isErr := call(t, cs, "search_docs", map[string]any{"query": "zebra", "mode": "keyword"})
+	if isErr || strings.Contains(text, "[mode:") {
+		t.Errorf("keyword = %q, %v", text, isErr)
+	}
+	for _, mode := range []string{"semantic", "hybrid"} {
+		text, isErr := call(t, cs, "search_docs", map[string]any{"query": "zebra", "mode": mode})
+		if !isErr || !strings.Contains(text, "no API key: set OPENROUTER_API_KEY;") || strings.Contains(text, "scree key") {
+			t.Errorf("%s = %q, %v", mode, text, isErr)
+		}
+	}
+}
+
+func TestModeNoteKeyHint(t *testing.T) {
+	if got := ModeNote(index.Keyword, "set X, or start through Y"); got != "[mode: auto → keyword: no API key; set X, or start through Y]" {
+		t.Errorf("keyword: %q", got)
+	}
+	if got := ModeNote(index.Semantic, "set X"); got != "[mode: auto → semantic]" {
+		t.Errorf("semantic: %q", got)
+	}
+}
+
 func TestFormatHitsMatch(t *testing.T) {
 	kw := hit("a.md", 1, "A", "x")
 	kw.EndLine, kw.Match = 2, store.MatchKeyword

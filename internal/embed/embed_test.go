@@ -290,3 +290,29 @@ func TestErrorRedactsKeyAtCutAndSplit(t *testing.T) {
 		}
 	}
 }
+
+// TestRedirectNotFollowed: a redirect is an error, made once, and the key
+// never reaches where it points, even on the same host.
+func TestRedirectNotFollowed(t *testing.T) {
+	var target atomic.Int32
+	dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target.Add(1)
+		okHandler(w, r)
+	}))
+	defer dst.Close()
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		var calls atomic.Int32
+		src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			http.Redirect(w, r, dst.URL+"/v1/embeddings", status)
+		}))
+		_, err := New(src.URL, "secret-key-123", "m", 0).Embed(context.Background(), []string{"x"})
+		src.Close()
+		if err == nil || !strings.Contains(err.Error(), "redirects are not followed") || calls.Load() != 1 {
+			t.Errorf("%d: err %v, calls %d", status, err, calls.Load())
+		}
+	}
+	if target.Load() != 0 {
+		t.Errorf("the redirect target got %d requests", target.Load())
+	}
+}

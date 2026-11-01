@@ -44,6 +44,9 @@ type Indexer struct {
 	// Progress, when set, is called after each file Sync handles, with the
 	// counts so far.
 	Progress func(SyncStats)
+	// NoKeyHint says how to supply an API key, for the error and the auto
+	// mode note of a search without one; "" means KeyHint's default.
+	NoKeyHint string
 
 	// writeMu serializes IndexFile, Sync and RemovePrefix, which can be
 	// called from the watcher and from the MCP reindex tool.
@@ -495,8 +498,27 @@ func Resolve(mode Mode, query string) Mode {
 	return Semantic
 }
 
+// ErrNoKey is wrapped in Search's error for a mode that embeds the query
+// when the query embedder has no API key; the error adds KeyHint.
+var ErrNoKey = errors.New("no API key")
+
+// KeyHint is NoKeyHint, or "set OPENROUTER_API_KEY" when that is empty.
+func (ix *Indexer) KeyHint() string { return cmp.Or(ix.NoKeyHint, "set OPENROUTER_API_KEY") }
+
+// NoKey reports whether queries cannot be embedded because the query
+// embedder (or Embedder) reports it has no API key. An embedder that cannot
+// tell is taken to have one.
+func (ix *Indexer) NoKey() bool {
+	e := ix.QueryEmbedder
+	if e == nil {
+		e = ix.Embedder
+	}
+	k, ok := e.(interface{ HasKey() bool })
+	return ok && !k.HasKey()
+}
+
 // Resolve returns the mode a search for query runs in: for Auto (or ""),
-// Hybrid if HasIdentifier(query) or a word of the query, trimmed as
+// Keyword when there is no API key (see NoKey), otherwise Hybrid if HasIdentifier(query) or a word of the query, trimmed as
 // HasIdentifier trims it and lowercased, is in the index's code vocabulary,
 // and Semantic otherwise; any other mode as it is. The notes need not hold
 // the word: hybrid's keyword side matches the query's other words too, so
@@ -504,6 +526,9 @@ func Resolve(mode Mode, query string) Mode {
 // extractor misread from a string can at worst send a question to Hybrid.
 // A failed lookup counts as no match.
 func (ix *Indexer) Resolve(ctx context.Context, mode Mode, query string) Mode {
+	if (mode == "" || mode == Auto) && ix.NoKey() {
+		return Keyword
+	}
 	if m := Resolve(mode, query); m != Semantic || (mode != "" && mode != Auto) {
 		return m
 	}
@@ -594,6 +619,9 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) (
 		return nil, fmt.Errorf("index: search: k must be at least 1, not %d", k)
 	}
 	mode = ix.Resolve(ctx, mode, query)
+	if mode != Keyword && ix.NoKey() {
+		return nil, fmt.Errorf(`%w: %s; mode "keyword" works without one`, ErrNoKey, ix.KeyHint())
+	}
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
 	}

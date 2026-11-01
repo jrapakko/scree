@@ -226,7 +226,7 @@ func TestSettingsFileRefusals(t *testing.T) {
 		l.wantRefused(t, runRun([]string{"doctor"}), "open to group or others")
 	}
 	l := launchSetup(t, "", 0)
-	l.wantRefused(t, runMCP(nil), l.file+" not found; create it with OPENROUTER_API_KEY, then: chmod 600")
+	l.wantRefused(t, runMCP(nil), l.file+" not found; create it with scree key, or with OPENROUTER_API_KEY and then: chmod 600")
 
 	t.Run("not owned by us", func(t *testing.T) {
 		l := launchSetup(t, testSettings, 0o600)

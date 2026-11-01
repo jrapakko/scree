@@ -137,13 +137,23 @@ func parseSettings(path string, data []byte) (map[string]string, error) {
 	return s, nil
 }
 
+// settingsMissing is readSettingsFile's error for a file that does not
+// exist; it matches fs.ErrNotExist.
+type settingsMissing string
+
+func (p settingsMissing) Error() string {
+	return fmt.Sprintf("%s not found; create it with scree key, or with OPENROUTER_API_KEY and then: chmod 600 %s", string(p), string(p))
+}
+
+func (settingsMissing) Unwrap() error { return fs.ErrNotExist }
+
 // readSettingsFile reads path, which must be a regular file (not a
 // symlink), owned by launchUID, with no group or other permission bits, and
 // at most maxSettingsFile bytes.
 func readSettingsFile(path string) ([]byte, error) {
 	fi, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("%s not found; create it with OPENROUTER_API_KEY, then: chmod 600 %s", path, path)
+		return nil, settingsMissing(path)
 	}
 	if err != nil {
 		return nil, err
@@ -237,7 +247,7 @@ func runMCP(args []string) error {
 	if docker {
 		return execDocker(home, s, pd)
 	}
-	return reexec(home, s, pd, false, "serve")
+	return reexec(home, s, launchExtra(pd, false), "serve")
 }
 
 // runRun is `scree run <command> [args]`: any other command, with its
@@ -255,24 +265,37 @@ func runRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	noColor := os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb"
-	return reexec(home, s, os.Getenv("CLAUDE_PROJECT_DIR"), noColor, args...)
+	return reexec(home, s, runExtra(), args...)
 }
 
-// reexec replaces the process with this binary running args, in an
-// environment of HOME (the passwd home), cleanPath, CLAUDE_PROJECT_DIR when
-// set, NO_COLOR=1 with noColor, and the settings.
-func reexec(home string, s map[string]string, pd string, noColor bool, args ...string) error {
-	exe, err := selfExecutable()
-	if err != nil {
-		return fmt.Errorf("cannot find the scree binary: %w", err)
-	}
+// runExtra is what scree run adds to the settings in the child's
+// environment: CLAUDE_PROJECT_DIR when set, and NO_COLOR=1 when NO_COLOR is
+// set or TERM is dumb.
+func runExtra() []string {
+	noColor := os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb"
+	return launchExtra(os.Getenv("CLAUDE_PROJECT_DIR"), noColor)
+}
+
+// launchExtra is CLAUDE_PROJECT_DIR=pd when pd is set, then NO_COLOR=1 with
+// noColor.
+func launchExtra(pd string, noColor bool) []string {
 	var extra []string
 	if pd != "" {
 		extra = append(extra, "CLAUDE_PROJECT_DIR="+pd)
 	}
 	if noColor {
 		extra = append(extra, "NO_COLOR=1")
+	}
+	return extra
+}
+
+// reexec replaces the process with this binary running args, in an
+// environment of HOME (the passwd home), cleanPath, extra, and the
+// settings.
+func reexec(home string, s map[string]string, extra []string, args ...string) error {
+	exe, err := selfExecutable()
+	if err != nil {
+		return fmt.Errorf("cannot find the scree binary: %w", err)
 	}
 	env := childEnv(home, cleanPath, s, false, extra...)
 	if err := execProgram(exe, append([]string{exe}, args...), env); err != nil {

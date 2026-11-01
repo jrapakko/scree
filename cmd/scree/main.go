@@ -43,6 +43,12 @@ Usage:
                            container
   scree run <command> [args]
                            run another command the same way, from a terminal
+  scree key [-offline] [-replace] [-check]
+                           save the OpenRouter API key in ~/.config/scree/env
+                           (prompted for, or one line from stdin; replacing
+                           a saved key from stdin needs -replace), then make
+                           one test call to the embeddings API (-check: only
+                           the call)
   scree watch              index changed files, then keep the index current
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
@@ -50,7 +56,8 @@ Usage:
   scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] "query"
                            auto (default) is semantic, plus keyword search
                            when the query holds an identifier such as FOO_BAR
-                           or a name from the folder's code;
+                           or a name from the folder's code, and keyword
+                           alone when there is no API key;
                            keyword makes no API call; -format text (the
                            default on a terminal) groups lines by query word;
                            -format json prints one object per hit, the stable
@@ -62,14 +69,14 @@ Usage:
                            and last sync; -prune deletes those whose folder
                            is gone
 
-Every command but indexes takes -notes, -db and -gitignore. The folder is
--notes if given, otherwise the git root of the current directory, or the
-current directory outside git. serve needs -notes outside Claude Code. Under
-Claude Code (CLAUDE_PROJECT_DIR set), serve refuses -notes, -db and SCREE_DB,
-requires CLAUDE_PROJECT_DIR to be in the same repo as its working directory,
-and indexes only a repo whose .mcp.json names scree mcp. ~ in
-~/.config/scree/env is the home directory in the password database, not
-$HOME. Environment:
+Every command but indexes and key takes -notes, -db and -gitignore. The
+folder is -notes if given, otherwise the git root of the current directory,
+or the current directory outside git. serve needs -notes outside Claude
+Code. Under Claude Code (CLAUDE_PROJECT_DIR set), serve refuses -notes, -db
+and SCREE_DB, requires CLAUDE_PROJECT_DIR to be in the same repo as its
+working directory, and indexes only a repo whose .mcp.json names scree mcp.
+~ in ~/.config/scree/env is the home directory in the password database,
+not $HOME. Environment:
   SCREE_DB            index file (default $XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db)
   SCREE_MODEL         embedding model (default openai/text-embedding-3-small)
   SCREE_DIMENSIONS    embedding size, 0 for the model default (default 512)
@@ -80,7 +87,10 @@ $HOME. Environment:
                       (default 50; 0 for no limit); reindex always does
   SCREE_ZDR           1 asks OpenRouter for zero-data-retention endpoints
                       only; 0 for other endpoints (default 1)
-  OPENROUTER_API_KEY  API key for the endpoint
+  OPENROUTER_API_KEY  API key for the endpoint; when it is unset and
+                      ~/.config/scree/env sets one (see scree key), search,
+                      reindex, doctor and watch run as scree run would,
+                      with settings from that file only
   SCREE_HTTP_TOKEN    bearer token for serve -http; required with
                       -allow-remote, enforced on loopback when set
 `
@@ -106,9 +116,19 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go exitOnSecondSignal(ctx, stop)
+	if err := useSettingsKey(cmd, args); err != nil {
+		fmt.Fprintln(os.Stderr, "scree:", textsafe.Strip(err.Error()))
+		os.Exit(1)
+	}
+	ctx := context.Background()
+	// scree key installs no handler here: Ctrl-C at its prompt ends it at
+	// once (readTerminal restores the terminal first).
+	if cmd != "key" {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		go exitOnSecondSignal(ctx, stop)
+	}
 
 	var err error
 	switch cmd {
@@ -128,6 +148,8 @@ func main() {
 		err = runMCP(args)
 	case "run":
 		err = runRun(args)
+	case "key":
+		err = runKey(ctx, args)
 	case "version", "-version", "--version":
 		fmt.Println("scree", version)
 	case "help", "-h", "-help", "--help":
@@ -194,8 +216,18 @@ func flags(name string, cfg *config) *flag.FlagSet {
 	fs.StringVar(&cfg.notes, "notes", "", "folder to index (default: see usage)")
 	fs.StringVar(&cfg.db, "db", os.Getenv("SCREE_DB"), "index file (default: one per folder under $XDG_DATA_HOME/scree/indexes)")
 	fs.BoolVar(&cfg.gitignore, "gitignore", true, "honor .gitignore, .git/info/exclude and core.excludesFile")
+	envConfig(cfg)
+	return fs
+}
+
+// defaultEmbedURL is the embeddings endpoint when SCREE_EMBED_URL is unset.
+const defaultEmbedURL = "https://openrouter.ai/api/v1/embeddings"
+
+// envConfig sets cfg's model, endpoint, key and dimensions from the
+// environment.
+func envConfig(cfg *config) {
 	cfg.model = envOr("SCREE_MODEL", "openai/text-embedding-3-small")
-	cfg.url = envOr("SCREE_EMBED_URL", "https://openrouter.ai/api/v1/embeddings")
+	cfg.url = envOr("SCREE_EMBED_URL", defaultEmbedURL)
 	cfg.apiKey = os.Getenv("OPENROUTER_API_KEY")
 	cfg.dims = 512
 	if v := os.Getenv("SCREE_DIMENSIONS"); v != "" {
@@ -203,7 +235,6 @@ func flags(name string, cfg *config) *flag.FlagSet {
 			log.Fatalf("SCREE_DIMENSIONS: %v", err)
 		}
 	}
-	return fs
 }
 
 func envOr(key, def string) string {
@@ -305,7 +336,7 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	// Queries fail fast: someone is waiting on the answer.
 	q := *e
 	q.Timeout, q.MaxAttempts = 10*time.Second, 2
-	ix := &index.Indexer{Policy: p, Embedder: e, QueryEmbedder: &q, Log: log.Default()}
+	ix := &index.Indexer{Policy: p, Embedder: e, QueryEmbedder: &q, Log: log.Default(), NoKeyHint: noKeyHint(cfg.serve)}
 	if cfg.doctor {
 		if _, err := os.Stat(cfg.db); errors.Is(err, fs.ErrNotExist) {
 			return ix, nil
@@ -548,7 +579,7 @@ func runSearch(ctx context.Context, args []string) error {
 	}
 	note := ""
 	if mode == index.Auto {
-		note = mcpserver.ModeNote(used)
+		note = mcpserver.ModeNote(used, ix.KeyHint())
 	}
 	if *format == "text" {
 		return writeText(ctx, os.Stdout, ix, fs.Arg(0), hits, note, linksOn())
@@ -717,7 +748,14 @@ func runDoctor(ctx context.Context, args []string) error {
 		report(false, "index built with %s but configured for %s; run `scree reindex -all`", have, want)
 	}
 
-	report(cfg.apiKey != "", "OPENROUTER_API_KEY %s", map[bool]string{true: "set", false: "not set"}[cfg.apiKey != ""])
+	switch {
+	case cfg.apiKey != "" && os.Getenv(keyFromVar) != "":
+		report(true, "OPENROUTER_API_KEY set (from %s)", os.Getenv(keyFromVar))
+	case cfg.apiKey != "":
+		report(true, "OPENROUTER_API_KEY set")
+	default:
+		report(false, "OPENROUTER_API_KEY not set (%s); search runs keyword mode only", noKeyHint(false))
+	}
 	if cfg.zdr {
 		report(true, "zero data retention requested (provider.zdr=true, data_collection=deny)")
 		if u, err := url.Parse(cfg.url); err != nil || u.Hostname() != "openrouter.ai" {

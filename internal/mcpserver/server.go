@@ -103,7 +103,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 			note = w.Note(ctx)
 		}
 		if mode == index.Auto {
-			note = joinNotes(ModeNote(used), note)
+			note = joinNotes(ModeNote(used, ix.KeyHint()), note)
 		}
 		return textResult(FormatHits(hits, note)), nil, nil
 	})
@@ -236,8 +236,15 @@ func FormatHits(hits []store.Hit, note string) string {
 }
 
 // ModeNote is the line FormatHits output ends with when auto mode chose
-// the search, naming the mode it ran.
-func ModeNote(used index.Mode) string { return "[mode: auto → " + string(used) + "]" }
+// the search, naming the mode it ran. Auto runs keyword only when there is
+// no API key (Indexer.Resolve), and the note says so and adds keyHint
+// (Indexer.KeyHint).
+func ModeNote(used index.Mode, keyHint string) string {
+	if used == index.Keyword {
+		return "[mode: auto → keyword: no API key; " + keyHint + "]"
+	}
+	return "[mode: auto → " + string(used) + "]"
+}
 
 // joinNotes joins the non-empty notes with newlines.
 func joinNotes(notes ...string) string {

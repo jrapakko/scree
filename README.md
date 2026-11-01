@@ -16,15 +16,13 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/scree ./cmd/scree
    ```
 
-2. **Write the settings file.** This prompts for the key without echoing it, so it never lands in your shell history or on screen.
+2. **Save the key** in the settings file. `scree key` prompts for it without echoing it, so it never lands in your shell history or on screen, writes `~/.config/scree/env` with mode 600, and makes one test call to the API:
 
    ```sh
-   mkdir -p ~/.config/scree
-   printf 'OpenRouter API key: '; stty -echo; IFS= read -r key; stty echo; echo
-   ( umask 077; printf "OPENROUTER_API_KEY='%s'\n" "$key" > ~/.config/scree/env )
-   chmod 600 ~/.config/scree/env
-   unset key
+   bin/scree key
    ```
+
+   It keeps any other lines in the file and replaces an earlier key. `scree key < file` reads the key from the first line of a file instead, and replaces a saved key only with `-replace`; `-offline` skips the test call, and `-check` makes only the test call. Ctrl-C at the prompt saves nothing.
 
 3. **Install** the binary:
 
@@ -66,7 +64,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/scree ./cmd/scree
 
 ## Configure
 
-Settings come from environment variables. The [settings file](#settings-file) is the one place to keep them, including the API key. Don't `export` the key in a shell profile.
+Settings come from environment variables. The [settings file](#settings-file) is the one place to keep them, including the API key. Don't `export` the key in a shell profile. With `OPENROUTER_API_KEY` unset, a command run directly (`scree search`, `doctor`, `reindex`, `watch`) still uses the key in the settings file, by running as `scree run` would; see below.
 
 | Variable | Default |
 | --- | --- |
@@ -78,6 +76,7 @@ Settings come from environment variables. The [settings file](#settings-file) is
 | `SCREE_FIRST_SYNC_MB` | `50`; a Claude Code session or `watch` won't start the first index of a folder with more markdown than this (`0` = no limit); `scree reindex` always does |
 | `SCREE_ZDR` | `1`; set `0` for endpoints other than OpenRouter |
 | `SCREE_HTTP_TOKEN` | none; required with `serve -allow-remote`, and enforced on loopback if set |
+| `OPENROUTER_API_KEY` | none; when unset and the [settings file](#settings-file) holds one (`scree key` writes it there), `search`, `reindex`, `doctor` and `watch` run as `scree run` would. Without a key, `auto` search runs `keyword` |
 
 `$XDG_DATA_HOME` defaults to `~/.local/share`.
 
@@ -119,6 +118,7 @@ Run `scree doctor -v` to see what each layer ignores before relying on a pattern
 ## Use
 
 ```sh
+scree key                # save the API key in the settings file
 scree doctor             # check config, index, and the API
 scree doctor -v          # also list every ignored file, and check the keyword index
 scree reindex            # index new and changed files
@@ -134,7 +134,7 @@ scree serve -notes . -http 127.0.0.1:7077   # MCP over HTTP, loopback only
 scree indexes            # list per-folder indexes; -prune deletes ones whose folder is gone
 ```
 
-Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. `serve` needs `-notes` outside Claude Code. From a terminal, use `scree run <command>` so the settings file is loaded, for example `scree run search "…"`.
+Every command but `indexes` and `key` takes `-notes <dir>`, `-db <file>` and `-gitignore=false`. `serve` needs `-notes` outside Claude Code. From a terminal, `search`, `reindex`, `doctor` and `watch` run as `scree run <command>` would whenever `OPENROUTER_API_KEY` is unset and the settings file holds a key; `scree run` loads the file in any case, for example `scree run search "…"`.
 
 ### Search modes
 
@@ -144,6 +144,8 @@ Every command but `indexes` takes `-notes <dir>`, `-db <file>` and `-gitignore=f
 - **`hybrid`**: a vector search and an SQLite FTS5 keyword search over chunk text, heading and path, merged by reciprocal rank fusion, so exact names rank first.
 - **`semantic`**: vectors only.
 - **`keyword`**: FTS5 only. It makes no API call, so it works without a key or while the API is down. A failed embedding call says so.
+
+With no API key, `auto` runs `keyword` and its output ends with `[mode: auto → keyword: no API key; run scree key, or set OPENROUTER_API_KEY]`; `-mode semantic` or `hybrid` is an error. `serve` says `set OPENROUTER_API_KEY, or start through scree mcp` instead, since it never reads the settings file, and on Windows only `set OPENROUTER_API_KEY`.
 
 On a private set of 16 plain-language and 7 identifier queries over real notes, `auto` kept plain-question file MRR at 0.89 while raising identifier MRR from 0.46 to 0.80. Always-on `hybrid` raised identifiers as much but cost plain questions, which is why it is not the default.
 
@@ -196,11 +198,13 @@ chunk text
 
 ### Settings file
 
-`scree mcp` (for Claude Code), `scree run` (from a terminal) and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. Step 2 of the [Quick start](#quick-start) creates it. It holds the key and optional settings, not the folder.
+`scree mcp` (for Claude Code), `scree run` (from a terminal) and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. `scree key` (step 2 of the [Quick start](#quick-start)) creates it or updates the key in it. It holds the key and optional settings, not the folder.
 
-`~` is taken from the password database (your login's home directory), not from `$HOME` or `$XDG_CONFIG_HOME`. `scree mcp` and `scree run` refuse to start if the file is missing, is a symlink, is not owned by you, or is readable by group or others; `chmod 600` fixes the last. On Linux the home directory comes from `/etc/passwd`, or from `getent passwd` for an LDAP or sssd login; if neither knows you, they refuse to start rather than trust `$HOME`. They don't run on Windows: set the variables in the environment and run `scree serve -notes …` or another command directly.
+A command run directly, without `scree run`, uses the environment. When `OPENROUTER_API_KEY` is unset and this file holds a key, `search`, `reindex`, `doctor` and `watch` instead re-run themselves exactly as `scree run` would: with an environment built from this file alone, so the key goes only to the file's `SCREE_EMBED_URL` (or the default endpoint), through the file's proxy if any, and no `SCREE_*`, proxy, `SSL_CERT_FILE` or `GODEBUG` variable from your shell applies. `doctor` then says the key came from this file. A missing file, or one with no key, means no key. A file that fails the checks below gives one warning naming the problem, and the command runs without a key (`auto` search runs `keyword`). `serve` never reads the file itself; under Claude Code, `scree mcp` has already applied it.
 
-Write one `NAME=value` per line, and wrap values in single quotes, as step 2 does, so a path with spaces stays one value. An `export ` prefix is allowed. The file is read as data and never run as shell, so nothing in a value is expanded. Only scree's own variables (`SCREE_*`, `OPENROUTER_API_KEY`), the proxy variables, and `DOCKER_HOST` and `DOCKER_CONTEXT` (passed only to docker by [`scree mcp -docker`](#docker-or-podman)) are accepted; any other name is an error that names the line. Other variables from the Configure table can go in the same file. A value can't itself contain the quote character that wraps it.
+`~` is taken from the password database (your login's home directory), not from `$HOME` or `$XDG_CONFIG_HOME`. `scree mcp` and `scree run` refuse to start if the file is missing, is a symlink, is not owned by you, or is readable by group or others; `chmod 600` fixes the last. `scree key` refuses such a file too (a missing one is fine), a `~/.config/scree` folder that is a symlink, is not yours or is writable by group or others, a symlinked `~/.config`, and a key that would make the file larger than 64 KB. On Linux the home directory comes from `/etc/passwd`, or from `getent passwd` for an LDAP or sssd login; if neither knows you, they refuse to start rather than trust `$HOME`. They don't run on Windows: set the variables in the environment and run `scree serve -notes …` or another command directly.
+
+Write one `NAME=value` per line, and wrap values in single quotes, as `scree key` does, so a path with spaces stays one value. An `export ` prefix is allowed. The file is read as data and never run as shell, so nothing in a value is expanded. Only scree's own variables (`SCREE_*`, `OPENROUTER_API_KEY`), the proxy variables, and `DOCKER_HOST` and `DOCKER_CONTEXT` (passed only to docker by [`scree mcp -docker`](#docker-or-podman)) are accepted; any other name is an error that names the line. Other variables from the Configure table can go in the same file. A value can't itself contain the quote character that wraps it.
 
 ### Claude Code
 
