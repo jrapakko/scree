@@ -8,11 +8,11 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/jrapakko/scree",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/jrapakko/scree:0.3.4",
+      "identifier": "ghcr.io/jrapakko/scree:0.3.5",
       "transport": {
         "type": "stdio"
       },

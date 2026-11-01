@@ -69,6 +69,7 @@ func startPager() (io.Writer, func(err error) error) {
 		return os.Stdout, direct
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = pagerEnv()
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	in, err := cmd.StdinPipe()
 	if err == nil {
@@ -85,6 +86,18 @@ func startPager() (io.Writer, func(err error) error) {
 		cmd.Wait()
 		return nil
 	}
+}
+
+// pagerEnv returns the pager's environment: the current one plus
+// LESSCHARSET=utf-8 unless LESSCHARSET is set, since the text view is
+// always UTF-8 and scree run and the settings-file key re-exec pass no
+// LANG or LC_*, without which less shows non-ASCII bytes as <E2>.
+func pagerEnv() []string {
+	env := os.Environ()
+	if _, set := os.LookupEnv("LESSCHARSET"); !set {
+		env = append(env, "LESSCHARSET=utf-8")
+	}
+	return env
 }
 
 // findExec returns the path of the executable regular file name in the

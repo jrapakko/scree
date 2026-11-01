@@ -205,3 +205,33 @@ func TestRunCarriesPagerAndColors(t *testing.T) {
 		}
 	}
 }
+
+// TestPagerCharset: the pager runs with LESSCHARSET=utf-8 added to the
+// environment, unless LESSCHARSET is already set (empty too).
+func TestPagerCharset(t *testing.T) {
+	dir := tempDir(t)
+	got := filepath.Join(dir, "charset")
+	pager := fakeExec(t, filepath.Join(dir, "bin"), "pager", `cat > /dev/null; printf '%s:%s' "${LESSCHARSET+set}" "$LESSCHARSET" > "$1"`)
+	t.Setenv("SCREE_PAGER", pager+" "+got)
+	for _, tc := range []struct {
+		set       bool
+		val, want string
+	}{
+		{false, "", "set:utf-8"},
+		{true, "latin1", "set:latin1"},
+		{true, "", "set:"},
+	} {
+		t.Setenv("LESSCHARSET", tc.val)
+		if !tc.set {
+			os.Unsetenv("LESSCHARSET")
+		}
+		w, done := startPager()
+		if w == os.Stdout {
+			t.Fatal("no pager started")
+		}
+		done(nil)
+		if b, _ := os.ReadFile(got); string(b) != tc.want {
+			t.Errorf("LESSCHARSET set %v %q: pager saw %q, want %q", tc.set, tc.val, b, tc.want)
+		}
+	}
+}
