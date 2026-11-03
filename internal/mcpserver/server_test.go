@@ -556,3 +556,74 @@ func TestStaleHitHasNoLines(t *testing.T) {
 		t.Errorf("FormatHits = %s", out)
 	}
 }
+
+// TestReindexOverFirstSyncCap: with the first sync skipped for size, the
+// search note says to ask the user and then call reindex with no path (not
+// a CLI command); a reindex of one path does not lift the cap, and one with
+// no path has this process's writer take the lock and index the folder.
+func TestReindexOverFirstSyncCap(t *testing.T) {
+	cs, _, _, w := connectWith(t, lenEmbedder{}, func(ix *index.Indexer, dir string) *writer.Writer {
+		return &writer.Writer{Indexer: ix, LockPath: filepath.Join(dir, "writer.lock"), Log: log.New(io.Discard, "", 0),
+			FirstSyncMax: 1, Resumable: true}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for w.Status().Phase != writer.Skipped {
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v", w.Status())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	text, _ := call(t, cs, "search_docs", map[string]any{"query": "zebra"})
+	if !strings.Contains(text, "ask the user, then call reindex with no path to index it anyway]") || strings.Contains(text, "scree reindex") {
+		t.Errorf("search while skipped = %q", text)
+	}
+	// A path does not lift the cap.
+	text, isErr := call(t, cs, "reindex", map[string]any{"path": "z.md"})
+	if isErr || !strings.HasPrefix(text, "[not indexed: ") || w.Status().Phase != writer.Skipped {
+		t.Fatalf("reindex z.md while skipped = %q, %v; phase %s", text, isErr, w.Status().Phase)
+	}
+	text, isErr = call(t, cs, "reindex", nil)
+	if isErr || !strings.HasPrefix(text, "Indexing this folder now") || strings.Contains(text, "pid") {
+		t.Fatalf("reindex while skipped = %q, %v", text, isErr)
+	}
+	for w.Status().Phase != writer.Watching {
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v", w.Status())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if text, _ := call(t, cs, "search_docs", map[string]any{"query": "zebra", "mode": "keyword"}); !strings.Contains(text, `path="z.md"`) {
+		t.Errorf("search after reindex = %q", text)
+	}
+}
+
+// TestReindexSkippedLostRace: two reindex calls that both see Skipped;
+// the second finds IndexAnyway already taken, the phase moved on, and its
+// reply is never empty.
+func TestReindexSkippedLostRace(t *testing.T) {
+	g := &gatedEmbedder{n: 0, release: make(chan struct{})}
+	defer close(g.release)
+	cs, _, _, w := connectWith(t, g, func(ix *index.Indexer, dir string) *writer.Writer {
+		return &writer.Writer{Indexer: ix, LockPath: filepath.Join(dir, "writer.lock"), Log: log.New(io.Discard, "", 0),
+			FirstSyncMax: 1, Resumable: true}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for w.Status().Phase != writer.Skipped {
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v", w.Status())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The first call lifts the cap; the writer moves to Starting, then
+	// Syncing, where the gated embedder holds it.
+	if text, ok := reindexSkipped(context.Background(), w, ""); !ok || !strings.HasPrefix(text, "Indexing this folder now") {
+		t.Fatalf("first = %q, %v", text, ok)
+	}
+	// The second, as if it had seen Skipped just before: not handled.
+	if text, ok := reindexSkipped(context.Background(), w, ""); ok {
+		t.Errorf("second = %q, handled", text)
+	}
+	if text, isErr := call(t, cs, "reindex", nil); isErr || strings.TrimSpace(text) == "" {
+		t.Errorf("reindex after the cap was lifted = %q, %v", text, isErr)
+	}
+}

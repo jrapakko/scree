@@ -52,9 +52,10 @@ type Indexer struct {
 	// called from the watcher and from the MCP reindex tool.
 	writeMu sync.Mutex
 
-	mu         sync.Mutex
-	pauseUntil time.Time
-	backoff    time.Duration
+	mu          sync.Mutex
+	pauseUntil  time.Time
+	backoff     time.Duration
+	keyRejected bool
 }
 
 // MaxBackoff caps the pause after repeated API outages.
@@ -72,6 +73,40 @@ func (ix *Indexer) PausedUntil() time.Time {
 	return ix.pauseUntil
 }
 
+// KeyRejected reports whether the embedding API has rejected the API key
+// (embed.ErrKeyRejected) in this process. It stays set, since the key
+// comes from the environment and does not change while the process runs;
+// from then on files are indexed for keyword search only, as with no key,
+// and auto search runs keyword. A process started with a working key
+// embeds those files.
+func (ix *Indexer) KeyRejected() bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	return ix.keyRejected
+}
+
+// noteKeyRejected sets KeyRejected when err is embed.ErrKeyRejected.
+func (ix *Indexer) noteKeyRejected(err error) {
+	if errors.Is(err, embed.ErrKeyRejected) {
+		ix.mu.Lock()
+		ix.keyRejected = true
+		ix.mu.Unlock()
+	}
+}
+
+// keywordOnly reports whether files are stored without vectors: there is
+// no API key, or the API rejected it.
+func (ix *Indexer) keywordOnly() bool { return noKey(ix.Embedder) || ix.KeyRejected() }
+
+// KeywordWhy says why files are indexed, and auto searches run, keyword
+// only: "no API key; <KeyHint>", or that the API rejected the key.
+func (ix *Indexer) KeywordWhy() string {
+	if !noKey(ix.Embedder) && ix.KeyRejected() {
+		return "the embedding API rejected the API key; replace it: " + ix.KeyHint()
+	}
+	return "no API key; " + ix.KeyHint()
+}
+
 // embed calls the API unless paused, and updates the pause from the result.
 func (ix *Indexer) embed(ctx context.Context, inputs []string) ([][]float32, error) {
 	ix.mu.Lock()
@@ -81,6 +116,7 @@ func (ix *Indexer) embed(ctx context.Context, inputs []string) ([][]float32, err
 		return nil, ErrPaused
 	}
 	vecs, err := ix.Embedder.Embed(ctx, inputs)
+	ix.noteKeyRejected(err)
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	switch {
@@ -135,7 +171,7 @@ func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel stri
 		case err == nil:
 			changed, keywordOnly, err := ix.indexSrc(ctx, clean, src, fi)
 			if changed && keywordOnly {
-				ix.logf("indexed %q for keyword search only: no API key; %s", clean, ix.KeyHint())
+				ix.logf("indexed %q for keyword search only: %s", clean, ix.KeywordWhy())
 			}
 			return changed, err
 		case errors.Is(err, fs.ErrNotExist):
@@ -155,8 +191,9 @@ func (ix *Indexer) IndexFileCanon(ctx context.Context, c *policy.Canon, rel stri
 
 // indexSrc stores src as the content of rel, embedding it only if its hash
 // changed, or if it was stored without vectors and the embedder now has an
-// API key. Without a key (see noKey), the chunks are stored without vectors,
-// for keyword search only, and keywordOnly is true; the API is not called.
+// API key. Without a key (see noKey), or once the API has rejected it (see
+// KeyRejected, which a rejection here sets), the chunks are stored without
+// vectors, for keyword search only, and keywordOnly is true.
 // fi is the file as opened; its mtime and size are recorded so search can
 // tell when the file changed since.
 func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.FileInfo) (changed, keywordOnly bool, err error) {
@@ -170,7 +207,7 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.F
 	if err != nil {
 		return false, false, err
 	}
-	keywordOnly = noKey(ix.Embedder)
+	keywordOnly = ix.keywordOnly()
 	// Unchanged, unless it lacks vectors that can now be made.
 	if have == hash && (!haveKeywordOnly || keywordOnly) {
 		if err := ix.backfillLines(ctx, rel, src); err != nil {
@@ -195,7 +232,11 @@ func (ix *Indexer) indexSrc(ctx context.Context, rel string, src []byte, fi fs.F
 	case len(inputs) == 0:
 		keywordOnly = false
 	case !keywordOnly:
-		if vecs, err = ix.embed(ctx, inputs); err != nil {
+		vecs, err = ix.embed(ctx, inputs)
+		switch {
+		case errors.Is(err, embed.ErrKeyRejected):
+			vecs, keywordOnly = nil, true
+		case err != nil:
 			return false, false, fmt.Errorf("%q: %w", rel, err)
 		}
 	}
@@ -271,23 +312,30 @@ func (ix *Indexer) RemovePrefix(ctx context.Context, rel string) error {
 // SyncStats reports what a Sync did. Deferred counts files left for later
 // because the embedding API was unavailable; their old rows are kept.
 // KeywordOnly counts the files among Indexed that were stored without
-// vectors, for keyword search only, because there is no API key. The counts
+// vectors, for keyword search only, because there is no API key or the API
+// rejected it (KeyRejected, set then). The counts
 // are of notes; Sources counts the manifests and source files read for the
 // code vocabulary, and SourcesChanged those whose names were re-read because
 // they are new or changed.
 type SyncStats struct {
 	Scanned, Indexed, Removed, Failed, Deferred int
 	KeywordOnly                                 int
+	KeyRejected                                 bool
 	Sources, SourcesChanged                     int
 }
 
 // IndexedText is "N indexed" for a sync summary, with " (M keyword only: no
-// API key)" added when st.KeywordOnly is not zero.
+// API key)" added when st.KeywordOnly is not zero ("API key rejected" when
+// st.KeyRejected).
 func (st SyncStats) IndexedText() string {
 	if st.KeywordOnly == 0 {
 		return fmt.Sprintf("%d indexed", st.Indexed)
 	}
-	return fmt.Sprintf("%d indexed (%d keyword only: no API key)", st.Indexed, st.KeywordOnly)
+	why := "no API key"
+	if st.KeyRejected {
+		why = "API key rejected"
+	}
+	return fmt.Sprintf("%d indexed (%d keyword only: %s)", st.Indexed, st.KeywordOnly, why)
 }
 
 // MaxSourceFiles caps the manifests and source files one Sync reads for the
@@ -453,7 +501,8 @@ func (ix *Indexer) Sync(ctx context.Context) (SyncStats, error) {
 		return st, err
 	}
 	if st.KeywordOnly > 0 {
-		ix.logf("%d files indexed for keyword search only: no API key; %s", st.KeywordOnly, ix.KeyHint())
+		st.KeyRejected = !noKey(ix.Embedder) && ix.KeyRejected()
+		ix.logf("%d files indexed for keyword search only: %s", st.KeywordOnly, ix.KeywordWhy())
 	}
 	kept := func(p string) bool {
 		return slices.ContainsFunc(keep, func(dir string) bool { return strings.HasPrefix(p, dir) })
@@ -559,7 +608,8 @@ func noKey(e embed.Embedder) bool {
 }
 
 // Resolve returns the mode a search for query runs in: for Auto (or ""),
-// Keyword when there is no API key (see NoKey), otherwise Hybrid if HasIdentifier(query) or a word of the query, trimmed as
+// Keyword when there is no API key (see NoKey) or the API rejected it (see
+// KeyRejected), otherwise Hybrid if HasIdentifier(query) or a word of the query, trimmed as
 // HasIdentifier trims it and lowercased, is in the index's code vocabulary,
 // and Semantic otherwise; any other mode as it is. The notes need not hold
 // the word: hybrid's keyword side matches the query's other words too, so
@@ -567,7 +617,7 @@ func noKey(e embed.Embedder) bool {
 // extractor misread from a string can at worst send a question to Hybrid.
 // A failed lookup counts as no match.
 func (ix *Indexer) Resolve(ctx context.Context, mode Mode, query string) Mode {
-	if (mode == "" || mode == Auto) && ix.NoKey() {
+	if (mode == "" || mode == Auto) && (ix.NoKey() || ix.KeyRejected()) {
 		return Keyword
 	}
 	if m := Resolve(mode, query); m != Semantic || (mode != "" && mode != Auto) {
@@ -642,6 +692,19 @@ const (
 // keywordHint is added to a failed embedding call's error.
 const keywordHint = `; mode="keyword" still works without the embedding API`
 
+// SearchResolved is Search with mode resolved first (see Indexer.Resolve),
+// and returns the mode it ran. When auto chose a mode that embeds the query
+// and the API rejects the key, it runs keyword search instead.
+func (ix *Indexer) SearchResolved(ctx context.Context, query string, k int, mode Mode) ([]store.Hit, Mode, error) {
+	used := ix.Resolve(ctx, mode, query)
+	hits, err := ix.Search(ctx, query, k, used)
+	if err != nil && (mode == "" || mode == Auto) && used != Keyword && errors.Is(err, embed.ErrKeyRejected) {
+		used = Keyword
+		hits, err = ix.Search(ctx, query, k, used)
+	}
+	return hits, used, err
+}
+
 // Search returns the k chunks that best match query, by mode (see
 // Resolve for Auto): vector search (which embeds query), keyword search
 // over chunk text, heading and path (no API call), or both merged by
@@ -663,6 +726,9 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) (
 	if mode != Keyword && ix.NoKey() {
 		return nil, fmt.Errorf(`%w: %s; mode "keyword" works without one`, ErrNoKey, ix.KeyHint())
 	}
+	if mode != Keyword && ix.KeyRejected() {
+		return nil, fmt.Errorf(`%w by the embedding API: replace it: %s; mode "keyword" works without one`, embed.ErrKeyRejected, ix.KeyHint())
+	}
 	if n, _ := ix.Store.ChunkCount(ctx); n == 0 {
 		return nil, nil
 	}
@@ -676,6 +742,7 @@ func (ix *Indexer) Search(ctx context.Context, query string, k int, mode Mode) (
 		}
 		vecs, err := e.Embed(ctx, []string{query})
 		if err != nil {
+			ix.noteKeyRejected(err)
 			return nil, fmt.Errorf("%w%s", err, keywordHint)
 		}
 		if vec, err = ix.Store.Search(ctx, vecs[0], fetch); err != nil {

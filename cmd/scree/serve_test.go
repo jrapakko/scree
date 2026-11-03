@@ -80,7 +80,7 @@ func TestServeNotesWithoutClaude(t *testing.T) {
 	if err := runServe(ctx, []string{"-notes", notes}); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("runServe = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(indexDir(notes), "index.db")); err != nil {
+	if _, err := os.Stat(filepath.Join(testIndexDir(t, notes), "index.db")); err != nil {
 		t.Errorf("no index for -notes under %s: %v", data, err)
 	}
 }
@@ -132,5 +132,42 @@ func TestShutdownTimeout(t *testing.T) {
 	runWatch(ctx, []string{"-notes", notes})
 	if d := time.Since(start); d < ShutdownTimeout || d > ShutdownTimeout+2*time.Second {
 		t.Errorf("watch returned after %s, want about %s", d, ShutdownTimeout)
+	}
+}
+
+// TestServeRefusesHomeNotes: an explicit -notes that is the home folder, a
+// folder above it, or a filesystem root is refused before anything is
+// written, unless -allow-home; a folder inside home is served.
+func TestServeRefusesHomeNotes(t *testing.T) {
+	data := serveEnv(t)
+	home := filepath.Join(tempDir(t), "home", "u")
+	notes := filepath.Join(home, "notes")
+	mkdir(t, notes)
+	fakeHome(t, home)
+	t.Setenv("XDG_DATA_HOME", data)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	root := filepath.VolumeName(home) + string(filepath.Separator)
+	dirs := []string{home, filepath.Dir(home), root, home + string(filepath.Separator) + "."}
+	// A symlink to home is refused too (where symlinks can be made).
+	if link := filepath.Join(tempDir(t), "link"); os.Symlink(home, link) == nil {
+		dirs = append(dirs, link)
+	}
+	for _, dir := range dirs {
+		err := runServe(ctx, []string{"-notes", dir})
+		if err == nil || !strings.Contains(err.Error(), "pick a notes folder or a repo instead, not your home folder") {
+			t.Errorf("serve -notes %s = %v", dir, err)
+		}
+		if _, err := os.Stat(data); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("serve -notes %s created %s before refusing", dir, data)
+		}
+	}
+	for _, args := range [][]string{{"-notes", notes}, {"-allow-home", "-notes", home}} {
+		if err := runServe(ctx, args); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("serve %q = %v", args, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(testIndexDir(t, home), "index.db")); err != nil {
+		t.Errorf("serve -allow-home made no index: %v", err)
 	}
 }

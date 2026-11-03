@@ -73,15 +73,19 @@ func readSettings(p string) ([]byte, map[string]string, error) {
 }
 
 // useSettingsKey runs before anything else in main. For a command in
-// keyCommands, with OPENROUTER_API_KEY unset and not already re-executed,
+// keyCommands, with no usable OPENROUTER_API_KEY (unset, blank, an unfilled
+// placeholder or not a valid key; see envKey) and not already re-executed,
 // it replaces the process with `scree run <cmd> <args>` when the settings
 // file sets a key. A missing file, a file with no key, or no home directory
 // to find it in leaves the command to run as it is, without a key; so does
-// a file that fails the checks, after a warning on stderr. It returns only
+// a file that fails the checks, after a warning on stderr. When the
+// variable was set but unusable, the switch to the file's key is said on
+// stderr, with the reason and never the value. It returns only
 // when the command should run here, or when the exec failed.
 func useSettingsKey(cmd string, args []string) error {
+	k, problem := envKey()
 	if !slices.Contains(keyCommands, cmd) || runtime.GOOS == "windows" ||
-		os.Getenv("OPENROUTER_API_KEY") != "" || os.Getenv(keyFromVar) != "" {
+		k != "" || os.Getenv(keyFromVar) != "" {
 		return nil
 	}
 	home, err := settingsHome()
@@ -97,6 +101,10 @@ func useSettingsKey(cmd string, args []string) error {
 	if s["OPENROUTER_API_KEY"] == "" {
 		return nil
 	}
+	if problem != "" {
+		// Say why the variable was passed over; problem never holds the value.
+		fmt.Fprintf(os.Stderr, "scree: %s; using the key from %s\n", problem, textsafe.Strip(p))
+	}
 	return reexecWithKey(home, p, s, append([]string{cmd}, args...)...)
 }
 
@@ -108,14 +116,20 @@ func reexecWithKey(home, p string, s map[string]string, args ...string) error {
 }
 
 // noKeyHint says how to supply the API key, for messages about its
-// absence: serve takes it only from its environment, which scree mcp sets
-// from the settings file, and Windows has no settings file.
+// absence. serve takes it only from its environment, which a client sets:
+// under Claude Code (CLAUDE_PROJECT_DIR set) scree mcp sets it from the
+// settings file, which scree key writes; elsewhere, such as Claude
+// Desktop, the extension's settings do. Windows has no settings file.
 func noKeyHint(serve bool) string {
+	const ext = "add an OpenRouter API key in the extension's settings, "
+	claudeCode := os.Getenv("CLAUDE_PROJECT_DIR") != ""
 	switch {
+	case runtime.GOOS == "windows" && serve && !claudeCode:
+		return ext + "or set OPENROUTER_API_KEY"
 	case runtime.GOOS == "windows":
 		return "set OPENROUTER_API_KEY"
-	case serve:
-		return "set OPENROUTER_API_KEY, or start through scree mcp"
+	case serve && !claudeCode:
+		return ext + "set OPENROUTER_API_KEY, or start through scree mcp"
 	}
 	return "run scree key, or set OPENROUTER_API_KEY"
 }
@@ -267,23 +281,52 @@ func readKey(terminal bool) (string, error) {
 // which the settings file could not hold as written. Errors never show the
 // key.
 func checkKey(b []byte) error {
-	switch {
-	case len(b) == 0:
+	if len(b) == 0 {
 		return errors.New("no key given; nothing saved")
+	}
+	if p := keyProblem(b); p != "" {
+		return errors.New(p + "; nothing saved")
+	}
+	return nil
+}
+
+// keyProblem says what is wrong with a non-empty key, by checkKey's rules,
+// or "" if nothing is. It never shows the key.
+func keyProblem(b []byte) string {
+	switch {
 	case len(b) > maxKeyBytes:
-		return fmt.Errorf("the key is longer than %d bytes; nothing saved", maxKeyBytes)
+		return fmt.Sprintf("the key is longer than %d bytes", maxKeyBytes)
 	case !utf8.Valid(b):
-		return errors.New("the key is not valid UTF-8; nothing saved")
+		return "the key is not valid UTF-8"
 	}
 	for _, r := range string(b) {
 		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || !unicode.IsPrint(r) {
-			return errors.New("the key contains whitespace, control or invisible characters; nothing saved")
+			return "the key contains whitespace, control or invisible characters"
 		}
 		if r == '\'' || r == '"' || r == '\\' {
-			return errors.New("the key contains a quote or backslash; nothing saved")
+			return "the key contains a quote or backslash"
 		}
 	}
-	return nil
+	return ""
+}
+
+// envKey returns OPENROUTER_API_KEY as scree uses it: surrounding
+// whitespace trimmed (a key pasted with a newline works), and "" for a
+// value that is still a client's unfilled placeholder (starts with "${") or
+// that fails checkKey's rules, with problem saying why in words that never
+// show the value. An unset or empty variable is "" with no problem.
+func envKey() (key, problem string) {
+	v := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
+	switch {
+	case v == "":
+		return "", ""
+	case strings.HasPrefix(v, "${"):
+		return "", "OPENROUTER_API_KEY is set but is an unfilled placeholder"
+	}
+	if p := keyProblem([]byte(v)); p != "" {
+		return "", "OPENROUTER_API_KEY is set but not a valid key: " + p
+	}
+	return v, ""
 }
 
 // saveKey writes key into the settings file at p, creating its folder

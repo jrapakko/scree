@@ -19,7 +19,10 @@ import (
 )
 
 // indexesBase is the folder holding one directory per indexed folder.
-func indexesBase() string { return filepath.Join(dataHome(), "scree", "indexes") }
+func indexesBase() (string, error) {
+	data, err := dataHome()
+	return filepath.Join(data, "scree", "indexes"), err
+}
 
 // indexInfo is what `scree indexes` learned about one index directory.
 type indexInfo struct {
@@ -50,8 +53,11 @@ func runIndexes(_ context.Context, args []string) error {
 }
 
 func indexes(w io.Writer, prune bool) error {
-	base := indexesBase()
-	if legacy := filepath.Join(dataHome(), "scree", "index.db"); fileExists(legacy) {
+	base, err := indexesBase()
+	if err != nil {
+		return err
+	}
+	if legacy := filepath.Join(filepath.Dir(base), "index.db"); fileExists(legacy) {
 		fmt.Fprintf(w, "legacy index %s (from the single-folder version); delete it, or pass -db %s to keep using it\n",
 			quote(legacy), quote(legacy))
 	}

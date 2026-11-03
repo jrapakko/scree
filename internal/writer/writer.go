@@ -86,14 +86,20 @@ type Writer struct {
 	OnAcquire func(context.Context) error
 	// FirstSyncMax caps, in bytes, the markdown a writer indexes on its
 	// own when the index is new: over it, the first sync is skipped (phase
-	// Skipped) until an explicit `scree reindex`. 0 means no cap.
+	// Skipped) until an explicit `scree reindex`, or IndexAnyway. 0 means
+	// no cap.
 	FirstSyncMax int64
+	// Resumable makes Run, after skipping the first sync, wait for
+	// IndexAnyway (serve's reindex tool) instead of returning.
+	Resumable bool
 
 	mu      sync.Mutex
 	status  Status
 	holding bool
 	synced  bool // meta synced_at is known to be set
 	stale   chan []string
+	noCap   bool          // IndexAnyway lifted FirstSyncMax
+	resume  chan struct{} // IndexAnyway's signal to a Resumable Run
 }
 
 // Run takes the write role whenever it can, until ctx is done: it tries the
@@ -134,6 +140,15 @@ func (w *Writer) Run(ctx context.Context) error {
 		w.holding = false
 		w.mu.Unlock()
 		l.Release()
+		if errors.Is(err, errSkipped) && w.Resumable && ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-w.resumeChan():
+			}
+			lastPID = -1
+			continue
+		}
 		if ctx.Err() != nil || errors.Is(err, errSkipped) {
 			return nil
 		}
@@ -161,8 +176,8 @@ func (w *Writer) hold(ctx context.Context) error {
 		return err
 	} else if skip {
 		w.set(Status{Phase: Skipped, Bytes: bytes})
-		w.logf("not indexing %s: %.1f MB of markdown is over SCREE_FIRST_SYNC_MB=%d; run `scree reindex` in it to index it anyway",
-			ix.Root(), mb(bytes), w.FirstSyncMax>>20)
+		w.logf("not indexing %s: %.1f MB of markdown is over SCREE_FIRST_SYNC_MB=%d; %s to index it anyway",
+			ix.Root(), mb(bytes), w.FirstSyncMax>>20, w.anywayHint())
 		return errSkipped
 	}
 	w.logf("syncing %s", ix.Root())
@@ -186,11 +201,51 @@ func (w *Writer) hold(ctx context.Context) error {
 	return watch.RunOptions(ctx, ix, watch.Options{Stale: stale})
 }
 
+// IndexAnyway lifts FirstSyncMax for this writer and, when Run skipped the
+// first sync and waits (Resumable), makes it take the lock and sync. It
+// reports whether it did, which it does only in phase Skipped.
+func (w *Writer) IndexAnyway() bool {
+	ch := w.resumeChan()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status.Phase != Skipped || !w.Resumable {
+		return false
+	}
+	w.noCap = true
+	w.status = Status{Phase: Starting}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (w *Writer) resumeChan() chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.resume == nil {
+		w.resume = make(chan struct{}, 1)
+	}
+	return w.resume
+}
+
+// anywayHint says how to index a folder over FirstSyncMax: for serve, a
+// model reads it, and should ask the user before indexing that much.
+func (w *Writer) anywayHint() string {
+	if w.Resumable {
+		return "ask the user, then call reindex with no path"
+	}
+	return `run "scree reindex" in it`
+}
+
 // overCap reports whether the first sync of a new index would exceed
 // FirstSyncMax, and the estimated size. An index that has files, or has
-// finished a sync before, is never capped.
+// finished a sync before, is never capped, nor is any after IndexAnyway.
 func (w *Writer) overCap(ctx context.Context) (bool, int64, error) {
-	if w.FirstSyncMax <= 0 {
+	w.mu.Lock()
+	noCap := w.noCap
+	w.mu.Unlock()
+	if w.FirstSyncMax <= 0 || noCap {
 		return false, 0, nil
 	}
 	ix := w.Indexer
@@ -264,8 +319,8 @@ func (w *Writer) Note(ctx context.Context) string {
 		return fmt.Sprintf("[index not updating: %s]", textsafe.Strip(st.Err.Error()))
 	}
 	if st.Phase == Skipped {
-		return fmt.Sprintf(`[not indexed: this folder has %.1f MB of markdown, over SCREE_FIRST_SYNC_MB=%d; run "scree reindex" in it to index it anyway]`,
-			mb(st.Bytes), w.FirstSyncMax>>20)
+		return fmt.Sprintf(`[not indexed: this folder has %.1f MB of markdown, over SCREE_FIRST_SYNC_MB=%d; %s to index it anyway]`,
+			mb(st.Bytes), w.FirstSyncMax>>20, w.anywayHint())
 	}
 	if st.Phase != Syncing && st.Phase != Waiting {
 		return ""

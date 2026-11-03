@@ -2,10 +2,14 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jrapakko/scree/internal/embed"
@@ -76,7 +80,7 @@ func TestSearchNoKey(t *testing.T) {
 }
 
 func TestModeNoteKeyHint(t *testing.T) {
-	if got := ModeNote(index.Keyword, "set X, or start through Y"); got != "[mode: auto → keyword: no API key; set X, or start through Y]" {
+	if got := ModeNote(index.Keyword, "no API key; set X, or start through Y"); got != "[mode: auto → keyword: no API key; set X, or start through Y]" {
 		t.Errorf("keyword: %q", got)
 	}
 	if got := ModeNote(index.Semantic, "set X"); got != "[mode: auto → semantic]" {
@@ -195,5 +199,132 @@ func TestReindexWithoutKey(t *testing.T) {
 	text, isErr := call(t, cs, "reindex", nil)
 	if isErr || !strings.Contains(text, "1 indexed (1 keyword only: no API key), 0 removed, 0 failed, 0 deferred") {
 		t.Fatalf("reindex = %q, %v", text, isErr)
+	}
+}
+
+// TestKeyRejectedAtIndexing: when the API answers 401, the files are
+// indexed for keyword search only and the API is not asked again; auto
+// search finds them by keyword and says the key was rejected, a mode that
+// embeds the query is an error saying so, and the key never shows.
+func TestKeyRejectedAtIndexing(t *testing.T) {
+	const key = "sk-or-v1-rejected0123456789abcdef"
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, `{"error":{"message":"bad key `+r.Header.Get("Authorization")+`"}}`, http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	cs, _, _, _ := connectWith(t, embed.New(srv.URL, key, "m", 0), nil)
+	var out []string
+	text, isErr := call(t, cs, "reindex", nil)
+	out = append(out, text)
+	if isErr || !strings.Contains(text, "1 indexed (1 keyword only: API key rejected)") {
+		t.Errorf("reindex = %q, %v", text, isErr)
+	}
+	text, isErr = call(t, cs, "search_docs", map[string]any{"query": "zebra"})
+	out = append(out, text)
+	if isErr || !strings.HasPrefix(text, `<hit n="1" path="z.md" lines="1-2" heading="Zoo" match="keyword">`) ||
+		!strings.HasSuffix(text, "[mode: auto → keyword: the embedding API rejected the API key; replace it: set OPENROUTER_API_KEY]") {
+		t.Errorf("auto = %q, %v", text, isErr)
+	}
+	text, isErr = call(t, cs, "search_docs", map[string]any{"query": "zebra", "mode": "semantic"})
+	out = append(out, text)
+	if !isErr || !strings.Contains(text, "API key rejected") || !strings.Contains(text, `mode "keyword" works`) {
+		t.Errorf("semantic = %q, %v", text, isErr)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("%d API calls, want 1", n)
+	}
+	for _, o := range out {
+		if strings.Contains(o, key) || strings.Contains(o, key[len(key)-12:]) {
+			t.Errorf("output shows the key: %q", o)
+		}
+	}
+}
+
+// rejectingEmbedder embeds until reject is set, then answers as the API
+// does for a rejected key.
+type rejectingEmbedder struct {
+	lenEmbedder
+	reject *atomic.Bool
+}
+
+func (r rejectingEmbedder) Embed(ctx context.Context, in []string) ([][]float32, error) {
+	if r.reject.Load() {
+		return nil, fmt.Errorf("embed: %w: 401 Unauthorized", embed.ErrKeyRejected)
+	}
+	return r.lenEmbedder.Embed(ctx, in)
+}
+
+// TestKeyRejectedAtSearch: a key the API rejects first on a query makes
+// that auto search run keyword instead, and later ones too.
+func TestKeyRejectedAtSearch(t *testing.T) {
+	var reject atomic.Bool
+	cs, _, _, _ := connectWith(t, rejectingEmbedder{reject: &reject}, nil)
+	if text, isErr := call(t, cs, "reindex", nil); isErr || strings.Contains(text, "keyword only") {
+		t.Fatalf("reindex = %q", text)
+	}
+	reject.Store(true)
+	for range 2 {
+		text, isErr := call(t, cs, "search_docs", map[string]any{"query": "zebra"})
+		if isErr || !strings.Contains(text, `path="z.md"`) || !strings.HasSuffix(text, "[mode: auto → keyword: the embedding API rejected the API key; replace it: set OPENROUTER_API_KEY]") {
+			t.Errorf("auto = %q, %v", text, isErr)
+		}
+	}
+}
+
+// TestForbiddenInputIsPerFile: a 403, which OpenRouter sends for an input
+// its moderation flags, fails that file only: the other files are still
+// embedded, the key is not taken as rejected, and auto search stays
+// semantic with no note about the key.
+func TestForbiddenInputIsPerFile(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var req struct{ Input []string }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, in := range req.Input {
+			if strings.Contains(in, "flaggedword") {
+				http.Error(w, `{"error":{"message":"input flagged by moderation"}}`, http.StatusForbidden)
+				return
+			}
+		}
+		type item struct {
+			Index     int       `json:"index"`
+			Embedding []float32 `json:"embedding"`
+		}
+		var out struct {
+			Data []item `json:"data"`
+		}
+		for i, in := range req.Input {
+			out.Data = append(out.Data, item{i, []float32{1, float32(len(in))}})
+		}
+		json.NewEncoder(w).Encode(out)
+	}))
+	defer srv.Close()
+	cs, root, s, _ := connectWith(t, embed.New(srv.URL, "sk-or-v1-working0123456789", "m", 0), nil)
+	os.WriteFile(filepath.Join(root, "bad.md"), []byte("# Bad\nflaggedword\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "y.md"), []byte("# Yak\nyak yak\n"), 0o644)
+	text, isErr := call(t, cs, "reindex", nil)
+	if isErr || !strings.Contains(text, "2 indexed, 0 removed, 1 failed") || strings.Contains(text, "keyword only") {
+		t.Errorf("reindex = %q, %v", text, isErr)
+	}
+	if n, err := s.KeywordOnlyFiles(context.Background()); err != nil || n != 0 {
+		t.Errorf("keyword-only files = %d, %v", n, err)
+	}
+	text, isErr = call(t, cs, "search_docs", map[string]any{"query": "zebra"})
+	if isErr || !strings.HasSuffix(text, "[mode: auto → semantic]") || strings.Contains(text, "rejected") {
+		t.Errorf("auto = %q, %v", text, isErr)
+	}
+	// Another sync tries the flagged file again, and only it.
+	before := calls.Load()
+	if text, _ := call(t, cs, "reindex", nil); !strings.Contains(text, "0 indexed, 0 removed, 1 failed") {
+		t.Errorf("second reindex = %q", text)
+	}
+	if n := calls.Load() - before; n != 1 {
+		t.Errorf("second reindex made %d calls, want 1", n)
 	}
 }

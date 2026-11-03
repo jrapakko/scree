@@ -51,9 +51,11 @@ Usage:
                            one test call to the embeddings API (-check: only
                            the call)
   scree watch              index changed files, then keep the index current
-  scree serve [-http addr [-allow-remote]]
+  scree serve [-http addr [-allow-remote]] [-allow-home]
                            run the MCP server (stdio unless -http is given;
-                           -http is loopback only unless -allow-remote)
+                           -http is loopback only unless -allow-remote;
+                           -notes may not be your home folder or above it
+                           unless -allow-home)
   scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json|grep] [-no-pager] "query"
                            auto (default) is semantic, plus keyword search
                            when the query holds an identifier such as FOO_BAR
@@ -111,6 +113,7 @@ type config struct {
 	firstSyncMax                  int64 // SCREE_FIRST_SYNC_MB in bytes; 0 means no cap
 	zdr, gitignore                bool
 	serve                         bool         // the folder defaults to CLAUDE_PROJECT_DIR
+	allowHome                     bool         // serve -allow-home: an explicit -notes may be home or above
 	doctor                        bool         // doctor reports the SCREE_NOTES warning itself
 	source                        folderSource // set by open
 	dbExplicit                    bool         // -db or SCREE_DB was given; set by open
@@ -237,7 +240,11 @@ const defaultEmbedURL = "https://openrouter.ai/api/v1/embeddings"
 func envConfig(cfg *config) {
 	cfg.model = envOr("SCREE_MODEL", "openai/text-embedding-3-small")
 	cfg.url = envOr("SCREE_EMBED_URL", defaultEmbedURL)
-	cfg.apiKey = os.Getenv("OPENROUTER_API_KEY")
+	var problem string
+	cfg.apiKey, problem = envKey()
+	if problem != "" {
+		log.Printf("%s; running without an API key", problem)
+	}
 	cfg.dims = 512
 	if v := os.Getenv("SCREE_DIMENSIONS"); v != "" {
 		if _, err := fmt.Sscan(v, &cfg.dims); err != nil {
@@ -328,14 +335,24 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
 		return nil, fmt.Errorf("folder %s is not a directory", root)
 	}
+	if cfg.serve && src == flagNotes && !cfg.allowHome {
+		if err := refuseHomeNotes(root); err != nil {
+			return nil, err
+		}
+	}
 	p, err := policy.OpenOptions(root, policy.Options{MaxBytes: cfg.maxBytes, GitIgnore: cfg.gitignore})
 	if err != nil {
 		return nil, err
 	}
 	cfg.dbExplicit = cfg.db != ""
 	if !cfg.dbExplicit {
-		cfg.db = filepath.Join(indexDir(p.Root()), "index.db")
-		if err := checkIndexDirs(filepath.Dir(cfg.db)); err != nil {
+		dir, err := indexDir(p.Root())
+		if err != nil {
+			p.Close()
+			return nil, err
+		}
+		cfg.db = filepath.Join(dir, "index.db")
+		if err := checkIndexDirs(dir); err != nil {
 			p.Close()
 			return nil, err
 		}
@@ -368,6 +385,21 @@ func open(cfg *config, checkModel bool) (*index.Indexer, error) {
 	return ix, nil
 }
 
+// refuseHomeNotes refuses, for serve, an explicit -notes that is the home
+// directory, a folder above it, or a filesystem or volume root: a client
+// such as Claude Desktop passes the folder a user picked, and indexing a
+// whole home folder is never what they meant. -allow-home lifts it.
+func refuseHomeNotes(root string) error {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("folder: %w", err)
+	}
+	if isHomeOrAbove(resolved) {
+		return fmt.Errorf("serve: %s is your home folder, a folder above it, or a filesystem or drive root; pick a notes folder or a repo instead, not your home folder (from the command line, -allow-home indexes it anyway)", root)
+	}
+	return nil
+}
+
 // lockPath is the writer lock beside the index file.
 func lockPath(cfg *config) string { return filepath.Join(filepath.Dir(cfg.db), "writer.lock") }
 
@@ -395,6 +427,7 @@ func newWriter(cfg *config, ix *index.Indexer) *writer.Writer {
 		Indexer:      ix,
 		LockPath:     lockPath(cfg),
 		FirstSyncMax: cfg.firstSyncMax,
+		Resumable:    cfg.serve, // the reindex tool can lift FirstSyncMax
 		OnAcquire:    func(context.Context) error { return claim(cfg, ix, true) },
 	}
 	w.Attach()
@@ -473,6 +506,7 @@ func runServe(ctx context.Context, args []string) error {
 	fs := flags("serve", &cfg)
 	addr := fs.String("http", "", "serve streamable HTTP on this address instead of stdio, e.g. 127.0.0.1:7077")
 	allowRemote := fs.Bool("allow-remote", false, "allow -http on a non-loopback address (needs SCREE_HTTP_TOKEN)")
+	fs.BoolVar(&cfg.allowHome, "allow-home", false, "allow -notes to be your home folder, a folder above it, or a filesystem root")
 	fs.Parse(args)
 	// stdout belongs to the MCP protocol.
 	log.SetOutput(textsafe.Writer(os.Stderr))
@@ -592,8 +626,7 @@ func runSearch(ctx context.Context, args []string) error {
 		return err
 	}
 	defer closeIndexer(ix)
-	used := ix.Resolve(ctx, mode, fs.Arg(0))
-	hits, err := ix.Search(ctx, fs.Arg(0), *k, used)
+	hits, used, err := ix.SearchResolved(ctx, fs.Arg(0), *k, mode)
 	if err != nil {
 		return err
 	}
@@ -602,7 +635,7 @@ func runSearch(ctx context.Context, args []string) error {
 	}
 	note := ""
 	if mode == index.Auto {
-		note = mcpserver.ModeNote(used, ix.KeyHint())
+		note = mcpserver.ModeNote(used, ix.KeywordWhy())
 	}
 	if kw := mcpserver.KeywordOnlyNote(ctx, ix, used, "scree reindex embeds them"); kw != "" {
 		note = strings.TrimPrefix(note+"\n"+kw, "\n")
@@ -745,6 +778,14 @@ func runDoctor(ctx context.Context, args []string) error {
 	defer closeIndexer(ix)
 	report(true, "folder %s (from %s)", ix.Root(), cfg.source)
 	doctorScan(ctx, ix, &cfg, *verbose, report, warn)
+	// The test call runs now, so the index line can say when the key was
+	// rejected; its result is reported last, as before.
+	var apiVecs [][]float32
+	var apiErr error
+	apiCheck := !*offline && cfg.apiKey != ""
+	if apiCheck {
+		apiVecs, apiErr = ix.Embedder.Embed(ctx, []string{"scree doctor"})
+	}
 
 	// doctor only reads: it never creates the index or records anything in
 	// it; the process holding the writer lock does that.
@@ -754,7 +795,7 @@ func runDoctor(ctx context.Context, args []string) error {
 		report(true, "index %s: not created yet (the first serve, watch or reindex builds it)", cfg.db)
 	} else {
 		st, err := ix.Store.Stats(ctx)
-		report(err == nil, "index %s: %d files, %d chunks%s (vec1 %s)", cfg.db, st.Files, st.Chunks, keywordOnlyText(st.KeywordOnly, cfg.apiKey != ""), st.Vec1Info)
+		report(err == nil, "index %s: %d files, %d chunks%s (vec1 %s)", cfg.db, st.Files, st.Chunks, keywordOnlyText(st.KeywordOnly, cfg.apiKey != "", errors.Is(apiErr, embed.ErrKeyRejected)), st.Vec1Info)
 		doctorKeyword(ctx, ix.Store, st.Chunks, *verbose, report)
 		doctorVocab(ctx, ix.Store, *verbose, report)
 		have, _ = ix.Store.Model()
@@ -787,7 +828,12 @@ func runDoctor(ctx context.Context, args []string) error {
 	case cfg.apiKey != "":
 		report(true, "OPENROUTER_API_KEY set")
 	default:
-		report(false, "OPENROUTER_API_KEY not set (%s); search runs keyword mode only", noKeyHint(false))
+		// A set but unusable key is not "not set"; problem never shows it.
+		what := "OPENROUTER_API_KEY not set"
+		if _, problem := envKey(); problem != "" {
+			what = problem
+		}
+		report(false, "%s (%s); search runs keyword mode only", what, noKeyHint(false))
 	}
 	if cfg.zdr {
 		report(true, "zero data retention requested (provider.zdr=true, data_collection=deny)")
@@ -797,11 +843,13 @@ func runDoctor(ctx context.Context, args []string) error {
 	} else {
 		warn("zero data retention off (SCREE_ZDR=0)")
 	}
-	if !*offline && cfg.apiKey != "" {
-		vecs, err := ix.Embedder.Embed(ctx, []string{"scree doctor"})
+	if apiCheck {
+		vecs, err := apiVecs, apiErr
 		switch {
 		case errors.Is(err, embed.ErrNoZDREndpoint):
 			report(false, "%v", err)
+		case errors.Is(err, embed.ErrKeyRejected):
+			report(false, "embeddings API: %v; until the key is replaced, files are indexed and searched by keyword only", err)
 		case err != nil:
 			report(false, "embeddings API: %v", err)
 		default:
@@ -816,11 +864,13 @@ func runDoctor(ctx context.Context, args []string) error {
 
 // keywordOnlyText is doctor's note on the n files indexed without vectors,
 // which semantic search cannot find: how to embed them, given whether there
-// is a key now. It is "" for none.
-func keywordOnlyText(n int, key bool) string {
+// is a key now and whether the API rejected it. It is "" for none.
+func keywordOnlyText(n int, key, rejected bool) string {
 	switch {
 	case n == 0:
 		return ""
+	case key && rejected:
+		return fmt.Sprintf(" (%d files keyword-only: the API rejected the key; replace it, then run scree reindex)", n)
 	case key:
 		return fmt.Sprintf(" (%d files keyword-only: indexed without an API key; run scree reindex)", n)
 	}

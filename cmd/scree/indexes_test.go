@@ -29,7 +29,7 @@ func makeIndex(t *testing.T, name string, synced bool) (root, dir string) {
 	t.Helper()
 	root = filepath.Join(tempDir(t), name)
 	mkdir(t, root)
-	dir = indexDir(root)
+	dir = testIndexDir(t, root)
 	s, err := store.Open(filepath.Join(dir, "index.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func runIndexesOut(t *testing.T, prune bool) (string, error) {
 func lineFor(t *testing.T, out, root string) string {
 	t.Helper()
 	for _, l := range strings.Split(out, "\n") {
-		if strings.HasPrefix(l, quote(capRunes(root))+"  ") && strings.HasSuffix(l, "  ("+quote(filepath.Base(indexDir(root)))+")") {
+		if strings.HasPrefix(l, quote(capRunes(root))+"  ") && strings.HasSuffix(l, "  ("+quote(filepath.Base(testIndexDir(t, root)))+")") {
 			return l
 		}
 	}

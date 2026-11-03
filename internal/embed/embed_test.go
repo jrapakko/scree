@@ -248,6 +248,31 @@ func TestErrorRedactsKey(t *testing.T) {
 	}
 }
 
+// TestKeyRejected: 401 is ErrKeyRejected; 403, which OpenRouter sends for
+// a flagged input, is a plain error for that input. Both are tried once,
+// neither is ErrUnavailable, and the key never shows in the error.
+func TestKeyRejected(t *testing.T) {
+	const key = "sk-or-v1-0123456789abcdef"
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		var calls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			http.Error(w, `{"error":{"message":"No auth credentials found"}}`, status)
+		}))
+		c := New(srv.URL, key, "m", 0)
+		c.retryDelay = time.Millisecond
+		_, err := c.Embed(context.Background(), []string{"x"})
+		srv.Close()
+		if err == nil || errors.Is(err, ErrKeyRejected) != (status == http.StatusUnauthorized) ||
+			errors.Is(err, ErrUnavailable) || strings.Contains(err.Error(), key) {
+			t.Errorf("%d: err = %v", status, err)
+		}
+		if n := calls.Load(); n != 1 {
+			t.Errorf("%d: %d calls, want 1", status, n)
+		}
+	}
+}
+
 func TestErrorUsesJSONMessage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPaymentRequired)

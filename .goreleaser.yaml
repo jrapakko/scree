@@ -10,7 +10,8 @@ before:
     - scripts/third-party-licenses.sh THIRD_PARTY_LICENSES
 
 builds:
-  - main: ./cmd/scree
+  - id: scree
+    main: ./cmd/scree
     binary: scree
     env:
       - CGO_ENABLED=0
@@ -22,8 +23,17 @@ builds:
     goarch: [amd64, arm64]
     mod_timestamp: "{{ .CommitTimestamp }}"
 
+# A macOS universal binary for the MCPB bundle (scripts/mcpb.sh, run by
+# the release workflow). The archives keep the per-arch binaries.
+universal_binaries:
+  - id: scree-universal
+    ids: [scree]
+    replace: false
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
 archives:
-  - formats: [tar.gz]
+  - ids: [scree]
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
         formats: [zip]

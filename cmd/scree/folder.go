@@ -132,7 +132,12 @@ func sameRepo(a, b string) bool {
 func isHomeOrAbove(dir string) bool { return homeOrAbove(dir, lookupHome()) }
 
 // homeOrAbove is isHomeOrAbove with the home directory given; "" means
-// unknown, and only filesystem roots are refused.
+// unknown, and only filesystem roots are refused. Besides comparing paths,
+// it compares files: dir is refused if it is the same directory
+// (os.SameFile) as home or any folder above home, so another path to the
+// same place (a bind mount, a differently cased path on a case-insensitive
+// disk, a macOS firmlink such as /System/Volumes/Data/Users/x) is refused
+// too.
 func homeOrAbove(dir, home string) bool {
 	if filepath.Dir(dir) == dir {
 		return true
@@ -147,8 +152,21 @@ func homeOrAbove(dir, home string) bool {
 	if home, err = filepath.Abs(home); err != nil {
 		return false
 	}
-	_, under := relUnder(dir, home)
-	return under
+	if _, under := relUnder(dir, home); under {
+		return true
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	for a := home; ; a = filepath.Dir(a) {
+		if ai, err := os.Stat(a); err == nil && os.SameFile(fi, ai) {
+			return true
+		}
+		if filepath.Dir(a) == a {
+			return false
+		}
+	}
 }
 
 // lookupHome returns the current user's home directory from the password
@@ -170,21 +188,32 @@ func relUnder(dir, path string) (string, bool) {
 	return rel, true
 }
 
-// dataHome returns $XDG_DATA_HOME, or ~/.local/share when it is unset.
-func dataHome() string {
-	if base := os.Getenv("XDG_DATA_HOME"); base != "" {
-		return base
+// dataHome returns $XDG_DATA_HOME, or ~/.local/share when it is unset. A
+// relative $XDG_DATA_HOME is ignored, as the XDG spec says. With neither it
+// nor an absolute home directory known, it fails, rather than putting the
+// indexes under the working directory, which may be the indexed folder.
+func dataHome() (string, error) {
+	if base := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(base) {
+		return base, nil
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share")
+	home, err := os.UserHomeDir()
+	if err != nil || !filepath.IsAbs(home) {
+		return "", errors.New("no folder for the indexes: set HOME (or XDG_DATA_HOME) to an absolute path, or pass -db")
+	}
+	return filepath.Join(home, ".local", "share"), nil
 }
 
 // indexDir returns $XDG_DATA_HOME/scree/indexes/<base>-<hash16> for a
 // resolved root. hash16 is the first 16 hex digits of sha256(root); base is
-// the folder's name made safe, so stale entries are recognisable.
-func indexDir(resolvedRoot string) string {
+// the folder's name made safe, so stale entries are recognisable. It fails
+// as dataHome does.
+func indexDir(resolvedRoot string) (string, error) {
+	data, err := dataHome()
+	if err != nil {
+		return "", err
+	}
 	sum := sha256.Sum256([]byte(resolvedRoot))
-	return filepath.Join(dataHome(), "scree", "indexes", safeBase(filepath.Base(resolvedRoot))+"-"+hex.EncodeToString(sum[:])[:16])
+	return filepath.Join(data, "scree", "indexes", safeBase(filepath.Base(resolvedRoot))+"-"+hex.EncodeToString(sum[:])[:16]), nil
 }
 
 // checkIndexDirs refuses an index directory, or the scree or indexes folder

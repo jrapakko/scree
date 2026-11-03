@@ -28,6 +28,26 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The MCPB bundle for Claude Desktop and its sha256 (sha256sum
+      # format), added to the draft. Publishing the draft runs registry.yml,
+      # which lists the bundle with its sha256.
+      - name: Build and upload the MCPB bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          one() {
+            jq -er --arg t "$1" --arg os "$2" --arg arch "$3" '
+              [.[] | select(.type == $t and .goos == $os and .goarch == $arch) | .path]
+              | if length == 1 then .[0] else error("want one \($t) for \($os)/\($arch), found \(length)") end
+            ' dist/artifacts.json
+          }
+          darwin=$(one Binary darwin all) # the universal binary: goreleaser types it Binary, goarch all
+          windows=$(one Binary windows amd64)
+          v=$(jq -er .version dist/metadata.json)
+          scripts/mcpb.sh "$v" "$darwin" "$windows" "dist/scree_${v}.mcpb"
+          (cd dist && sha256sum "scree_${v}.mcpb" > "scree_${v}.mcpb.sha256")
+          gh release upload "$GITHUB_REF_NAME" "dist/scree_${v}.mcpb" "dist/scree_${v}.mcpb.sha256" --clobber
 
   image:
     runs-on: ubuntu-latest

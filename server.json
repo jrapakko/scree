@@ -55,6 +55,14 @@
           "isSecret": true
         }
       ]
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/jrapakko/scree/releases/download/v0.3.6/scree_0.3.6.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      }
     }
   ]
 }

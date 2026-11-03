@@ -2,8 +2,8 @@ name: Registry
 
 # Publishes server.json to the MCP Registry when a release is published
 # (not when the draft is made: the image must be pushed by release.yml
-# first, and the registry checks it). Re-run a failed publish with
-# workflow_dispatch and the tag.
+# first, the MCPB bundle must be public, and the registry checks both).
+# Re-run a failed publish with workflow_dispatch and the tag.
 on:
   release:
     types: [published]
@@ -47,11 +47,22 @@ jobs:
           tar -xzf "$d/p.tgz" -C "$d" mcp-publisher
           install -m 755 "$d/mcp-publisher" /usr/local/bin/
           rm -rf "$d"
-      - name: Set the version in server.json
+      - name: Set the version and bundle in server.json
         run: |
-          jq --arg v "$VERSION" '
+          # The registry fetches the bundle too, so it must be public:
+          # release.yml adds it to the draft, and this runs on publish.
+          url="https://github.com/jrapakko/scree/releases/download/$TAG/scree_$VERSION.mcpb"
+          d=$(mktemp -d)
+          curl -fsSL -o "$d/scree.mcpb" "$url"
+          sha=$(sha256sum "$d/scree.mcpb" | cut -d' ' -f1)
+          rm -rf "$d"
+          jq --arg v "$VERSION" --arg url "$url" --arg sha "$sha" '
             .version = $v
-            | .packages |= map(if .registryType == "oci" then .identifier = (.identifier | sub(":[^:/]+$"; "")) + ":" + $v else . end)
+            | .packages |= map(
+                if .registryType == "oci" then .identifier = (.identifier | sub(":[^:/]+$"; "")) + ":" + $v
+                elif .registryType == "mcpb" then .identifier = $url | .fileSha256 = $sha
+                else . end)
+            | if ([.packages[] | select(.registryType == "mcpb")] | length) == 1 then . else error("want one mcpb package") end
           ' server.json > server.json.new
           mv server.json.new server.json
           { echo '```json'; cat server.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

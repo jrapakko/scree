@@ -107,26 +107,6 @@ func recordExec(t *testing.T) *execRec {
 	return r
 }
 
-// captureStderr returns what fn writes to stderr.
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	old := os.Stderr
-	os.Stderr = w
-	done := make(chan string)
-	go func() {
-		b, _ := io.ReadAll(r)
-		done <- string(b)
-	}()
-	fn()
-	os.Stderr = old
-	w.Close()
-	return <-done
-}
-
 // TestDirectCommandsReexecWithSettingsKey: with OPENROUTER_API_KEY unset
 // and a key in the settings file, search, reindex, doctor and watch
 // re-execute as scree run would, with an environment from the file alone
@@ -295,7 +275,8 @@ func TestSettingsKeyFileRefused(t *testing.T) {
 // TestServeIgnoresSettingsKey: serve keeps to its environment (under
 // Claude Code, scree mcp has applied the settings file already), so it
 // neither reads the key nor refuses a bad file, and without a key it says
-// to set the variable or start through scree mcp, never scree key.
+// to use the extension's settings, set the variable or start through
+// scree mcp, never scree key.
 func TestServeIgnoresSettingsKey(t *testing.T) {
 	serveEnv(t)
 	notes, db := searchFixture(t)
@@ -316,7 +297,7 @@ func TestServeIgnoresSettingsKey(t *testing.T) {
 		}
 		_, err = ix.Search(context.Background(), "nightly", 3, index.Semantic)
 		if err == nil || !errors.Is(err, index.ErrNoKey) ||
-			!strings.Contains(err.Error(), "no API key: set OPENROUTER_API_KEY, or start through scree mcp;") ||
+			!strings.Contains(err.Error(), "no API key: add an OpenRouter API key in the extension's settings, set OPENROUTER_API_KEY, or start through scree mcp;") ||
 			strings.Contains(err.Error(), "scree key") {
 			t.Errorf("mode %o: %v", mode, err)
 		}
@@ -696,5 +677,59 @@ func TestKeyRefusesSymlinkedFolders(t *testing.T) {
 				t.Errorf("wrote through the symlink: %v", entries)
 			}
 		})
+	}
+}
+
+// TestUnusableEnvKeyUsesSettingsKey: an OPENROUTER_API_KEY that envKey
+// reads as no key (blank, an unfilled placeholder, invalid) does not stop a
+// direct command from using the settings file's key; a usable one does.
+func TestUnusableEnvKeyUsesSettingsKey(t *testing.T) {
+	serveEnv(t)
+	keyHome(t, testSettings, 0o600)
+	for in, reexec := range map[string]bool{
+		" \n":                               true,
+		"${user_config.openrouter_api_key}": true,
+		"bad\x01key":                        true,
+		"\n" + testSecret + "\n":            false,
+	} {
+		t.Setenv("OPENROUTER_API_KEY", in)
+		r := recordExec(t)
+		var err error
+		msg := captureStderr(t, func() { err = useSettingsKey("search", []string{"q"}) })
+		if err != nil || r.called != reexec {
+			t.Errorf("%q: %v, exec %v, want %v", in, err, r.called, reexec)
+		}
+		said := strings.Contains(msg, "; using the key from ")
+		if said != (reexec && strings.TrimSpace(in) != "") {
+			t.Errorf("%q: stderr %q", in, msg)
+		}
+		if strings.Contains(msg, "bad") || strings.Contains(msg, "user_config") || strings.Contains(msg, testSecret) {
+			t.Errorf("%q: stderr shows the value: %q", in, msg)
+		}
+	}
+}
+
+// TestDoctorInvalidKey: a set but unusable OPENROUTER_API_KEY is reported
+// as such, not as "not set", and doctor never prints the value.
+func TestDoctorInvalidKey(t *testing.T) {
+	serveEnv(t)
+	notes, db := searchFixture(t)
+	for in, want := range map[string]string{
+		"bad\x01secretvalue":                "FAIL OPENROUTER_API_KEY is set but not a valid key: the key contains whitespace, control or invisible characters (run scree key, or set OPENROUTER_API_KEY)",
+		"${user_config.openrouter_api_key}": "FAIL OPENROUTER_API_KEY is set but is an unfilled placeholder (run scree key, or set OPENROUTER_API_KEY)",
+	} {
+		t.Setenv("OPENROUTER_API_KEY", in)
+		var out string
+		captureStderr(t, func() {
+			out = captureStdout(t, func() {
+				runDoctor(context.Background(), []string{"-offline", "-notes", notes, "-db", db})
+			})
+		})
+		if !strings.Contains(out, want) || strings.Contains(out, "not set") {
+			t.Errorf("%q: doctor:\n%s", in, out)
+		}
+		if strings.Contains(out, "secretvalue") || strings.Contains(out, "user_config") {
+			t.Errorf("%q: doctor shows the value:\n%s", in, out)
+		}
 	}
 }

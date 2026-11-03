@@ -152,11 +152,61 @@ func TestResolveFilesystemRoot(t *testing.T) {
 	}
 }
 
+// testIndexDir is indexDir, failing the test on an error.
+func testIndexDir(t *testing.T, root string) string {
+	t.Helper()
+	d, err := indexDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// TestDataHomeNeedsAbsolute: with no absolute XDG_DATA_HOME or home
+// directory, there is no data folder, and open refuses rather than putting
+// the index under the working directory.
+func TestDataHomeNeedsAbsolute(t *testing.T) {
+	home := tempDir(t)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
+	t.Setenv("XDG_DATA_HOME", "rel/data")
+	if d, err := dataHome(); err != nil || d != filepath.Join(home, ".local", "share") {
+		t.Errorf("relative XDG_DATA_HOME: %q, %v", d, err)
+	}
+	for _, h := range []string{"", "rel/home"} {
+		t.Setenv("HOME", h)
+		t.Setenv("USERPROFILE", h)
+		for _, x := range []string{"", "rel/data"} {
+			t.Setenv("XDG_DATA_HOME", x)
+			if d, err := dataHome(); err == nil {
+				t.Errorf("HOME=%q XDG_DATA_HOME=%q: %q", h, x, d)
+			}
+		}
+	}
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	t.Setenv("SCREE_DB", "")
+	notes := filepath.Join(home, "notes")
+	mkdir(t, notes)
+	t.Chdir(notes)
+	cfg := config{notes: notes}
+	if ix, err := open(&cfg, true); err == nil || !strings.Contains(err.Error(), "no folder for the indexes") {
+		if err == nil {
+			closeIndexer(ix)
+		}
+		t.Errorf("open with no data folder = %v", err)
+	}
+	if ents, _ := os.ReadDir(notes); len(ents) != 0 {
+		t.Errorf("wrote into the notes folder: %v", ents)
+	}
+}
+
 func TestIndexDirStable(t *testing.T) {
 	data := tempDir(t)
 	t.Setenv("XDG_DATA_HOME", data)
-	a, b := indexDir("/home/u/repo"), indexDir("/home/u/other/repo")
-	if a != indexDir("/home/u/repo") {
+	a, b := testIndexDir(t, "/home/u/repo"), testIndexDir(t, "/home/u/other/repo")
+	if a != testIndexDir(t, "/home/u/repo") {
 		t.Error("same root, different dirs")
 	}
 	if a == b {
@@ -181,7 +231,7 @@ func TestIndexDirStable(t *testing.T) {
 			t.Errorf("safeBase(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if base := filepath.Base(indexDir("/x/my notes")); !strings.HasPrefix(base, "my_notes-") {
+	if base := filepath.Base(testIndexDir(t, "/x/my notes")); !strings.HasPrefix(base, "my_notes-") {
 		t.Errorf("unsafe base not sanitized: %q", base)
 	}
 }
@@ -423,7 +473,7 @@ func TestIndexNeverThroughSymlink(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			data := serveEnv(t)
 			root, _ := filepath.EvalSymlinks(notes)
-			plant(data, indexDir(root))
+			plant(data, testIndexDir(t, root))
 			cfg := config{notes: notes}
 			if ix, err := open(&cfg, true); err == nil {
 				closeIndexer(ix)
@@ -437,7 +487,7 @@ func TestIndexNeverThroughSymlink(t *testing.T) {
 	t.Run("writer.lock", func(t *testing.T) {
 		serveEnv(t)
 		root, _ := filepath.EvalSymlinks(notes)
-		dir := indexDir(root)
+		dir := testIndexDir(t, root)
 		mkdir(t, dir)
 		victim := filepath.Join(target, "victim")
 		os.WriteFile(victim, []byte("keep"), 0o600)
@@ -452,4 +502,35 @@ func TestIndexNeverThroughSymlink(t *testing.T) {
 			t.Errorf("victim changed: %q", b)
 		}
 	})
+}
+
+// TestHomeOrAboveSameFile: another path to home or a folder above it (here
+// through a symlinked parent, standing in for a bind mount, a differently
+// cased path or a firmlink) is refused, since the files are compared, not
+// just the paths; folders inside home or beside it pass.
+func TestHomeOrAboveSameFile(t *testing.T) {
+	base := tempDir(t)
+	real := filepath.Join(base, "real")
+	home := filepath.Join(real, "home")
+	mkdir(t, filepath.Join(home, "notes"))
+	mkdir(t, filepath.Join(real, "other"))
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skip("no symlinks:", err)
+	}
+	for dir, want := range map[string]bool{
+		home:                                  true,
+		real:                                  true,
+		filepath.Join(alias, "home"):          true,
+		alias:                                 true,
+		filepath.Join(home, "notes"):          false,
+		filepath.Join(alias, "home", "notes"): false,
+		filepath.Join(alias, "other"):         false,
+		filepath.Join(real, "other"):          false,
+		filepath.Join(base, "missing"):        false,
+	} {
+		if got := homeOrAbove(dir, home); got != want {
+			t.Errorf("homeOrAbove(%s) = %v, want %v", dir, got, want)
+		}
+	}
 }

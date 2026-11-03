@@ -31,6 +31,12 @@ const BatchSize = 64
 // reached, or returned 429 or a 5xx status. Callers may try again later.
 var ErrUnavailable = errors.New("embedding API unavailable")
 
+// ErrKeyRejected means the API answered 401: the API key is wrong or
+// revoked. Trying again with the same key will not help. A 403 is not
+// this: OpenRouter sends it for an input its moderation flags, so it is an
+// error for that input only.
+var ErrKeyRejected = errors.New("API key rejected")
+
 // ErrNoZDREndpoint means the provider has no endpoint for the model that
 // meets the requested data policy, such as zero data retention.
 var ErrNoZDREndpoint = errors.New("no zero-data-retention endpoint for this model")
@@ -233,6 +239,9 @@ func (c *Client) statusErr(resp *http.Response, raw []byte) error {
 	}
 	if retryable(resp.StatusCode) {
 		return fmt.Errorf("embed: %w: %s: %s", ErrUnavailable, resp.Status, msg)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("embed: %w: %s: %s", ErrKeyRejected, resp.Status, msg)
 	}
 	return fmt.Errorf("embed: %s: %s", resp.Status, msg)
 }

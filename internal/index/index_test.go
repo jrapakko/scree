@@ -985,13 +985,13 @@ func TestSemanticOverKeywordOnlyIndex(t *testing.T) {
 	}
 }
 
-// failEmbedder fails every call with an error that is not ErrUnavailable,
-// such as a rejected key.
+// failEmbedder fails every call with an error that is neither
+// ErrUnavailable nor ErrKeyRejected.
 type failEmbedder struct{ fakeEmbedder }
 
 func (f *failEmbedder) Embed(context.Context, []string) ([][]float32, error) {
 	f.calls++
-	return nil, errors.New("embed: 401 Unauthorized")
+	return nil, errors.New("embed: 402 Payment Required")
 }
 
 // TestKeywordOnlyAPIErrors: once there is a key, a keyword-only file whose
@@ -1029,6 +1029,52 @@ func TestKeywordOnlyAPIErrors(t *testing.T) {
 	ix.Embedder = &keyEmbedder{key: true}
 	if st, err := ix.Sync(ctx); err != nil || st.Indexed != 2 || keywordOnly(t, ix) != 0 {
 		t.Fatalf("API back = %+v, %v", st, err)
+	}
+}
+
+// rejectEmbedder has a key that the API rejects.
+type rejectEmbedder struct{ fakeEmbedder }
+
+func (r *rejectEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	r.calls++
+	return nil, fmt.Errorf("embed: %w: 401 Unauthorized", embed.ErrKeyRejected)
+}
+
+// TestSyncKeyRejected: a key the API rejects is no outage and no per-file
+// failure: the files are stored for keyword search only, without pausing
+// and without asking the API again, and auto search runs keyword. A later
+// indexer with a working key (a new process) embeds them.
+func TestSyncKeyRejected(t *testing.T) {
+	ctx := context.Background()
+	ix, _ := setup(t)
+	re := &rejectEmbedder{}
+	ix.Embedder = re
+	write(t, ix.Root(), "a.md", "# Apples\napple\n")
+	write(t, ix.Root(), "b.md", "# Bananas\nbanana\n")
+	st, err := ix.Sync(ctx)
+	if err != nil || st != (SyncStats{Scanned: 2, Indexed: 2, KeywordOnly: 2, KeyRejected: true}) || re.calls != 1 {
+		t.Fatalf("sync = %+v, %v; calls %d", st, err, re.calls)
+	}
+	if !ix.KeyRejected() || !ix.PausedUntil().IsZero() || keywordOnly(t, ix) != 2 {
+		t.Fatalf("rejected %v, paused until %v, keyword-only %d", ix.KeyRejected(), ix.PausedUntil(), keywordOnly(t, ix))
+	}
+	if got := st.IndexedText(); got != "2 indexed (2 keyword only: API key rejected)" {
+		t.Errorf("IndexedText = %q", got)
+	}
+	if !strings.HasPrefix(ix.KeywordWhy(), "the embedding API rejected the API key") {
+		t.Errorf("KeywordWhy = %q", ix.KeywordWhy())
+	}
+	hits, used, err := ix.SearchResolved(ctx, "banana", 3, Auto)
+	if err != nil || used != Keyword || len(hits) != 1 || hits[0].Path != "b.md" {
+		t.Fatalf("auto ran %s: %+v, %v", used, hits, err)
+	}
+	if _, err := ix.Search(ctx, "banana", 3, Semantic); !errors.Is(err, embed.ErrKeyRejected) || re.calls != 1 {
+		t.Fatalf("semantic = %v; calls %d", err, re.calls)
+	}
+
+	fresh := &Indexer{Policy: ix.Policy, Store: ix.Store, Embedder: &keyEmbedder{key: true}}
+	if st, err := fresh.Sync(ctx); err != nil || st.Indexed != 2 || st.KeywordOnly != 0 || keywordOnly(t, fresh) != 0 {
+		t.Fatalf("sync with a working key = %+v, %v", st, err)
 	}
 }
 

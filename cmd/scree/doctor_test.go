@@ -30,6 +30,26 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-done
 }
 
+// captureStderr returns what fn writes to stderr.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	fn()
+	os.Stderr = old
+	w.Close()
+	return <-done
+}
+
 func TestDoctorListsReincluded(t *testing.T) {
 	home := tempDir(t)
 	t.Setenv("HOME", home)
@@ -188,5 +208,22 @@ func TestSizeLine(t *testing.T) {
 	}
 	if got := sizeLine(400, "other/model"); got != "size: 0.0 MB of markdown, about 100 tokens to embed in full" {
 		t.Errorf("sizeLine = %q", got)
+	}
+}
+
+// TestKeywordOnlyText: doctor's index note says why files lack vectors:
+// no key, a key the API rejected, or none now (indexed before the key).
+func TestKeywordOnlyText(t *testing.T) {
+	if got := keywordOnlyText(0, true, true); got != "" {
+		t.Errorf("none: %q", got)
+	}
+	if got := keywordOnlyText(2, true, true); !strings.Contains(got, "2 files keyword-only: the API rejected the key") {
+		t.Errorf("rejected: %q", got)
+	}
+	if got := keywordOnlyText(2, true, false); !strings.Contains(got, "indexed without an API key; run scree reindex") {
+		t.Errorf("key now: %q", got)
+	}
+	if got := keywordOnlyText(2, false, false); !strings.Contains(got, "no API key") {
+		t.Errorf("no key: %q", got)
 	}
 }

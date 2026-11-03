@@ -93,8 +93,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
-		used := ix.Resolve(ctx, mode, a.Query)
-		hits, err := ix.Search(ctx, a.Query, k, used)
+		hits, used, err := ix.SearchResolved(ctx, a.Query, k, mode)
 		if err != nil {
 			return errResult(err.Error()), nil, nil
 		}
@@ -103,7 +102,7 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 			note = w.Note(ctx)
 		}
 		if mode == index.Auto {
-			note = joinNotes(ModeNote(used, ix.KeyHint()), note)
+			note = joinNotes(ModeNote(used, ix.KeywordWhy()), note)
 		}
 		note = joinNotes(note, KeywordOnlyNote(ctx, ix, used, "reindex embeds them"))
 		return textResult(FormatHits(hits, note)), nil, nil
@@ -134,9 +133,21 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "reindex",
-		Description: "Re-index one file, or with no path, every file that changed since it was last indexed.",
+		Description: "Re-index one file, or with no path, every file that changed since it was last indexed. A folder too big to index on its own (search results then say so) is indexed by a reindex with no path, which lifts that limit; ask the user first.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, a reindexArgs) (*mcp.CallToolResult, any, error) {
+		if w != nil && w.Status().Phase == writer.Skipped {
+			if text, ok := reindexSkipped(ctx, w, a.Path); ok {
+				return textResult(text), nil, nil
+			}
+		}
 		if w != nil && !w.Holding() {
+			switch st := w.Status(); st.Phase {
+			case writer.Waiting:
+			case writer.Stopped:
+				return errResult(fmt.Sprintf("The index is not updating: %s", textsafe.Strip(st.Err.Error()))), nil, nil
+			default:
+				return textResult("The index writer is starting; new and changed files are picked up within a few seconds."), nil, nil
+			}
 			// Another process writes this index. A path still gets the
 			// policy's verdict, so an ignored file is refused as usual.
 			if a.Path != "" {
@@ -174,6 +185,23 @@ func New(ix *index.Indexer, w *writer.Writer, version string) *mcp.Server {
 	})
 
 	return s
+}
+
+// reindexSkipped answers a reindex call that found the first sync skipped
+// for size (phase Skipped). A reindex with no path is the explicit request
+// to index the folder anyway, done by the writer, which takes the lock
+// first; a path does not lift the cap and gets the writer's note. ok is
+// false when the phase moved on meanwhile (another call lifted the cap
+// first), and the caller then answers as for that phase, so the reply is
+// never empty.
+func reindexSkipped(ctx context.Context, w *writer.Writer, path string) (text string, ok bool) {
+	if path == "" && w.IndexAnyway() {
+		return "Indexing this folder now, despite its size; search results say how far it has got.", true
+	}
+	if note := w.Note(ctx); note != "" && w.Status().Phase == writer.Skipped {
+		return note, true
+	}
+	return "", false
 }
 
 // FormatHits renders search results as <hit> elements for a model or a
@@ -238,11 +266,12 @@ func FormatHits(hits []store.Hit, note string) string {
 
 // ModeNote is the line FormatHits output ends with when auto mode chose
 // the search, naming the mode it ran. Auto runs keyword only when there is
-// no API key (Indexer.Resolve), and the note says so and adds keyHint
-// (Indexer.KeyHint).
-func ModeNote(used index.Mode, keyHint string) string {
+// no API key or the API rejected it (Indexer.Resolve), and the note adds
+// why, Indexer.KeywordWhy: "no API key; <hint>" or that the key was
+// rejected.
+func ModeNote(used index.Mode, why string) string {
 	if used == index.Keyword {
-		return "[mode: auto → keyword: no API key; " + keyHint + "]"
+		return "[mode: auto → keyword: " + why + "]"
 	}
 	return "[mode: auto → " + string(used) + "]"
 }

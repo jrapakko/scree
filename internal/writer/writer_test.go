@@ -331,3 +331,31 @@ func TestSearchQueuesChangedForWriter(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestFirstSyncCapResumable: a Resumable writer that skipped the first
+// sync waits instead of returning, and IndexAnyway has it take the lock
+// and index everything, once.
+func TestFirstSyncCapResumable(t *testing.T) {
+	e := newEnv(t, "a.md", "b.md")
+	writeBig(e.root)
+	w, _, done := e.writerWith(t, constEmbedder{}, func(w *Writer) { w.FirstSyncMax = 1 << 20; w.Resumable = true })
+	waitPhase(t, w, Skipped, 5*time.Second)
+	if note := w.Note(context.Background()); !strings.Contains(note, "ask the user, then call reindex with no path to index it anyway]") {
+		t.Errorf("note = %q", note)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned after skipping: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if !w.IndexAnyway() {
+		t.Fatal("IndexAnyway = false while skipped")
+	}
+	if w.IndexAnyway() {
+		t.Error("IndexAnyway = true twice")
+	}
+	waitPhase(t, w, Watching, 10*time.Second)
+	if paths, _ := w.Indexer.Store.Paths(context.Background()); len(paths) != 5 {
+		t.Errorf("paths = %v", paths)
+	}
+}
