@@ -54,7 +54,7 @@ Usage:
   scree serve [-http addr [-allow-remote]]
                            run the MCP server (stdio unless -http is given;
                            -http is loopback only unless -allow-remote)
-  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] [-no-pager] "query"
+  scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json|grep] [-no-pager] "query"
                            auto (default) is semantic, plus keyword search
                            when the query holds an identifier such as FOO_BAR
                            or a name from the folder's code, and keyword
@@ -552,11 +552,11 @@ func runSearch(ctx context.Context, args []string) error {
 	fs := flags("search", &cfg)
 	k := fs.Int("k", 8, "number of results")
 	modeFlag := fs.String("mode", "auto", "auto (semantic, plus keyword for identifier-like queries or names from the folder's code), hybrid, semantic or keyword (no API call)")
-	format := fs.String("format", "", "text (the default on a terminal), xml (the default otherwise) or json")
+	format := fs.String("format", "", "text (the default on a terminal), xml (the default otherwise), json, or grep (path:line:text, for fzf or vim -q)")
 	noPager := fs.Bool("no-pager", false, "print the text view directly, without a pager")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] [-no-pager] "query"`)
+		return errors.New(`usage: scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json|grep] [-no-pager] "query"`)
 	}
 	if *k < 1 {
 		return fmt.Errorf("-k must be at least 1, not %d", *k)
@@ -571,8 +571,8 @@ func runSearch(ctx context.Context, args []string) error {
 			*format = "text"
 		}
 	}
-	if *format != "text" && *format != "xml" && *format != "json" {
-		return fmt.Errorf("format must be text, xml or json, not %q", *format)
+	if *format != "text" && *format != "xml" && *format != "json" && *format != "grep" {
+		return fmt.Errorf("format must be text, xml, json or grep, not %q", *format)
 	}
 	// Colours, like links, and the pager are for the terminal on stdout.
 	var pal palette
@@ -606,6 +606,9 @@ func runSearch(ctx context.Context, args []string) error {
 	}
 	if kw := mcpserver.KeywordOnlyNote(ctx, ix, used, "scree reindex embeds them"); kw != "" {
 		note = strings.TrimPrefix(note+"\n"+kw, "\n")
+	}
+	if *format == "grep" {
+		return writeGrep(ctx, os.Stdout, ix, fs.Arg(0), hits, note)
 	}
 	if *format == "text" {
 		out, done := io.Writer(os.Stdout), func(err error) error { return err }

@@ -493,3 +493,98 @@ func cutBounds(s string, at int) (start, end int) {
 	}
 	return len(string(r[:first])), len(string(r[:last]))
 }
+
+// writeGrep writes hits as path:line:text lines, the shape of grep -n, for
+// fzf, vim -q and the like: in rank order, each line of a hit's range that
+// holds a query word, or the range's first line when none does (a semantic
+// hit), each path:line once. Stale hits are left out. Text is made safe as
+// in the text view; the note goes to stderr.
+//
+// Note folders can be hostile, so the path field is kept unambiguous: a hit
+// whose path holds ':' (which would forge the line field) or anything safe
+// would change (which would list it under another file's name) is left out
+// and counted in the note, and a path starting with '-' or '+' gets "./" so
+// no consumer takes it for an option or a vim +command.
+func writeGrep(ctx context.Context, w io.Writer, ix *index.Indexer, query string, hits []store.Hit, note string) error {
+	skipped := 0
+	kept := hits[:0:0]
+	for _, h := range hits {
+		if strings.Contains(h.Path, ":") || safe(h.Path) != h.Path {
+			skipped++
+			continue
+		}
+		kept = append(kept, h)
+	}
+	hits = kept
+	if skipped > 0 {
+		note = strings.TrimSpace(note + "\n" + fmt.Sprintf("[%d hits left out: a ':' or control character in the path; see -format json]", skipped))
+	}
+	var words []string
+	for _, word := range index.KeywordWords(query) {
+		if !slices.Contains(words, word) {
+			words = append(words, word)
+		}
+	}
+	type row struct {
+		hit, line int
+		text      string
+	}
+	var rows []row
+	var texts []string
+	for i, l := range ix.Lines(hits) {
+		chunk := strings.Split(hits[i].Text, "\n")
+		for j, s := range l {
+			piece := ""
+			if j < len(chunk) {
+				piece = chunk[j]
+			}
+			t := lineText(s, piece)
+			rows = append(rows, row{i, hits[i].Line + j, t})
+			texts = append(texts, t)
+		}
+	}
+	matched := make([]bool, len(texts))
+	if len(words) > 0 && len(texts) > 0 {
+		matches, err := matchTexts(ctx, words, texts)
+		if err != nil {
+			note = strings.TrimSpace("word matching failed: " + err.Error() + "\n" + note)
+		}
+		for _, ms := range matches {
+			for _, m := range ms {
+				matched[m.Row] = true
+			}
+		}
+	}
+	var b strings.Builder
+	seen := map[string]bool{}
+	emit := func(r row) {
+		path := hits[r.hit].Path
+		if strings.HasPrefix(path, "-") || strings.HasPrefix(path, "+") {
+			path = "./" + path
+		}
+		key := path + ":" + strconv.Itoa(r.line)
+		if !seen[key] {
+			seen[key] = true
+			b.WriteString(key + ":" + r.text + "\n")
+		}
+	}
+	for lo := 0; lo < len(rows); {
+		hi := lo
+		hasMatch := false
+		for hi < len(rows) && rows[hi].hit == rows[lo].hit {
+			hasMatch = hasMatch || matched[hi]
+			hi++
+		}
+		for k := lo; k < hi; k++ {
+			if matched[k] || (!hasMatch && k == lo) {
+				emit(rows[k])
+			}
+		}
+		lo = hi
+	}
+	if note != "" {
+		fmt.Fprintln(os.Stderr, safe(note))
+	}
+	_, err := io.WriteString(w, b.String())
+	return err
+}

@@ -197,7 +197,7 @@ func TestCLISearchText(t *testing.T) {
 		t.Errorf("terminal default: %q", got)
 	}
 	if err := runSearch(context.Background(), []string{"-notes", notes, "-db", db, "-format", "yaml", "x"}); err == nil ||
-		!strings.Contains(err.Error(), "format must be text, xml or json") {
+		!strings.Contains(err.Error(), "format must be text, xml, json or grep") {
 		t.Errorf("bad format: %v", err)
 	}
 
@@ -587,5 +587,66 @@ func TestParseColors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "\x1b") {
 			t.Errorf("%q: %v, want %q", s, err, want)
 		}
+	}
+}
+
+// TestCLISearchGrep: -format grep prints path:line:text for each line of a
+// hit that holds a query word, each once, or the first line of a hit none
+// of whose lines does; the note goes to stderr, not stdout.
+func TestCLISearchGrep(t *testing.T) {
+	serveEnv(t)
+	notes, db := searchFixture(t)
+	addNote(t, notes, db, "b.md", "B", "# B\nnothing\nops again\x1b[31m\n")
+	kw := []string{"-notes", notes, "-db", db, "-mode", "keyword", "-format", "grep"}
+	got := searchOut(t, false, append(kw, "ops purge_old_records")...)
+	for _, want := range []string{
+		"ops.md:1:# Ops\n",
+		"ops.md:3:run PURGE_OLD_RECORDS nightly via the PageFetcher\n",
+		"b.md:3:ops again[31m\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+	if strings.Contains(got, ":2:") || strings.Contains(got, "\x1b") || strings.Count(got, "ops.md:1:") != 1 {
+		t.Errorf("unwanted lines or escapes: %q", got)
+	}
+	if got := searchOut(t, false, append(kw, "zebra")...); got != "" {
+		t.Errorf("no hits: %q", got)
+	}
+
+	// Hostile names: ':' would forge the line field and a changed path
+	// would name another file, so both are left out; '-' and '+' get "./".
+	addNote(t, notes, db, "x:1:y.md", "X", "zebrafoo colon\n")
+	addNote(t, notes, db, "x\u200b.md", "X", "zebrafoo zw\n")
+	addNote(t, notes, db, "-e1e x.md", "X", "zebrafoo dash\n")
+	addNote(t, notes, db, "+!x.md", "X", "zebrafoo plus\n")
+	var stderr string
+	stdout := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			if err := runSearch(context.Background(), append(kw, "zebrafoo")); err != nil {
+				t.Error(err)
+			}
+		})
+	})
+	if strings.Contains(stdout, "colon") || strings.Contains(stdout, "zw") ||
+		!strings.Contains(stdout, "./-e1e x.md:1:zebrafoo dash\n") || !strings.Contains(stdout, "./+!x.md:1:zebrafoo plus\n") {
+		t.Errorf("hostile names: %q", stdout)
+	}
+	if !strings.Contains(stderr, "[2 hits left out") {
+		t.Errorf("stderr: %q", stderr)
+	}
+
+	// A semantic hit with no query word in it: its first line.
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"index":0,"embedding":[1,0]}]}`)
+	}))
+	defer api.Close()
+	t.Setenv("SCREE_EMBED_URL", api.URL)
+	t.Setenv("OPENROUTER_API_KEY", "test-key")
+	t.Setenv("SCREE_ZDR", "0")
+	got = searchOut(t, false, "-notes", notes, "-db", db, "-k", "1", "-format", "grep", "zebra crossing")
+	if got != "ops.md:1:# Ops\n" {
+		t.Errorf("semantic: %q", got)
 	}
 }
