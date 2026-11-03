@@ -9,7 +9,7 @@ scree run <command> [args]
 scree key [-offline] [-replace] [-check]
 scree watch
 scree serve [-http addr [-allow-remote]]
-scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json] [-no-pager] "query"
+scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json|grep] [-no-pager] "query"
 scree reindex [-all] [path]
 scree doctor [-v] [-offline]
 scree indexes [-prune]
@@ -100,7 +100,7 @@ Prints the top hits, or `No matching documents.`. Takes exactly one query argume
 | --- | --- | --- |
 | `-k <n>` | `8` | Number of results, at least 1. Not capped on the CLI; the MCP tool caps at 50. |
 | `-mode <m>` | `auto` | `auto` (semantic, plus keyword search when the query holds an identifier such as `FOO_BAR` or a name from the folder's code; keyword alone when there is no API key), `hybrid`, `semantic` or `keyword`; see [search modes](using-with-claude-code.md#search-modes). `keyword` makes no API call. |
-| `-format <f>` | `text` on a terminal, else `xml` | `text` for the text view, `xml` for `<hit>` elements, or `json` for one object per line |
+| `-format <f>` | `text` on a terminal, else `xml` | `text` for the text view, `xml` for `<hit>` elements, `json` for one object per line, or `grep` for `path:line:text` lines |
 | `-no-pager` | `false` | Print the text view directly instead of through a pager |
 
 ```sh
@@ -108,9 +108,21 @@ scree search "how do I rotate the backup keys"
 scree search -mode keyword PURGE_OLD_RECORDS     # exact words, no API call
 scree search -no-pager "ci seed"                  # text view, without the pager
 scree search -format json "release checklist"
+scree search -format grep "ci seed"              # path:line:text, for fzf or vim -q
 ```
 
 `-format json` is the stable format for scripts and evaluations. Each line is `{"n","mode","path","start","end","heading","score","match","stale","also","also_more"}`: `mode` is the mode that ran (never `auto`), `start`, `end` and `score` are `null` when absent, `also` is a list of `{"path","start","end"}` (with `"stale":true` on a copy whose text is gone), and `also_more` appears only when more copies exist. The chunk text is left out.
+
+`-format grep` prints `path:line:text` lines like `grep -n`: each line of a hit that holds a query word, or a semantic hit's first line, in rank order, each once, with control characters dropped. The mode note goes to stderr. Pick a hit with [fzf](https://github.com/junegunn/fzf) and open it in vim, or load all of them into vim's quickfix list:
+
+```sh
+sg() { scree search -format grep "$*" | fzf --delimiter : \
+  --preview 'n={2}; case $n in ""|*[!0-9]*) exit;; esac; sed -n "$(( n>5 ? n-5 : 1 )),+30p" -- {1}' \
+  --bind 'enter:become(n={2}; case $n in ""|*[!0-9]*) exit 1;; esac; vim "+$n" -- {1})'; }
+vim --cmd 'set efm=%f:%l:%m' -q <(scree search -format grep "ci seed")
+```
+
+Paths are relative to the folder, so run these from its top. A folder you didn't write can choose its file names and text, so treat the fields as untrusted: check the line is a number and put `--` before the path, as above, rather than pasting `{1}` or `{2}` into shell arithmetic or a command line, and give `vim -q` the `%f:%l:%m` error format, since its default one also picks up `"file" line N:` inside note text. scree leaves out hits whose path holds `:` or a control character (with a count on stderr) and starts a path beginning with `-` or `+` with `./`.
 
 An empty index returns no hits without calling the API. Without an API key, `auto` runs `keyword` and ends with `[mode: auto → keyword: no API key; run scree key, or set OPENROUTER_API_KEY]`, and `-mode semantic` or `hybrid` is an error.
 
