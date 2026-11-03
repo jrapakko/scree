@@ -1,0 +1,60 @@
+name: Registry
+
+# Publishes server.json to the MCP Registry when a release is published
+# (not when the draft is made: the image must be pushed by release.yml
+# first, and the registry checks it). Re-run a failed publish with
+# workflow_dispatch and the tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, e.g. v0.3.6
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # mcp-publisher login github-oidc
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PUBLISHER_VERSION: v1.8.7
+      PUBLISHER_SHA256: 00b21004149a4ce66f0782508ae4a2bce67d1bea395a8da0bd8028159fb59579
+    steps:
+      - name: Check the tag
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "not a release tag: $TAG" >&2
+            exit 1
+          fi
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - name: Install mcp-publisher
+        run: |
+          d=$(mktemp -d)
+          curl -fsSL -o "$d/p.tgz" "https://github.com/modelcontextprotocol/registry/releases/download/$PUBLISHER_VERSION/mcp-publisher_linux_amd64.tar.gz"
+          echo "$PUBLISHER_SHA256  $d/p.tgz" | sha256sum -c -
+          tar -xzf "$d/p.tgz" -C "$d" mcp-publisher
+          install -m 755 "$d/mcp-publisher" /usr/local/bin/
+          rm -rf "$d"
+      - name: Set the version in server.json
+        run: |
+          jq --arg v "$VERSION" '
+            .version = $v
+            | .packages |= map(if .registryType == "oci" then .identifier = (.identifier | sub(":[^:/]+$"; "")) + ":" + $v else . end)
+          ' server.json > server.json.new
+          mv server.json.new server.json
+          { echo '```json'; cat server.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - run: mcp-publisher validate
+      - run: mcp-publisher login github-oidc
+      - run: mcp-publisher publish
