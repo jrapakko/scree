@@ -102,12 +102,12 @@ scree is listed in the [MCP Registry](https://registry.modelcontextprotocol.io/)
 ```
 docker run -i --rm -e OPENROUTER_API_KEY \
   -v <folder>:/notes:ro -v scree-data:/data \
-  ghcr.io/jrapakko/scree:0.3.5 serve -notes /notes
+  ghcr.io/jrapakko/scree:0.4.0 serve -notes /notes
 ```
 
 That is one notes folder per registration, over stdio, with the key held by the client rather than your settings file, so `SCREE_MODEL` and the other settings in the file don't apply. On SELinux hosts the mount needs `:z` as well, with the relabelling [above](#selinux-z-is-required-and-it-relabels).
 
-For Claude Code, use `scree mcp` from a repo's `.mcp.json` (see [Getting started](getting-started.md#turn-scree-on-for-the-repo)), or `scree mcp -docker` above: those index the session's repo, enforce the opt-in, and take the key from your settings file. One-click bundles for Claude Desktop are [planned](roadmap.md#planned).
+For Claude Code, use `scree mcp` from a repo's `.mcp.json` (see [Getting started](getting-started.md#turn-scree-on-for-the-repo)), or `scree mcp -docker` above: those index the session's repo, enforce the opt-in, and take the key from your settings file. For Claude Desktop on macOS and Windows, the registry entry also lists a one-click bundle; see [Claude Desktop](claude-desktop.md).
 
 ## HTTP inside a container
 

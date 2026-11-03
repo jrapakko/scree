@@ -45,6 +45,9 @@ The opt-in check reads only a plain, small, valid `.mcp.json` at the repo root.
 **`<dir> is your home directory, a folder above it, or a filesystem root; pass -notes <dir> to index it anyway`**
 The folder was derived from the current directory and landed on `~` or above, often because of a dotfiles repo with its `.git` at `~`. Run from inside a real repo, or pass `-notes` on the command line. Under Claude Code the message ends `scree does not index it from Claude Code` instead: start the session in a repo.
 
+**`serve: <dir> is your home folder, a folder above it, or a filesystem or drive root; pick a notes folder or a repo instead, not your home folder (from the command line, -allow-home indexes it anyway)`**
+`serve` refuses such a folder even when it is given with `-notes`, as [Claude Desktop](claude-desktop.md) does with the folder you picked. In Claude Desktop, change the notes folder in the extension's settings to a notes folder or a repo. From a terminal, `serve -allow-home` indexes it anyway. Another path to your home folder, such as a bind mount or a different letter case on macOS, is refused the same way.
+
 **`serve: -notes, -db and SCREE_DB are for the command line; under Claude Code (CLAUDE_PROJECT_DIR is set) scree indexes the repo it runs in`**
 Something passed `-notes` or `-db` to `serve`, or set `SCREE_DB`, inside a Claude Code session. Remove it; see [why](getting-started.md#why--notes-isnt-allowed-under-claude-code). If you see this from a terminal, unset `CLAUDE_PROJECT_DIR`.
 
@@ -56,6 +59,9 @@ A `.git` above the folder belongs to another user or is a symlink, so its ignore
 An index folder, or the `scree` or `indexes` folder above it, is a symlink. Replace it with a real folder.
 
 ## The index
+
+**`no folder for the indexes: set HOME (or XDG_DATA_HOME) to an absolute path, or pass -db`**
+A relative `XDG_DATA_HOME` is ignored, and there is no absolute home directory to fall back on, so scree won't place the index relative to the current directory. Set either to an absolute path, or name the index file with `-db`.
 
 **`index root mismatch: index <file> was built for <dir>, not <dir>; pass a different -db or delete it`**
 `-db` or `SCREE_DB` points at an index built for another folder. Use the default location (no `-db`), another file, or delete that index.
@@ -100,14 +106,20 @@ This session's writer stopped with the error shown; search still works on what i
 **`[not indexed: this folder has X MB of markdown, over SCREE_FIRST_SYNC_MB=M; run "scree reindex" in it to index it anyway]`**
 Check `doctor -v`, exclude build output or vendored docs with `.screeignore`, then `scree run reindex` to index it on purpose, or raise `SCREE_FIRST_SYNC_MB`.
 
+**`[not indexed: … over SCREE_FIRST_SYNC_MB=M; ask the user, then call reindex with no path to index it anyway]`**
+The same cap, under `serve` without the CLI's wording, as in the [Claude Desktop bundle](claude-desktop.md). Claude should ask you first; once you agree, it calls the `reindex` tool with no path, which lifts the cap for that server process and indexes the folder. A `reindex` with a path doesn't lift it.
+
 **`bad line in .screeignore: …; nothing is indexed until it is fixed (scree doctor lists the lines)`**
 Fix the lines `doctor` names by number. Indexing resumes once the file parses.
 
-**`mode must be auto, hybrid, semantic or keyword, not "…"`**, **`format must be text, xml or json, not "…"`**, **`-k must be at least 1, not N`**
+**`mode must be auto, hybrid, semantic or keyword, not "…"`**, **`format must be text, xml, json or grep, not "…"`**, **`-k must be at least 1, not N`**
 A typo in `-mode`, `mode`, `-format` or `-k`.
 
 **`[mode: auto → keyword: no API key; …]`**
-There is no API key, so `auto` searched keywords only. Run `scree key` to save one in the settings file. Under Claude Code the note ends `start through scree mcp`: the server got no key from `scree mcp`, so the settings file has none.
+There is no API key, so `auto` searched keywords only. Run `scree key` to save one in the settings file; under Claude Code, `scree mcp` passes the file's key, so the note there means the file has none. From `serve` elsewhere, as from Claude Desktop, the note says `add an OpenRouter API key in the extension's settings, set OPENROUTER_API_KEY, or start through scree mcp`: add the key in the extension's settings.
+
+**`[mode: auto → keyword: the embedding API rejected the API key; replace it: …]`**, **`API key rejected by the embedding API: replace it: …; mode "keyword" works without one`**
+The API answered 401, so this process indexes and searches by keyword only from then on, without asking the API again, and `reindex` counts those files as `keyword only: API key rejected`. Replace the key (`scree key`, or the extension's settings in Claude Desktop) and restart; the next process with a working key embeds those files.
 
 **`no API key: …; mode "keyword" works without one`**
 `-mode semantic` or `hybrid` needs a key. Run `scree key`, or use `-mode keyword`.
@@ -131,8 +143,11 @@ There is no key in the environment or the settings file. Run `scree key`. If the
 **`embed: model <model> has no endpoint that meets zero data retention; choose another model or set SCREE_ZDR=0 (API: …)`**
 OpenRouter has no zero-retention endpoint for that model. Pick another `SCREE_MODEL`, or accept retention with `SCREE_ZDR=0`. With ZDR off, the same error says the model has no endpoint that `is allowed by the account's data policy`: check your OpenRouter privacy settings.
 
-**`embed: 401 Unauthorized: …`**
-The key is wrong or revoked. Create a new one and update the settings file.
+**`embed: API key rejected: 401 Unauthorized: …`**, **`FAIL embeddings API: embed: API key rejected: …`** (doctor)
+The key is wrong or revoked. Create a new one and update the settings file. Until then, files are indexed and searched by keyword only (see [Search notes](#search-notes)). A 403 is different: OpenRouter sends it for an input its moderation flags, and it fails only that file.
+
+**`OPENROUTER_API_KEY is set but not a valid key: …; running without an API key`**, **`OPENROUTER_API_KEY is set but is an unfilled placeholder; …`**
+The variable holds something `scree key` would refuse (inner whitespace, control characters, quotes) or a `${...}` placeholder a client didn't fill in, so it counts as no key. The value is never shown. Spaces and newlines around a key are trimmed, so they aren't the cause. Fix or unset the variable. A command run directly then uses the settings file's key, if it holds one, after `scree: OPENROUTER_API_KEY is …; using the key from <file>`. `doctor` reports the same problem on its key line.
 
 **`embed: 402 Payment Required: …`**
 The OpenRouter account is out of credit. Add credit.

@@ -8,7 +8,7 @@ scree mcp [-docker]
 scree run <command> [args]
 scree key [-offline] [-replace] [-check]
 scree watch
-scree serve [-http addr [-allow-remote]]
+scree serve [-http addr [-allow-remote]] [-allow-home]
 scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json|grep] [-no-pager] "query"
 scree reindex [-all] [path]
 scree doctor [-v] [-offline]
@@ -18,6 +18,8 @@ scree help
 ```
 
 From a terminal, `scree search`, `reindex`, `doctor` and `watch` use the API key in the settings file when `OPENROUTER_API_KEY` is unset, by re-running themselves as `scree run` would (see [Configuration](configuration.md#direct-commands-and-the-settings-files-key)). `scree run <command>`, for example `scree run search "…"`, loads the file's settings for any command. `scree mcp` is what a repo's `.mcp.json` runs.
+
+Scree trims spaces and newlines around `OPENROUTER_API_KEY`. A value that is an unfilled `${...}` placeholder, or that `scree key` would refuse (inner whitespace, control characters, quotes), counts as no key, with one log line that never shows the value; a command run directly then uses the settings file's key, if it holds one.
 
 Flags use Go's `flag` package: `-flag` and `--flag` are the same, booleans take `-flag=false`, and **flags must come before positional arguments**. `scree search -k 3 "query"` works; `scree search "query" -k 3` is a usage error.
 
@@ -32,6 +34,8 @@ Flags use Go's `flag` package: `-flag` and `--flag` are the same, booleans take 
 
 A folder found automatically (not given with `-notes`) is refused if it is your home directory, a folder above it, or a filesystem root. Home comes from the password database; `$HOME` is used only if that lookup fails. The git root is found only through a `.git` you own that is not a symlink, and the search stops at a sticky folder such as `/tmp` (see [Security](security.md)). `doctor` prints which rule chose the folder.
 
+`serve` refuses such a folder even as `-notes` (a client such as [Claude Desktop](claude-desktop.md) passes the folder a user picked) unless `-allow-home` is given. The check compares the folders themselves, not just their paths, so another path to your home folder (a bind mount, different letter case on macOS, `/System/Volumes/Data/Users/…`) is refused too. It only compares the chosen folder with your home folder and the folders above it, so a folder that holds a mount of your home somewhere inside it (as some containers and devcontainers set up) is not caught.
+
 Under Claude Code, `serve` also refuses `-notes`, `-db` and `SCREE_DB`, and refuses a folder whose root `.mcp.json` names no `scree mcp` server. Without `CLAUDE_PROJECT_DIR` (a terminal, a container, another MCP client), `-notes` and `-db` work as for any command and the opt-in check does not apply.
 
 ## Flags for every command but `indexes` and `key`
@@ -39,7 +43,7 @@ Under Claude Code, `serve` also refuses `-notes`, `-db` and `SCREE_DB`, and refu
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-notes <dir>` | see above | Folder to index |
-| `-db <file>` | `$SCREE_DB`, else `$XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db` | Index file. The index records its folder and refuses another one. |
+| `-db <file>` | `$SCREE_DB`, else `$XDG_DATA_HOME/scree/indexes/<folder>-<hash>/index.db` | Index file. The index records its folder and refuses another one. `$XDG_DATA_HOME` is used only when absolute, else `~/.local/share`; with neither it nor an absolute home directory, scree refuses to open an index unless `-db` names one. |
 | `-gitignore` | `true` | Honor `.gitignore`, `.git/info/exclude` and your global excludes file. `-gitignore=false` turns that layer off. |
 
 ## Commands
@@ -89,6 +93,7 @@ The MCP server. Claude Code starts it through `scree mcp`; you rarely run it by 
 | --- | --- | --- |
 | `-http <addr>` | none (stdio) | Serve streamable HTTP on `addr`, for example `127.0.0.1:7077` |
 | `-allow-remote` | `false` | Allow a non-loopback `-http` address. Requires `SCREE_HTTP_TOKEN`. |
+| `-allow-home` | `false` | Allow `-notes` to be your home folder, a folder above it, or a filesystem root (see [Which folder](#which-folder)). |
 
 The writer runs in the background, so the MCP handshake and searches never wait for the lock or the first sync. HTTP rules are on the [Security](security.md#http-mode) page.
 
@@ -164,7 +169,7 @@ A word matches whole tokens, as keyword search does, including inside a path wri
 
 ### `scree reindex [-all] [path]`
 
-Without a path, syncs the whole folder: indexes new and changed files by content hash and removes rows for deleted or newly ignored ones. Prints `N files: N indexed, N removed, N failed, N deferred`. Without an API key, files are indexed for keyword search only, with no API call, and the count reads `N indexed (M keyword only: no API key)`; the first sync with a key embeds just those files.
+Without a path, syncs the whole folder: indexes new and changed files by content hash and removes rows for deleted or newly ignored ones. Prints `N files: N indexed, N removed, N failed, N deferred`. Without an API key, files are indexed for keyword search only, with no API call, and the count reads `N indexed (M keyword only: no API key)`; the first sync with a key embeds just those files. A key the API rejects (401) is treated the same way for the rest of the run, counted as `keyword only: API key rejected`.
 
 With a path, relative to the folder or absolute inside it, re-indexes that one file and prints `re-indexed "<path>"` or `"<path>" is already up to date`. An ignored path is an error.
 
@@ -177,7 +182,7 @@ If another process holds the writer lock:
 - plain `reindex` and `reindex <path>` print `pid N keeps this index current; nothing to do` and exit 0 (an ignored path is still refused first);
 - `reindex -all` fails: `index is in use by pid N (a Claude Code session or scree watch); close it, then run reindex -all`.
 
-The CLI is never subject to the first-sync cap: it is how you index a large folder on purpose.
+The CLI is never subject to the first-sync cap: it is how you index a large folder on purpose. In `serve`, the MCP `reindex` tool with no path lifts the cap for that process; see [`reindex`](using-with-claude-code.md#reindex).
 
 ### `scree doctor [-v] [-offline]`
 
@@ -191,9 +196,9 @@ Checks the setup and prints one line per check, marked `ok`, `warn` or `FAIL`:
 - the [code vocabulary](using-with-claude-code.md#the-code-vocabulary): how many names were read from how many manifests and source files, and how many of them the notes also contain;
 - whether a process holds the writer lock, and its pid;
 - the configured model, and whether the index was built with another;
-- whether `OPENROUTER_API_KEY` is set, and `(from <file>)` when it came from the settings file; without a key it reports `FAIL` and says search runs keyword mode only;
+- whether `OPENROUTER_API_KEY` is set, and `(from <file>)` when it came from the settings file; without a key it reports `FAIL` and says search runs keyword mode only. A key that is set but unusable is reported as such, not as not set: `OPENROUTER_API_KEY is set but is an unfilled placeholder` or `OPENROUTER_API_KEY is set but not a valid key: …`, never showing the value;
 - whether zero data retention is requested;
-- a test embedding call, unless `-offline`.
+- a test embedding call, unless `-offline`. If the API rejects the key (401), the line reads `embeddings API: embed: API key rejected: …; until the key is replaced, files are indexed and searched by keyword only`.
 
 `doctor` never creates or writes the index.
 

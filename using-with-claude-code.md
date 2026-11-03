@@ -48,7 +48,9 @@ The shell expands `$HOME` when you run this, so the stored command is your absol
 - **`semantic`**: vectors only.
 - **`keyword`**: FTS5 only. It makes no API call, so it works without a key or while the API is down. A failed embedding call in the other modes says that `mode="keyword"` still works.
 
-**Without an API key**, `auto` runs `keyword` and its output ends with `[mode: auto → keyword: no API key; set OPENROUTER_API_KEY, or start through scree mcp]`, while `semantic` and `hybrid` return an error saying `keyword` works without one. Under Claude Code, `scree mcp` passes the key from your settings file, so this means the file has none; run `scree key`. An API error or outage with a key is not treated as no key.
+**Without an API key**, `auto` runs `keyword` and its output ends with `[mode: auto → keyword: no API key; run scree key, or set OPENROUTER_API_KEY]`, while `semantic` and `hybrid` return an error saying `keyword` works without one. Under Claude Code, `scree mcp` passes the key from your settings file, so this means the file has none; run `scree key`. From `serve` elsewhere, as from [Claude Desktop](claude-desktop.md), the hint is `add an OpenRouter API key in the extension's settings, set OPENROUTER_API_KEY, or start through scree mcp`.
+
+**A rejected key** (the API answers 401) is treated the same way for the rest of that process: files are indexed for keyword search only, `auto` runs `keyword` and ends with `[mode: auto → keyword: the embedding API rejected the API key; replace it: <hint>]`, and `semantic` or `hybrid` is an error saying the key was rejected. The next process with a working key embeds those files. Any other API error or outage with a key is not treated as no key; a 403, which OpenRouter sends for an input its moderation flags, fails only that file.
 
 `auto` is the default because, in retrieval measurements, always-on `hybrid` helped identifier queries but cost plain-language questions; `auto` keeps the gain on identifiers without the loss.
 
@@ -104,7 +106,7 @@ When the index is not complete or not updating, the response ends with one line 
 | `[index incomplete: first sync in progress, N files indexed so far]` | This session is building a new index. |
 | `[index incomplete: another scree process (pid N) is building it]` | Another session or `scree watch` holds the writer lock and hasn't finished the first sync. |
 | `[index not updating: …]` | This session's writer stopped with the error shown. Search still works on what is indexed. |
-| `[not indexed: this folder has X MB of markdown, over SCREE_FIRST_SYNC_MB=M; run "scree reindex" in it to index it anyway]` | The first-sync cap applied. |
+| `[not indexed: this folder has X MB of markdown, over SCREE_FIRST_SYNC_MB=M; ask the user, then call reindex with no path to index it anyway]` | The first-sync cap applied. See [`reindex`](#reindex). |
 | `[N files indexed for keyword search only; reindex embeds them]` | Those files were indexed without an API key, so `semantic` and the vector side of `hybrid` miss them. The next sync with a key embeds them. |
 
 Results returned with an "incomplete" note are real, but may miss files not yet indexed.
@@ -131,7 +133,9 @@ Results returned with an "incomplete" note are real, but may miss files not yet 
 
 ## `reindex`
 
-The writer already watches the folder, so Claude rarely needs this. Replies:
+The writer already watches the folder, so Claude rarely needs this. The one exception is the first-sync cap: a folder with more than `SCREE_FIRST_SYNC_MB` of markdown isn't indexed on its own, and `reindex` with no path lifts the cap for that server process, takes the writer lock and syncs as usual. A `reindex` with a path doesn't lift it and returns the note. The note, the log and the tool's description tell Claude to ask the user first, rather than naming a CLI command. From a terminal, `scree run reindex` does the same.
+
+Replies:
 
 | Situation | Reply |
 | --- | --- |

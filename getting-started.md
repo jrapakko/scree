@@ -29,10 +29,11 @@ The release workflow (`.github/workflows/release.yml`) runs on a `v*` tag and pu
 
 - A **draft** GitHub release built by GoReleaser, with archives for Linux, macOS and Windows on amd64 and arm64, named `scree_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), plus `checksums.txt`. Each archive holds the binary, `LICENSE`, `README.md`, `docs/SPEC.md`, `contrib/scree-watch.service` and `THIRD_PARTY_LICENSES/`. The workflow runs `go test` before building.
 - A multi-arch (linux/amd64, linux/arm64) image at `ghcr.io/jrapakko/scree`, tagged `<version>` and `<major>.<minor>`. See [Docker](docker.md).
+- A one-click bundle for Claude Desktop on macOS and Windows, `scree_<version>.mcpb`, with `scree_<version>.mcpb.sha256`. It is untested in any client so far; see [Claude Desktop](claude-desktop.md).
 
-The release is created as a draft and published by hand, so a tag alone does not make the GitHub release public; the image is pushed when the tag is. Releases are listed on the [GitHub releases page](https://github.com/jrapakko/scree/releases); the latest is `v0.3.5`.
+The release is created as a draft and published by hand, so a tag alone does not make the GitHub release public; the image is pushed when the tag is. Releases are listed on the [GitHub releases page](https://github.com/jrapakko/scree/releases); the latest is `v0.4.0`. Publishing a release also publishes its listing to the MCP Registry.
 
-scree is also listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.jrapakko/scree`, pointing at the image. That entry runs `scree serve` in a container for one notes folder, for MCP clients that install from the registry; for Claude Code, use `scree mcp` as below. See [Docker](docker.md#the-mcp-registry-listing).
+scree is also listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.jrapakko/scree`, pointing at the image. That entry runs `scree serve` in a container for one notes folder, for MCP clients that install from the registry, and also lists the Claude Desktop bundle; for Claude Code, use `scree mcp` as below. See [Docker](docker.md#the-mcp-registry-listing).
 
 ## The settings file
 

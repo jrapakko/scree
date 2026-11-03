@@ -80,6 +80,8 @@ Only lowercased names are kept, in the local index. Code is never chunked, embed
 
 A folder found automatically (from the working directory, lifted to its git root) is refused if it is your home directory, a folder above it, or a filesystem root. A dotfiles repo at `~` would otherwise make every non-repo folder under it lift to `~` and upload your whole home directory. Home comes from the password database, so a `HOME` set by a repo can't move it; `$HOME` is used only if that lookup fails. `scree mcp -docker` applies the same rule to what it mounts. Only an explicit `-notes` on the command line can index such a folder.
 
+`serve` applies the guard to `-notes` too, since a client such as [Claude Desktop](claude-desktop.md) passes whatever folder a user picked; only `serve -allow-home` lifts it, and the bundle doesn't pass it. The folders are compared as files, with symlinks resolved, against your home and each folder above it, so another path to home (a bind mount, a case-insensitive spelling on macOS, a macOS firmlink such as `/System/Volumes/Data/Users/…`) is refused too. A folder that only holds a mount of your home somewhere inside it, as some containers and devcontainers set up, is not caught.
+
 ## Model-facing output: data, not instructions
 
 - Each search result is a `<hit>` element and `read_doc` returns a `<doc>` element. Any `<hit`, `</hit`, `<doc` or `</doc` inside file text, in any letter case, has its `<` replaced by `&lt;`, so a file can't close its element and forge a result.
@@ -96,6 +98,12 @@ A folder found automatically (from the working directory, lifted to its git root
 - control and format characters, including bidi controls, are dropped from note text before it is coloured, so a note can't add its own escape sequences; the colours and OSC 8 links are scree's own, and `SCREE_COLORS` accepts only digits and `;`;
 - the numbered lines are read from the current file through the same policy as everything else;
 - the pager is run without a shell, and found only by absolute path or in `/usr/local/bin`, `/usr/bin` or `/bin`, never through `PATH`; under `scree run`, `SCREE_PAGER` comes from the settings file only.
+
+## The API key
+
+- **Trimmed and checked.** Spaces and newlines around `OPENROUTER_API_KEY` are trimmed. A value that is an unfilled `${...}` placeholder, as a client may leave it, or one `scree key` would refuse (inner whitespace, control characters, quotes), counts as no key. One log line says so and never shows the value; `doctor` reports it as set but unusable rather than as not set.
+- **A rejected key is not retried.** When the API answers 401, that process indexes and searches by keyword only for the rest of its run, without sending the key again, and `auto` search says the key was rejected. The next process with a working key embeds those files.
+- **A 403 is not a rejected key.** OpenRouter sends it for an input its moderation flags, so it fails only that file, as other API errors do.
 
 ## Zero data retention
 
@@ -122,6 +130,14 @@ The index directory is created with mode 0700 and its files 0600. The index file
 `scree mcp -docker` never pulls an image (`--pull=never`), since the container receives your key; mounts the work tree read-only; refuses your home directory, a folder above it, `/` and paths containing `:`; accepts only a volume name for the data volume; and passes settings by name so the key never appears on a command line. The docker CLI gets only `HOME`, a fixed `PATH`, the settings, and `DOCKER_HOST` or `DOCKER_CONTEXT` from the settings file. The image runs as an unprivileged user.
 
 On SELinux hosts, the container can read the bind-mounted folder only with `:z`, which **permanently relabels every file in that folder on the host** to `container_file_t`, even for a read-only mount. That is a trade-off you choose with `SCREE_MOUNT_OPTS=ro,z`: mount a repo or a notes folder, never your home directory, or use the native binary, which relabels nothing. See [Docker](docker.md).
+
+## The Claude Desktop bundle
+
+The [bundle](claude-desktop.md) runs `server/scree serve -notes <folder>` with only `OPENROUTER_API_KEY` set from its settings. It never goes through `scree mcp`, so it reads no settings file and no repo's `.mcp.json` plays a part: what runs is whatever is in the bundle file. Choosing the folder is the opt-in, and the home guard above still applies.
+
+- **Checksums.** Each release has `scree_<version>.mcpb.sha256`, and the MCP Registry entry records the same sha256. Whether a client checks it on install is untested.
+- **Unsigned.** The binaries are not signed or notarized, so Gatekeeper may refuse the macOS one until you allow it, and the `DYLD_*` caveat under [Trusting a repo](#trusting-a-repo) applies to it.
+- **Untested.** The bundle has not been tested in any MCP client on any platform (not in Claude Desktop, not on macOS or Windows); only the server command was run, on Linux with a Linux build.
 
 ## What scree does not protect against
 

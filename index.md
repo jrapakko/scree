@@ -21,6 +21,8 @@ The point is relevance and context, not speed. Long markdown files are unwieldy 
 4. **Turn scree on for the repo:** `claude mcp add scree --scope project -- scree mcp` writes a `.mcp.json` with no key and no paths. Commit it. A repo whose own `.mcp.json` doesn't name `scree mcp` is never indexed.
 5. **Use it.** Each Claude Code session in the repo starts `scree serve` through `scree mcp`. The first one builds the index in the background; later ones only read it and take over writing when the writer exits. Claude calls `search_docs`, gets `<hit>` elements with line ranges, and reads just those lines.
 
+For Claude Desktop on macOS and Windows there is also an untested one-click bundle; see [Claude Desktop](claude-desktop.md).
+
 Approving scree in a repo's `.mcp.json` means trusting that repo, as with any project server; see [Security](security.md#trusting-a-repo).
 
 From a terminal, `scree search` prints a [text view](cli.md#scree-search) grouped by query word, with the matching lines of each hit, coloured and paged. Without an API key, scree still indexes notes for keyword search.
@@ -31,6 +33,7 @@ Each folder gets its own index under `$XDG_DATA_HOME/scree/indexes/`. Idle memor
 
 - [Getting started](getting-started.md): install, the settings file, turning a repo on, the first index, migrating.
 - [Using with Claude Code](using-with-claude-code.md): the tools, search modes, their output, and several sessions in one repo.
+- [Claude Desktop](claude-desktop.md): the one-click bundle (untested), its two settings, and its caveats.
 - [CLI reference](cli.md): every command and flag, the search text view, and exit codes.
 - [Configuration](configuration.md): environment variables, the settings file, what `scree mcp` and `scree run` accept.
 - [Ignoring files](ignoring-files.md): what gets indexed, `.gitignore`, `.screeignore`, front matter.

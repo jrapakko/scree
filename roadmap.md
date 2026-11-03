@@ -4,7 +4,7 @@ title: Roadmap
 
 ## Done
 
-Everything below is on `main` and in `v0.3.5`, the latest release. `v0.1.0` and `v0.2.0` (code-vocabulary routing) were released on 2026-10-24; `v0.3.1`, `v0.3.2`, `v0.3.3` and `v0.3.5` add the search text view, `scree key`, and keyword search without an API key.
+Everything below is on `main` and in `v0.4.0`, the latest release. `v0.1.0` and `v0.2.0` (code-vocabulary routing) were released on 2026-10-24; `v0.3.1`, `v0.3.2`, `v0.3.3` and `v0.3.5` add the search text view, `scree key`, and keyword search without an API key; `v0.3.6` adds `scree search -format grep`; `v0.4.0` adds the Claude Desktop bundle and registry publishing from CI.
 
 - **Per-repo indexes.** One index per folder under `$XDG_DATA_HOME/scree/indexes/`, chosen from `-notes`, or under Claude Code from the git root of the session's working directory, with `CLAUDE_PROJECT_DIR` as a cross-check. Each index records its folder and model and refuses another.
 - **Enforced opt-in.** Under Claude Code, `serve` indexes only a repo whose own committed `.mcp.json` names `scree mcp`.
@@ -13,7 +13,7 @@ Everything below is on `main` and in `v0.3.5`, the latest release. `v0.1.0` and 
 - **Safe reads.** Canonical on-disk names with NFC and case folding, symlinks only inside the folder, FIFO-safe opens (a FIFO swapped in for a note is refused even when it reuses the inode number), trust only your own `.git`, no symlinked git files, nothing echoed, fail closed on a bad `.screeignore`, the home guard.
 - **One writer per index.** A `writer.lock` per index, background first sync in `serve`, takeover by readers, a bounded shutdown, and resync after API outages.
 - **Tools.** `search_docs(query, k, mode?)`, `read_doc(path, start?, end?)` returning `<doc>`, and `reindex(path?)`, with server instructions that name the project folder and mark file text as data.
-- **Search modes.** An FTS5 keyword index beside the vectors; `hybrid` merges both by reciprocal rank fusion, `keyword` makes no API call, and `auto`, the default, runs `hybrid` for identifier-like queries and `semantic` otherwise. `scree search -mode` and `-format json`.
+- **Search modes.** An FTS5 keyword index beside the vectors; `hybrid` merges both by reciprocal rank fusion, `keyword` makes no API call, and `auto`, the default, runs `hybrid` for identifier-like queries and `semantic` otherwise. `scree search -mode`, `-format json`, and `-format grep` for fzf and `vim -q`.
 - **Code-vocabulary routing.** `auto` also runs `hybrid` when a query word is a name from the repo's code: dependency names from manifests and mixed-case names from imports and declarations in Python, JavaScript, TypeScript and Go, collected locally with a stoplist and never embedded or sent. `doctor` reports the vocabulary's size and how many names the notes also contain. See [the code vocabulary](using-with-claude-code.md#the-code-vocabulary).
 - **Human view.** `scree search`'s text view, the default on a terminal: hits grouped by query word, each with an excerpt, a clickable `>path:start-end` link and the numbered lines of its range, coloured (`SCREE_COLORS`) and paged through `less -FRX` (`SCREE_PAGER`, `-no-pager`). No local search page. See [the text view](cli.md#the-text-view).
 - **`scree key` and the settings file's key.** `scree key` saves and tests the key without echoing it. Direct `search`, `reindex`, `doctor` and `watch` use the file's key by re-running as `scree run` would, in a clean environment. The embeddings client never follows a redirect.
@@ -25,14 +25,15 @@ Everything below is on `main` and in `v0.3.5`, the latest release. `v0.1.0` and 
 - **Migration.** Indexes from earlier builds are upgraded in place; see [Migrating](getting-started.md#migrating).
 - **Packaging.** MIT license, CI, a GoReleaser and GHCR release workflow, and an 18 MB distroless image.
 - **MCP Registry.** Listed as `io.github.jrapakko/scree`, with the image `ghcr.io/jrapakko/scree` as its package; see [Docker](docker.md#the-mcp-registry-listing).
-
-## Planned
-
-- **One-click bundles for Claude Desktop.** An MCPB bundle for Claude Desktop on macOS and Windows, built by the release workflow, that asks for a notes folder and the API key and runs `scree serve` for that folder. Claude Code keeps `.mcp.json` and `scree mcp`; Linux keeps the image and the native binary.
-- **Automatic registry publishing.** Publish each release's `server.json`, including the bundle, to the MCP Registry from CI with `mcp-publisher`, once the release is public, instead of by hand.
+- **One-click bundle for Claude Desktop.** Each release carries `scree_<version>.mcpb`, an MCPB bundle for Claude Desktop on macOS and Windows, built by the release workflow, with its `.mcpb.sha256`. It asks for a notes folder and an optional API key and runs `scree serve -notes` for that folder, which now refuses home, a folder above it or a filesystem root unless `-allow-home` is given. Untested in any client so far; see [Claude Desktop](claude-desktop.md). Claude Code keeps `.mcp.json` and `scree mcp`; Linux keeps the image and the native binary.
+- **Automatic registry publishing.** Publishing a release runs a workflow that sets `server.json`'s version and image tag from the tag, adds the bundle's URL and sha256, validates it with `mcp-publisher` and publishes it to the MCP Registry, logged in by GitHub OIDC. Prereleases are skipped.
+- **Key handling for clients.** `OPENROUTER_API_KEY` is trimmed; a placeholder or invalid value counts as no key, and a key the API rejects (401) switches that process to keyword-only indexing and search. See [Security](security.md#the-api-key).
 
 ## Open items
 
+- **Test the Claude Desktop bundle.** Install and run it in Claude Desktop on macOS and Windows. It has not been tested in any MCP client on any platform so far; only the server command was run, on Linux with a Linux build.
+- **Signing and notarization.** Sign and notarize the macOS binary for Gatekeeper. The release binaries and the bundle are unsigned today.
+- **Hardening left from the bundle review.** On Windows, a `.git` or `.gitignore` above the folder is trusted without an owner check. Symlink targets are stat'ed before the in-root check, which can touch an automount or UNC path. A client loader might substitute `${...}` again inside a substituted value; not checked against the reference loader. The "file text is data, not instructions" warning could go in the `search_docs` and `read_doc` tool descriptions too. Immutable releases, and a fallback by release ID if the upload step cannot find the draft by tag.
 - **Base image pinning.** The Dockerfile's `golang` and distroless images are referenced by tag. Pin them by digest once something like Dependabot keeps the digests current.
 - **Docker and worktrees.** `scree mcp -docker` mounts only the work tree, so a worktree whose git dir lives in the main repository outside the mount can't be read in the container, and it requires `CLAUDE_PROJECT_DIR` to lead to the same work tree, not just the same repository as native `serve` allows.
 - **Docker on SELinux.** The only way to make the read-only mount readable is `SCREE_MOUNT_OPTS=ro,z` (or `ro,Z`), which permanently relabels every file in the folder on the host. A label-free option, such as `--security-opt label=disable` for that one container, is not offered yet. The container also gets no proxy variables; only the docker CLI does.

@@ -20,7 +20,7 @@ scree reads its settings from environment variables. Keep them in the settings f
 | `SCREE_PAGER` | `less -FRX` | Pager for `scree search`'s text view on a terminal; see [below](#the-text-view). Set it empty for none. |
 | `SCREE_COLORS` | `word=1:match=1;33:link=36:lineno=2` | Colours of the text view; see [below](#the-text-view). |
 
-`<folder>` in the index path is the folder's name with characters outside `[A-Za-z0-9._-]` replaced by `_`, cut to 40 bytes, with a leading `.` replaced by `_`; `<hash>` is the first 16 hex digits of the SHA-256 of the folder's resolved path. `$XDG_DATA_HOME` defaults to `~/.local/share`.
+`<folder>` in the index path is the folder's name with characters outside `[A-Za-z0-9._-]` replaced by `_`, cut to 40 bytes, with a leading `.` replaced by `_`; `<hash>` is the first 16 hex digits of the SHA-256 of the folder's resolved path. `$XDG_DATA_HOME` defaults to `~/.local/share`; a relative value is ignored. With neither it nor an absolute home directory, scree refuses to open an index unless `-db` names one.
 
 An invalid `SCREE_DIMENSIONS`, `SCREE_MAX_FILE_BYTES`, `SCREE_FIRST_SYNC_MB` or `SCREE_ZDR` stops the command with an error naming the variable.
 

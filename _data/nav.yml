@@ -1,6 +1,7 @@
 - path: index.md
 - path: getting-started.md
 - path: using-with-claude-code.md
+- path: claude-desktop.md
 - path: cli.md
 - path: configuration.md
 - path: ignoring-files.md
