@@ -383,7 +383,11 @@ func keyRun(t *testing.T, terminal bool, input string, args ...string) (string, 
 	log.SetOutput(os.Stderr)
 	ew.Close()
 	stderr := <-errOut
-	if terminal && prompted && !strings.Contains(stderr, "OpenRouter API key: ") {
+	prompt := "OpenRouter API key: "
+	if slices.Contains(args, "-mcp") {
+		prompt = "OpenRouter API key for scree mcp: "
+	}
+	if terminal && prompted && !strings.Contains(stderr, prompt) {
 		t.Errorf("no prompt on stderr: %q", stderr)
 	}
 	all := out + stderr + logBuf.String()
@@ -441,7 +445,7 @@ func TestKeyWritesSettings(t *testing.T) {
 	home := filepath.Dir(filepath.Dir(filepath.Dir(file)))
 	wantEnv := []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "TERM=xterm", "SCREE_KEY_FROM=" + file,
 		"OPENROUTER_API_KEY=" + testSecret, "SCREE_EMBED_URL=" + api.URL, "SCREE_ZDR=0"}
-	if !r.called || !slices.Equal(r.argv, []string{testExe, "key", "-check"}) || !slices.Equal(r.env, wantEnv) {
+	if !r.called || !slices.Equal(r.argv, []string{testExe, "key", "-child", "-check"}) || !slices.Equal(r.env, wantEnv) {
 		t.Fatalf("exec %v %q\nenv %q\nwant %q", r.called, r.argv, r.env, wantEnv)
 	}
 	if got := api.calls(); len(got) != 0 {
@@ -454,7 +458,7 @@ func TestKeyWritesSettings(t *testing.T) {
 			t.Setenv(k, v)
 		}
 	}
-	out, err = keyRun(t, false, "", "-check")
+	out, err = keyRun(t, false, "", "-child", "-check")
 	if err != nil || !strings.Contains(out, "ok   embeddings API returned 2 dimensions") {
 		t.Fatalf("%q, %v", out, err)
 	}
@@ -486,7 +490,7 @@ func TestKeyTestCallFails(t *testing.T) {
 	t.Setenv("SCREE_EMBED_URL", api.URL)
 	t.Setenv("OPENROUTER_API_KEY", testSecret)
 	t.Setenv(keyFromVar, file)
-	out, err := keyRun(t, false, "", "-check")
+	out, err := keyRun(t, false, "", "-child", "-check")
 	if err == nil || !strings.Contains(err.Error(), "the test call with the key in "+file+" failed") ||
 		strings.Contains(err.Error(), testSecret) || strings.Contains(out, testSecret) {
 		t.Errorf("err %v, out %q", err, out)

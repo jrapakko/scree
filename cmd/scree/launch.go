@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"syscall"
+
+	"github.com/jrapakko/scree/internal/textsafe"
 )
 
 // scree mcp and scree run load the settings file as data and re-execute
@@ -205,12 +208,13 @@ func loadSettings() (home string, s map[string]string, err error) {
 }
 
 // childEnv is HOME, PATH, extra, then the settings sorted by name, without
-// the docker-only ones unless withDocker.
+// the docker-only ones unless withDocker, and never SCREE_MCP_API_KEY (see
+// mcpSettings).
 func childEnv(home, path string, s map[string]string, withDocker bool, extra ...string) []string {
 	env := append([]string{"HOME=" + home, "PATH=" + path}, extra...)
 	names := make([]string, 0, len(s))
 	for n := range s {
-		if withDocker || !slices.Contains(dockerOnly, n) {
+		if n != mcpKeyVar && (withDocker || !slices.Contains(dockerOnly, n)) {
 			names = append(names, n)
 		}
 	}
@@ -244,10 +248,31 @@ func runMCP(args []string) error {
 		return errors.New("mcp: CLAUDE_PROJECT_DIR is not set; scree mcp is for Claude Code " +
 			"(from a terminal, run scree run serve -notes <dir>)")
 	}
+	s = mcpSettings(settingsPath(home), s)
 	if docker {
 		return execDocker(home, s, pd)
 	}
 	return reexec(home, s, launchExtra(pd, false), "serve")
+}
+
+// mcpSettings is the settings scree mcp passes on, from the file p: without
+// SCREE_MCP_API_KEY, and with OPENROUTER_API_KEY set to it when it is
+// usable (read as envKey reads OPENROUTER_API_KEY), so serve, or with
+// -docker the container (which gets the key by name from the docker CLI's
+// environment), uses the MCP key. An unusable one is said on stderr, with
+// the reason and never the value, and the file's OPENROUTER_API_KEY is
+// used as without it.
+func mcpSettings(p string, s map[string]string) map[string]string {
+	k, problem := settingsMCPKey(s)
+	s = maps.Clone(s)
+	delete(s, mcpKeyVar)
+	switch {
+	case problem != "":
+		fmt.Fprintf(os.Stderr, "scree: warning: %s in %s; using OPENROUTER_API_KEY\n", problem, textsafe.Strip(p))
+	case k != "":
+		s["OPENROUTER_API_KEY"] = k
+	}
+	return s
 }
 
 // runRun is `scree run <command> [args]`: any other command, with its

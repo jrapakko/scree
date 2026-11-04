@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,12 +45,13 @@ Usage:
                            container
   scree run <command> [args]
                            run another command the same way, from a terminal
-  scree key [-offline] [-replace] [-check]
+  scree key [-mcp] [-offline] [-replace] [-check]
                            save the OpenRouter API key in ~/.config/scree/env
                            (prompted for, or one line from stdin; replacing
                            a saved key from stdin needs -replace), then make
                            one test call to the embeddings API (-check: only
-                           the call)
+                           the call); -mcp saves SCREE_MCP_API_KEY, a
+                           separate key that only scree mcp uses
   scree watch              index changed files, then keep the index current
   scree serve [-http addr [-allow-remote]] [-allow-home]
                            run the MCP server (stdio unless -http is given;
@@ -95,6 +97,8 @@ not $HOME. Environment:
                       ~/.config/scree/env sets one (see scree key), search,
                       reindex, doctor and watch run as scree run would,
                       with settings from that file only
+  SCREE_MCP_API_KEY   in ~/.config/scree/env only: the key scree mcp passes
+                      to serve instead of OPENROUTER_API_KEY (scree key -mcp)
   SCREE_HTTP_TOKEN    bearer token for serve -http; required with
                       -allow-remote, enforced on loopback when set
   SCREE_PAGER         pager for search's text view on a terminal, run
@@ -835,6 +839,7 @@ func runDoctor(ctx context.Context, args []string) error {
 		}
 		report(false, "%s (%s); search runs keyword mode only", what, noKeyHint(false))
 	}
+	doctorMCPKey(report, warn)
 	if cfg.zdr {
 		report(true, "zero data retention requested (provider.zdr=true, data_collection=deny)")
 		if u, err := url.Parse(cfg.url); err != nil || u.Hostname() != "openrouter.ai" {
@@ -860,6 +865,31 @@ func runDoctor(ctx context.Context, args []string) error {
 		return errors.New("doctor found problems")
 	}
 	return nil
+}
+
+// doctorMCPKey reports, when the settings file sets SCREE_MCP_API_KEY,
+// that scree mcp uses it rather than OPENROUTER_API_KEY, or, if it is
+// unusable, why (never the value). A missing or refused file says nothing
+// here: direct commands warn about the latter themselves.
+func doctorMCPKey(report func(bool, string, ...any), warn func(string, ...any)) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	home, err := settingsHome()
+	if err != nil {
+		return
+	}
+	p := settingsPath(home)
+	_, s, err := readSettings(p)
+	if err != nil {
+		return
+	}
+	switch k, problem := settingsMCPKey(s); {
+	case problem != "":
+		warn("%s in %s; scree mcp uses OPENROUTER_API_KEY instead", problem, p)
+	case k != "":
+		report(true, "scree mcp uses SCREE_MCP_API_KEY from %s; direct commands and scree run use OPENROUTER_API_KEY", p)
+	}
 }
 
 // keywordOnlyText is doctor's note on the n files indexed without vectors,

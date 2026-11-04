@@ -22,7 +22,7 @@ You need Go 1.26 and an OpenRouter API key from https://openrouter.ai/settings/k
    bin/scree key
    ```
 
-   It keeps any other lines in the file and replaces an earlier key. `scree key < file` reads the key from the first line of a file instead, and replaces a saved key only with `-replace`; `-offline` skips the test call, and `-check` makes only the test call. Ctrl-C at the prompt saves nothing.
+   It keeps any other lines in the file and replaces an earlier key. `scree key < file` reads the key from the first line of a file instead, and replaces a saved key only with `-replace`; `-offline` skips the test call, and `-check` makes only the test call. Ctrl-C at the prompt saves nothing. To see Claude Code's OpenRouter costs apart from your own searches, save a second key with `bin/scree key -mcp`: `scree mcp` then uses it, and everything else keeps the first ([settings file](#settings-file)).
 
 3. **Install** the binary:
 
@@ -79,6 +79,7 @@ Settings come from environment variables. The [settings file](#settings-file) is
 | `SCREE_PAGER` | `less -FRX` from `/usr/local/bin`, `/usr/bin` or `/bin`; the pager for `scree search`'s text view on a terminal, run without a shell: an absolute path or a name in those folders (never looked up on `PATH`), then its arguments. Set it empty for none |
 | `SCREE_COLORS` | `word=1:match=1;33:link=36:lineno=2`; the text view's colours as SGR codes (digits and `;` only) for the word headings, the matched words, the locations and the line numbers. `match=` turns one off |
 | `OPENROUTER_API_KEY` | none; when unset and the [settings file](#settings-file) holds one (`scree key` writes it there), `search`, `reindex`, `doctor` and `watch` run as `scree run` would. Without a key (unset or empty), notes are indexed for keyword search only and `auto` search runs `keyword` |
+| `SCREE_MCP_API_KEY` | none; read only from the [settings file](#settings-file) (`scree key -mcp` writes it), and only by `scree mcp`, which passes it to `serve` as `OPENROUTER_API_KEY` instead of the file's own. Commands run directly and `scree run` never use it |
 
 `$XDG_DATA_HOME` defaults to `~/.local/share`; a relative value is ignored. With neither it nor an absolute home directory, scree refuses to open an index unless `-db` names one.
 
@@ -121,6 +122,7 @@ Run `scree doctor -v` to see what each layer ignores before relying on a pattern
 
 ```sh
 scree key                # save the API key in the settings file
+scree key -mcp           # optional: a separate key for scree mcp (Claude Code)
 scree doctor             # check config, index, and the API
 scree doctor -v          # also list every ignored file, and check the keyword index
 scree reindex            # index new and changed files
@@ -222,6 +224,8 @@ Paths are relative to the folder, so run these from its top. A folder you didn't
 `scree mcp` (for Claude Code), `scree run` (from a terminal) and the systemd unit all read the same file, `~/.config/scree/env`, so the API key lives in one place with mode 600. `scree key` (step 2 of the [Quick start](#quick-start)) creates it or updates the key in it. It holds the key and optional settings, not the folder.
 
 A command run directly, without `scree run`, uses the environment. When `OPENROUTER_API_KEY` is unset (or blank, a placeholder or invalid, as above) and this file holds a key, `search`, `reindex`, `doctor` and `watch` instead re-run themselves exactly as `scree run` would: with an environment built from this file alone, so the key goes only to the file's `SCREE_EMBED_URL` (or the default endpoint), through the file's proxy if any, and no `SCREE_*`, proxy, `SSL_CERT_FILE` or `GODEBUG` variable from your shell applies. `doctor` then says the key came from this file. A missing file, or one with no key, means no key. A file that fails the checks below gives one warning naming the problem, and the command runs without a key (`auto` search runs `keyword`). `serve` never reads the file itself; under Claude Code, `scree mcp` has already applied it.
+
+The file can hold a second key, `SCREE_MCP_API_KEY`, which `scree key -mcp` writes (with the same flags and rules as `scree key`; `-check -mcp` tests it). `scree mcp` and `scree mcp -docker` then give `serve` that key as `OPENROUTER_API_KEY` instead of the file's own, so OpenRouter's per-key usage shows Claude Code apart from `scree search` and the rest, which keep `OPENROUTER_API_KEY`. `SCREE_MCP_API_KEY` never reaches any process under its own name. If it is unusable (empty, a placeholder, inner whitespace, a quote), `scree mcp` says why on stderr, never the value, and uses `OPENROUTER_API_KEY`; `doctor` warns about it too, and otherwise says when `scree mcp` uses the separate key. As with any setting, the file's last `SCREE_MCP_API_KEY` line is the one used.
 
 `~` is taken from the password database (your login's home directory), not from `$HOME` or `$XDG_CONFIG_HOME`. `scree mcp` and `scree run` refuse to start if the file is missing, is a symlink, is not owned by you, or is readable by group or others; `chmod 600` fixes the last. `scree key` refuses such a file too (a missing one is fine), a `~/.config/scree` folder that is a symlink, is not yours or is writable by group or others, a symlinked `~/.config`, and a key that would make the file larger than 64 KB. On Linux the home directory comes from `/etc/passwd`, or from `getent passwd` for an LDAP or sssd login; if neither knows you, they refuse to start rather than trust `$HOME`. They don't run on Windows: set the variables in the environment and run `scree serve -notes …` or another command directly.
 

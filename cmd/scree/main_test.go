@@ -22,6 +22,9 @@ func TestMain(m *testing.M) {
 		main()
 		os.Exit(0)
 	}
+	// A caller's SCREE_KEY_FROM (an agent run sets it to none) would make
+	// commands under test act as re-executed children.
+	os.Unsetenv(keyFromVar)
 	home, err := os.MkdirTemp("", "scree-home-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

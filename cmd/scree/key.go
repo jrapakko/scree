@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,6 +37,12 @@ import (
 // keyFromVar marks a process re-executed to use the settings file's key;
 // its value is the file. Such a process never re-executes again.
 const keyFromVar = "SCREE_KEY_FROM"
+
+// mcpKeyVar is the settings file's optional key for scree mcp alone, so
+// its use can be told apart from direct commands' (on OpenRouter, by
+// key). scree mcp passes it to serve as OPENROUTER_API_KEY; it never
+// reaches any child under its own name.
+const mcpKeyVar = "SCREE_MCP_API_KEY"
 
 // keyCommands are the commands that use the settings file's key.
 var keyCommands = []string{"search", "reindex", "doctor", "watch"}
@@ -134,26 +141,43 @@ func noKeyHint(serve bool) string {
 	return "run scree key, or set OPENROUTER_API_KEY"
 }
 
-// runKey is `scree key [-offline] [-replace] [-check]`: it reads the API
-// key (prompted for without echo on a terminal, otherwise one line from
-// stdin), saves it in the settings file, and unless -offline makes one test
-// embedding call; -check makes only the call. The key is never printed.
-// main calls it with no signal handling installed, so Ctrl-C at the prompt
-// ends scree at once.
+// runKey is `scree key [-mcp] [-offline] [-replace] [-check]`: it reads
+// the API key (prompted for without echo on a terminal, otherwise one line
+// from stdin), saves it in the settings file, and unless -offline makes one
+// test embedding call; -check makes only the call. With -mcp it does the
+// same for SCREE_MCP_API_KEY, the key scree mcp uses instead of
+// OPENROUTER_API_KEY. The key is never printed. main calls it with no
+// signal handling installed, so Ctrl-C at the prompt ends scree at once.
 func runKey(ctx context.Context, args []string) error {
+	// childMarker, first, is checkInChild's re-exec; it is not a flag, so
+	// usage never shows it.
+	child := len(args) > 0 && args[0] == childMarker
+	if child {
+		args = args[1:]
+	}
 	set := flag.NewFlagSet("key", flag.ExitOnError)
+	mcpKey := set.Bool("mcp", false, "save or check SCREE_MCP_API_KEY, the key scree mcp uses, instead of OPENROUTER_API_KEY")
 	offline := set.Bool("offline", false, "skip the test call to the embeddings API")
 	replaceKey := set.Bool("replace", false, "replace a key already in the file when reading the new one from stdin")
 	check := set.Bool("check", false, "only make the test call, with the key in the settings file")
 	set.Parse(args)
 	if set.NArg() != 0 {
-		return errors.New("usage: scree key [-offline] [-replace] [-check] (the key is prompted for, or read from stdin)")
+		return errors.New("usage: scree key [-mcp] [-offline] [-replace] [-check] (the key is prompted for, or read from stdin)")
 	}
 	if runtime.GOOS == "windows" {
 		return errKeyUnsupported
 	}
-	if *check && os.Getenv(keyFromVar) != "" {
-		return testKey(ctx, os.Getenv(keyFromVar))
+	name, prompt := "OPENROUTER_API_KEY", "OpenRouter API key: "
+	if *mcpKey {
+		name, prompt = mcpKeyVar, "OpenRouter API key for scree mcp: "
+	}
+	// Only checkInChild's re-exec tests the key in its environment; a
+	// SCREE_KEY_FROM inherited from a caller is not that.
+	if child {
+		if !*check || os.Getenv(keyFromVar) == "" {
+			return errors.New("key: " + childMarker + " is for scree's own re-exec of scree key -check")
+		}
+		return testKey(ctx, os.Getenv(keyFromVar), name)
 	}
 	home, err := settingsHome()
 	if err != nil {
@@ -166,21 +190,21 @@ func runKey(ctx context.Context, args []string) error {
 		return err
 	}
 	if *check {
-		return checkInChild(home, p, s)
+		return checkInChild(home, p, s, *mcpKey)
 	}
 	terminal := stdinTerminal()
-	if !terminal && s["OPENROUTER_API_KEY"] != "" && !*replaceKey {
-		return fmt.Errorf("%s already holds an API key; nothing saved (to replace it from stdin, add -replace)", p)
+	if !terminal && s[name] != "" && !*replaceKey {
+		return fmt.Errorf("%s already holds an API key (%s); nothing saved (to replace it from stdin, add -replace)", p, name)
 	}
-	key, err := readKey(terminal)
+	key, err := readKey(terminal, prompt)
 	if err != nil {
 		return err
 	}
-	if err := saveKey(p, key); err != nil {
+	if err := saveKey(p, name, key); err != nil {
 		return err
 	}
-	fmt.Printf("saved OPENROUTER_API_KEY in %s\n", p)
-	if os.Getenv("OPENROUTER_API_KEY") != "" {
+	fmt.Printf("saved %s in %s\n", name, p)
+	if !*mcpKey && os.Getenv("OPENROUTER_API_KEY") != "" {
 		fmt.Println("note: OPENROUTER_API_KEY is set in the environment, and commands run directly use that one")
 	}
 	if *offline {
@@ -189,28 +213,51 @@ func runKey(ctx context.Context, args []string) error {
 	if _, s, err = readSettings(p); err != nil {
 		return err
 	}
-	return checkInChild(home, p, s)
+	return checkInChild(home, p, s, *mcpKey)
 }
+
+// childMarker is the first argument of the scree key -check that
+// checkInChild runs.
+const childMarker = "-child"
 
 // checkInChild replaces the process with `scree key -check`, run with the
 // settings file's key the way direct commands are (see useSettingsKey).
-func checkInChild(home, p string, s map[string]string) error {
+// With mcp the key is SCREE_MCP_API_KEY, passed as OPENROUTER_API_KEY the
+// way scree mcp passes it, and the child is `scree key -check -mcp`.
+func checkInChild(home, p string, s map[string]string, mcp bool) error {
 	if s == nil {
 		return settingsMissing(p)
 	}
-	if s["OPENROUTER_API_KEY"] == "" {
-		return fmt.Errorf("%s holds no OPENROUTER_API_KEY; run scree key", p)
+	if !mcp {
+		if s["OPENROUTER_API_KEY"] == "" {
+			return fmt.Errorf("%s holds no OPENROUTER_API_KEY; run scree key", p)
+		}
+		return reexecWithKey(home, p, s, "key", childMarker, "-check")
 	}
-	return reexecWithKey(home, p, s, "key", "-check")
+	k, problem := settingsMCPKey(s)
+	switch {
+	case problem != "":
+		return fmt.Errorf("%s in %s; not testing it (replace it with scree key -mcp)", problem, p)
+	case k == "":
+		return fmt.Errorf("%s holds no %s; run scree key -mcp", p, mcpKeyVar)
+	}
+	s = maps.Clone(s)
+	s["OPENROUTER_API_KEY"] = k
+	return reexecWithKey(home, p, s, "key", childMarker, "-check", "-mcp")
 }
 
 // testKey makes one test embedding call with the key and settings in the
-// environment, which checkInChild built from the settings file p.
-func testKey(ctx context.Context, p string) error {
+// environment, which checkInChild built from the settings file p; name is
+// the file's variable the key came from, for messages.
+func testKey(ctx context.Context, p, name string) error {
 	var cfg config
 	envConfig(&cfg)
 	if cfg.apiKey == "" {
-		return fmt.Errorf("%s holds no OPENROUTER_API_KEY; run scree key", p)
+		hint := "scree key"
+		if name == mcpKeyVar {
+			hint = "scree key -mcp"
+		}
+		return fmt.Errorf("%s holds no %s; run %s", p, name, hint)
 	}
 	zdr, err := zdrSetting()
 	if err != nil {
@@ -253,13 +300,13 @@ func readTerminal() ([]byte, error) {
 	return term.ReadPassword(fd)
 }
 
-// readKey reads the key: from the terminal without echo, after a prompt on
+// readKey reads the key: from the terminal without echo, after prompt on
 // stderr, or else the first line of stdin.
-func readKey(terminal bool) (string, error) {
+func readKey(terminal bool, prompt string) (string, error) {
 	var b []byte
 	var err error
 	if terminal {
-		fmt.Fprint(os.Stderr, "OpenRouter API key: ")
+		fmt.Fprint(os.Stderr, prompt)
 		b, err = readPassword()
 		fmt.Fprintln(os.Stderr)
 	} else {
@@ -316,26 +363,45 @@ func keyProblem(b []byte) string {
 // that fails checkKey's rules, with problem saying why in words that never
 // show the value. An unset or empty variable is "" with no problem.
 func envKey() (key, problem string) {
-	v := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
+	return usableKey("OPENROUTER_API_KEY", os.Getenv("OPENROUTER_API_KEY"))
+}
+
+// settingsMCPKey is the settings file's SCREE_MCP_API_KEY read as envKey
+// reads OPENROUTER_API_KEY, except that a line setting it empty or blank
+// is a problem too: its fallback to OPENROUTER_API_KEY would merge the
+// two keys' costs unnoticed. As for every setting, the file's last line
+// for it counts.
+func settingsMCPKey(s map[string]string) (key, problem string) {
+	v, ok := s[mcpKeyVar]
+	if ok && strings.TrimSpace(v) == "" {
+		return "", mcpKeyVar + " is set but empty (the file's last " + mcpKeyVar + " line is the one used)"
+	}
+	return usableKey(mcpKeyVar, v)
+}
+
+// usableKey is envKey's reading of the value v of the variable name.
+func usableKey(name, v string) (key, problem string) {
+	v = strings.TrimSpace(v)
 	switch {
 	case v == "":
 		return "", ""
 	case strings.HasPrefix(v, "${"):
-		return "", "OPENROUTER_API_KEY is set but is an unfilled placeholder"
+		return "", name + " is set but is an unfilled placeholder"
 	}
 	if p := keyProblem([]byte(v)); p != "" {
-		return "", "OPENROUTER_API_KEY is set but not a valid key: " + p
+		return "", name + " is set but not a valid key: " + p
 	}
 	return v, ""
 }
 
-// saveKey writes key into the settings file at p, creating its folder
-// (mode 700) if needed. An existing OPENROUTER_API_KEY line is replaced
+// saveKey writes key into the settings file at p as the variable name
+// (OPENROUTER_API_KEY or SCREE_MCP_API_KEY), creating its folder (mode 700)
+// if needed. An existing line for name is replaced
 // (keeping its indent and any "export "), or one is appended; every other
 // line is kept byte for byte. The file is replaced atomically by a new one
 // with mode 600, and only if it passes the checks scree run applies; the
 // folder must be owned by the user and not writable by group or others.
-func saveKey(p, key string) error {
+func saveKey(p, name, key string) error {
 	dir := filepath.Dir(p)
 	// Neither folder may be a symlink, which could lead the key into a
 	// dotfiles repo or a folder others can read; ~/.config is checked
@@ -353,7 +419,7 @@ func saveKey(p, key string) error {
 	if err != nil {
 		return err
 	}
-	out := setKeyLine(data, key)
+	out := setKeyLine(data, name, key)
 	if len(out) > maxSettingsFile {
 		return fmt.Errorf("%s would be larger than 64 KB with the key; nothing saved", p)
 	}
@@ -420,11 +486,11 @@ func checkKeyDir(dir string) error {
 	return nil
 }
 
-// setKeyLine returns data with every OPENROUTER_API_KEY line, as
+// setKeyLine returns data with every line setting the variable name, as
 // parseSettings reads them, set to key in single quotes, or with such a
 // line appended when there is none.
-func setKeyLine(data []byte, key string) []byte {
-	const name = "OPENROUTER_API_KEY="
+func setKeyLine(data []byte, name, key string) []byte {
+	name += "="
 	line := name + "'" + key + "'"
 	var b bytes.Buffer
 	found := false
