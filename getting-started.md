@@ -45,6 +45,7 @@ scree key
 
 It prompts for the key without echoing it, writes the file atomically with mode 600 (creating `~/.config/scree` with mode 700 if needed), keeps every other line as it was, and then makes one test call to the embeddings API. Ctrl-C at the prompt saves nothing.
 
+- `scree key -mcp` saves a second, optional key that only `scree mcp` uses, so Claude Code's costs show apart from your own searches ([details](configuration.md#a-separate-key-for-scree-mcp)).
 - `scree key < file` reads the key from the first line of a file instead. Piped input replaces a key the file already holds only with `-replace`.
 - `-offline` skips the test call; `-check` makes only the test call, with the saved key.
 - It refuses an empty key, one with whitespace, quotes, a backslash or control characters, a settings file that fails the rules below, and a symlinked `~/.config` or `~/.config/scree`. It never prints the key.

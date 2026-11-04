@@ -171,6 +171,8 @@ Another endpoint may reject OpenRouter's `provider` field. Set `SCREE_ZDR=0` for
 | `<dir> is writable by group or others (mode N); fix with: chmod 700 <dir>` | `chmod 700 ~/.config/scree`. |
 | `<path> is a symlink; not writing the key through it` | `~/.config` or `~/.config/scree` is a symlink. Make it a real folder. |
 | `<file> holds no OPENROUTER_API_KEY; run scree key` | `-check` found no saved key. |
+| `<file> holds no SCREE_MCP_API_KEY; run scree key -mcp` | `-check -mcp` found no saved MCP key. |
+| `scree: warning: SCREE_MCP_API_KEY is set but empty … in <file>; using OPENROUTER_API_KEY` (and other reasons) | `scree mcp` found an unusable MCP key and fell back to the main one, so Claude Code's costs land on that key. Run `scree key -mcp -replace` or fix the last `SCREE_MCP_API_KEY` line. |
 | `the test call with the key in <file> failed: …` | The key was saved; the error says why the call failed, as in [the embeddings API](#the-embeddings-api) below. |
 
 ## The search text view

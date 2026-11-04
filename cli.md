@@ -6,7 +6,7 @@ nav_title: CLI
 ```
 scree mcp [-docker]
 scree run <command> [args]
-scree key [-offline] [-replace] [-check]
+scree key [-mcp] [-offline] [-replace] [-check]
 scree watch
 scree serve [-http addr [-allow-remote]] [-allow-home]
 scree search [-k n] [-mode auto|hybrid|semantic|keyword] [-format text|xml|json|grep] [-no-pager] "query"
@@ -61,7 +61,7 @@ What a repo's `.mcp.json` runs. It loads the settings file from your passwd home
 
 Runs any other command, with its arguments, the way `scree mcp` runs `serve`: settings from the file, nothing else from the environment except `CLAUDE_PROJECT_DIR` when set. For the text view it also passes `NO_COLOR=1` when `NO_COLOR` is set or `TERM` is `dumb`, and your `TERM` when it is a plain terminal name such as `xterm-256color`, so the pager works. `scree run mcp` and `scree run run` are refused. It refuses to run on Windows. The systemd unit uses `scree run watch`.
 
-### `scree key [-offline] [-replace] [-check]`
+### `scree key [-mcp] [-offline] [-replace] [-check]`
 
 Saves your OpenRouter API key in the settings file, then makes one test call to the embeddings API with it. On a terminal it prompts without echoing; otherwise it reads the first line of stdin. It writes the file atomically with mode 600, sets the `OPENROUTER_API_KEY=` line (or appends one) and keeps every other line as it was. It never prints the key.
 
@@ -75,9 +75,12 @@ Saves your OpenRouter API key in the settings file, then makes one test call to 
 scree key                          # prompt, save, test
 scree key -replace < new-key.txt   # replace the saved key from a file
 scree key -check                   # test the saved key
+scree key -mcp                     # a separate key for scree mcp (Claude Code)
 ```
 
 The test call runs in the same clean environment as `scree run`, so it uses the file's endpoint and proxy, and prints `ok   embeddings API returned N dimensions`. Ctrl-C at the prompt saves nothing and exits with status 130. If `OPENROUTER_API_KEY` is also set in your environment, it says that commands run directly use that one. It refuses a settings file that fails the [usual checks](configuration.md#what-scree-mcp-and-scree-run-accept-and-refuse) (a missing one is fine), a symlinked `~/.config` or `~/.config/scree`, a `~/.config/scree` not yours or writable by others, and a key that is empty, over 1 KB, or holds whitespace, quotes, a backslash or control characters. It doesn't run on Windows.
+
+`-mcp` does the same for a second key, `SCREE_MCP_API_KEY`, which only `scree mcp` uses (see [Configuration](configuration.md#a-separate-key-for-scree-mcp)), so OpenRouter's per-key usage shows Claude Code's costs apart from your own searches. It writes only that line and leaves `OPENROUTER_API_KEY` alone, as plain `scree key` leaves the MCP line alone. `-check -mcp` tests the MCP key; a file without one gives `<file> holds no SCREE_MCP_API_KEY; run scree key -mcp`.
 
 ### `scree watch`
 
@@ -196,7 +199,7 @@ Checks the setup and prints one line per check, marked `ok`, `warn` or `FAIL`:
 - the [code vocabulary](using-with-claude-code.md#the-code-vocabulary): how many names were read from how many manifests and source files, and how many of them the notes also contain;
 - whether a process holds the writer lock, and its pid;
 - the configured model, and whether the index was built with another;
-- whether `OPENROUTER_API_KEY` is set, and `(from <file>)` when it came from the settings file; without a key it reports `FAIL` and says search runs keyword mode only. A key that is set but unusable is reported as such, not as not set: `OPENROUTER_API_KEY is set but is an unfilled placeholder` or `OPENROUTER_API_KEY is set but not a valid key: …`, never showing the value;
+- whether `OPENROUTER_API_KEY` is set, and `(from <file>)` when it came from the settings file; without a key it reports `FAIL` and says search runs keyword mode only. A key that is set but unusable is reported as such, not as not set: `OPENROUTER_API_KEY is set but is an unfilled placeholder` or `OPENROUTER_API_KEY is set but not a valid key: …`, never showing the value. When the settings file sets `SCREE_MCP_API_KEY`, a further line says `scree mcp uses SCREE_MCP_API_KEY from <file>; direct commands and scree run use OPENROUTER_API_KEY`, or warns that it is empty or unusable;
 - whether zero data retention is requested;
 - a test embedding call, unless `-offline`. If the API rejects the key (401), the line reads `embeddings API: embed: API key rejected: …; until the key is replaced, files are indexed and searched by keyword only`.
 

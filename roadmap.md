@@ -4,7 +4,7 @@ title: Roadmap
 
 ## Done
 
-Everything below is on `main` and in `v0.4.0`, the latest release. `v0.1.0` and `v0.2.0` (code-vocabulary routing) were released on 2026-10-24; `v0.3.1`, `v0.3.2`, `v0.3.3` and `v0.3.5` add the search text view, `scree key`, and keyword search without an API key; `v0.3.6` adds `scree search -format grep`; `v0.4.0` adds the Claude Desktop bundle and registry publishing from CI.
+Everything below is on `main` and in `v0.4.1`, the latest release. `v0.1.0` and `v0.2.0` (code-vocabulary routing) were released on 2026-10-24; `v0.3.1`, `v0.3.2`, `v0.3.3` and `v0.3.5` add the search text view, `scree key`, and keyword search without an API key; `v0.3.6` adds `scree search -format grep`; `v0.4.0` adds the Claude Desktop bundle and registry publishing from CI; `v0.4.1` adds a separate key for `scree mcp`.
 
 - **Per-repo indexes.** One index per folder under `$XDG_DATA_HOME/scree/indexes/`, chosen from `-notes`, or under Claude Code from the git root of the session's working directory, with `CLAUDE_PROJECT_DIR` as a cross-check. Each index records its folder and model and refuses another.
 - **Enforced opt-in.** Under Claude Code, `serve` indexes only a repo whose own committed `.mcp.json` names `scree mcp`.
@@ -27,6 +27,7 @@ Everything below is on `main` and in `v0.4.0`, the latest release. `v0.1.0` and 
 - **MCP Registry.** Listed as `io.github.jrapakko/scree`, with the image `ghcr.io/jrapakko/scree` as its package; see [Docker](docker.md#the-mcp-registry-listing).
 - **One-click bundle for Claude Desktop.** Each release carries `scree_<version>.mcpb`, an MCPB bundle for Claude Desktop on macOS and Windows, built by the release workflow, with its `.mcpb.sha256`. It asks for a notes folder and an optional API key and runs `scree serve -notes` for that folder, which now refuses home, a folder above it or a filesystem root unless `-allow-home` is given. Untested in any client so far; see [Claude Desktop](claude-desktop.md). Claude Code keeps `.mcp.json` and `scree mcp`; Linux keeps the image and the native binary.
 - **Automatic registry publishing.** Publishing a release runs a workflow that sets `server.json`'s version and image tag from the tag, adds the bundle's URL and sha256, validates it with `mcp-publisher` and publishes it to the MCP Registry, logged in by GitHub OIDC. Prereleases are skipped.
+- **A separate key for `scree mcp`.** `SCREE_MCP_API_KEY` (`scree key -mcp`) is used only by `scree mcp`, so OpenRouter shows Claude Code's costs apart from direct CLI use. See [Configuration](configuration.md#a-separate-key-for-scree-mcp).
 - **Key handling for clients.** `OPENROUTER_API_KEY` is trimmed; a placeholder or invalid value counts as no key, and a key the API rejects (401) switches that process to keyword-only indexing and search. See [Security](security.md#the-api-key).
 
 ## Open items

@@ -9,6 +9,7 @@ scree reads its settings from environment variables. Keep them in the settings f
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | none | API key sent as `Authorization: Bearer` to the embeddings endpoint. Needed for embedding and for every search mode but `keyword`. Without one, notes are indexed for keyword search only and `auto` runs `keyword`. `scree key` saves it in the settings file. |
+| `SCREE_MCP_API_KEY` | none | Read only from the settings file (`scree key -mcp` writes it), and only by `scree mcp`, which passes it to `serve` as `OPENROUTER_API_KEY` instead of the file's own. Commands run directly and `scree run` never use it. See [below](#a-separate-key-for-scree-mcp). |
 | `SCREE_MODEL` | `openai/text-embedding-3-small` | Embedding model. |
 | `SCREE_DIMENSIONS` | `512` | Embedding size requested from the API; `0` uses the model's default. Must be an integer. |
 | `SCREE_EMBED_URL` | `https://openrouter.ai/api/v1/embeddings` | Any OpenAI-compatible embeddings endpoint. |
@@ -33,6 +34,17 @@ A command run directly, without `scree run`, reads its settings from your enviro
 - With `OPENROUTER_API_KEY` set in your environment, that key is used and the file is not read.
 - `serve` never reads the file itself; under Claude Code, `scree mcp` has already applied it.
 
+
+### A separate key for scree mcp
+
+To see Claude Code's OpenRouter costs apart from your own searches, create a second key on OpenRouter and save it with `scree key -mcp`. It goes in the settings file as `SCREE_MCP_API_KEY`. `scree mcp` and `scree mcp -docker` then give `serve` that key as `OPENROUTER_API_KEY` instead of the file's own; `scree search`, `reindex`, `doctor`, `watch` and `scree run` keep using `OPENROUTER_API_KEY`, and OpenRouter's activity page shows each key's spend.
+
+- `SCREE_MCP_API_KEY` never reaches any process under its own name, and is never printed or put on a command line; with `-docker` the container gets it as `OPENROUTER_API_KEY`, passed by name.
+- If it is empty or unusable (a placeholder, inner whitespace, a quote), `scree mcp` prints `scree: warning: <reason> in <file>; using OPENROUTER_API_KEY` on stderr, never the value, and uses the file's `OPENROUTER_API_KEY`. `doctor` warns about it too, and otherwise says when `scree mcp` uses the separate key.
+- As with any setting, the file's last `SCREE_MCP_API_KEY` line is the one used.
+- scree before 0.4.1 doesn't know this key: it passes `SCREE_MCP_API_KEY` on to its children under its own name and its `scree mcp` spends on `OPENROUTER_API_KEY`, so update every installed copy.
+- The [Claude Desktop bundle](claude-desktop.md) doesn't read the settings file; its key is the one in the extension's settings, which can be a third key.
+
 ### The text view
 
 `scree search`'s text view on a terminal (see [CLI](cli.md#the-text-view)) uses two settings:
@@ -55,6 +67,7 @@ Set `SCREE_EMBED_URL`, `SCREE_MODEL` and, since other servers may reject OpenRou
 ### Removed
 
 `SCREE_NOTES` was the folder setting of the single-folder version. It is no longer read; a run with it set logs a warning, and `doctor` prints one. The folder now comes from `-notes` or the git root. See [Migrating](getting-started.md#from-the-single-folder-version).
+
 
 ## Variables scree reads but you don't set in the file
 
